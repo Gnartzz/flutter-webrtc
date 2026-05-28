@@ -182,6 +182,8 @@ void FlutterScreenCapture::GetDisplayMedia(
   std::string source_id = "0";
   // DesktopType source_type = kScreen;
   double fps = 30.0;
+  uint32_t max_width = 0;
+  uint32_t max_height = 0;
 
   const EncodableMap video = findMap(constraints, "video");
   if (video != EncodableMap()) {
@@ -202,6 +204,12 @@ void FlutterScreenCapture::GetDisplayMedia(
       if (frameRate != 0.0) {
         fps = frameRate;
       }
+      // honeycord-fork: max resolution clamp (clamped via libyuv I420Scale
+      // in libwebrtc's RTCDesktopCapturerImpl before the encoder pipeline).
+      EncodableValue mwv = findEncodableValue(mandatory, "maxWidth");
+      if (!mwv.IsNull()) max_width = static_cast<uint32_t>(GetValue<int>(mwv));
+      EncodableValue mhv = findEncodableValue(mandatory, "maxHeight");
+      if (!mhv.IsNull()) max_height = static_cast<uint32_t>(GetValue<int>(mhv));
     }
   }
 
@@ -274,6 +282,9 @@ void FlutterScreenCapture::GetDisplayMedia(
 
   base_->local_streams_[uuid] = stream;
 
+  if (max_width > 0 && max_height > 0) {
+    desktop_capturer->SetMaxResolution(max_width, max_height);
+  }
   desktop_capturer->Start(uint32_t(fps));
 
   result->Success(EncodableValue(params));
