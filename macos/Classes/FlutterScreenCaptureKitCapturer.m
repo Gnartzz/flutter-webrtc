@@ -14,6 +14,7 @@
 @property(nonatomic, strong) RTCVideoCapturer *capturer;
 @property(nonatomic, weak) id<RTCVideoCapturerDelegate> delegate;
 @property(nonatomic, strong) dispatch_queue_t captureQueue;
+@property(nonatomic, strong) dispatch_queue_t audioQueue;
 #if __has_include(<ScreenCaptureKit/ScreenCaptureKit.h>)
 @property(nonatomic, strong) SCStream *stream;
 #endif
@@ -27,12 +28,14 @@
     _delegate = delegate;
     _capturer = [[RTCVideoCapturer alloc] initWithDelegate:delegate];
     _captureQueue = dispatch_queue_create("com.iperius.sck.capture", DISPATCH_QUEUE_SERIAL);
+    _audioQueue = dispatch_queue_create("com.honeycord.sck.audio", DISPATCH_QUEUE_SERIAL);
   }
   return self;
 }
 
 - (void)startCaptureWithFPS:(NSInteger)fps
                    sourceId:(NSString* _Nullable)sourceId
+               captureAudio:(BOOL)captureAudio
                   onStarted:(void (^)(NSError * _Nullable error))onStarted {
 #if __has_include(<ScreenCaptureKit/ScreenCaptureKit.h>)
   if (@available(macOS 12.3, *)) {
@@ -59,6 +62,17 @@
       config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
       if (@available(macOS 13.0, *)) {
         config.showsCursor = YES;
+        // System-Audio des freigegebenen Bildschirms aufnehmen (macOS 13+).
+        // Eigene Mikrofon-Audio wird NICHT mit erfasst — das bleibt der
+        // separaten AudioDeviceModule-Pipeline überlassen.
+        if (captureAudio) {
+          config.capturesAudio = YES;
+          // 48 kHz / 2 Kanäle passt zur WebRTC-Standardpipeline; ScreenCaptureKit
+          // liefert Float32 nicht-interleaved, wir konvertieren später in s16.
+          config.sampleRate = 48000;
+          config.channelCount = 2;
+          config.excludesCurrentProcessAudio = YES;
+        }
       }
 
       self.stream = [[SCStream alloc] initWithFilter:filter configuration:config delegate:nil];
@@ -70,6 +84,18 @@
       if (addOutputError != nil) {
         onStarted(addOutputError);
         return;
+      }
+      // Audio-Output separat hinzufügen, eigener Queue zur Vermeidung von
+      // Backpressure zwischen Video- und Audio-Pfad.
+      if (captureAudio && @available(macOS 13.0, *)) {
+        NSError *audioOutputError = nil;
+        [self.stream addStreamOutput:self
+                                type:SCStreamOutputTypeAudio
+                  sampleHandlerQueue:self.audioQueue
+                               error:&audioOutputError];
+        if (audioOutputError != nil) {
+          NSLog(@"[Honeycord] SCK addStreamOutput audio failed: %@", audioOutputError);
+        }
       }
 
       [self.stream startCaptureWithCompletionHandler:^(NSError * _Nullable startError) {
@@ -132,23 +158,28 @@
 - (void)stream:(SCStream *)stream
 didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         ofType:(SCStreamOutputType)type API_AVAILABLE(macos(12.3)) {
-  if (type != SCStreamOutputTypeScreen) {
+  if (type == SCStreamOutputTypeScreen) {
+    CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+    if (pixelBuffer == nil) {
+      return;
+    }
+    CMTime timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+    int64_t timeStampNs = (int64_t)(CMTimeGetSeconds(timestamp) * 1000000000.0);
+    id<RTCVideoFrameBuffer> rtcBuffer = [[RTCCVPixelBuffer alloc] initWithPixelBuffer:pixelBuffer];
+    RTCVideoFrame *frame = [[RTCVideoFrame alloc] initWithBuffer:rtcBuffer
+                                                        rotation:RTCVideoRotation_0
+                                                     timeStampNs:timeStampNs];
+    [self.delegate capturer:self.capturer didCaptureVideoFrame:frame];
     return;
   }
-
-  CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
-  if (pixelBuffer == nil) {
-    return;
+  if (@available(macOS 13.0, *)) {
+    if (type == SCStreamOutputTypeAudio) {
+      id<FlutterScreenCaptureKitAudioDelegate> delegate = self.audioDelegate;
+      if (delegate != nil) {
+        [delegate screenCapturerDidOutputAudioBuffer:sampleBuffer];
+      }
+    }
   }
-
-  CMTime timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
-  int64_t timeStampNs = (int64_t)(CMTimeGetSeconds(timestamp) * 1000000000.0);
-
-  id<RTCVideoFrameBuffer> rtcBuffer = [[RTCCVPixelBuffer alloc] initWithPixelBuffer:pixelBuffer];
-  RTCVideoFrame *frame = [[RTCVideoFrame alloc] initWithBuffer:rtcBuffer
-                                                      rotation:RTCVideoRotation_0
-                                                   timeStampNs:timeStampNs];
-  [self.delegate capturer:self.capturer didCaptureVideoFrame:frame];
 }
 #endif
 

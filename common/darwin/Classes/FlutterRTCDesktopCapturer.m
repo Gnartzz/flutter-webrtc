@@ -10,8 +10,107 @@
 
 #import "VideoProcessingAdapter.h"
 #import "LocalVideoTrack.h"
+#import "LocalAudioTrack.h"
 #if TARGET_OS_OSX
+#import <AVFoundation/AVFoundation.h>
+#import <WebRTC/RTCCustomAudioSource.h>
 #import "FlutterScreenCaptureKitCapturer.h"
+
+// Pipe für System-Audio aus ScreenCaptureKit in eine RTCCustomAudioSource.
+// Konvertiert die SCK-typischen Float32-Non-Interleaved-Samples in das von
+// WebRTC erwartete Int16-Interleaved-PCM, ringgeladen in 10-ms-Chunks pro
+// PushData-Aufruf (WebRTC.OnData bevorzugt 10 ms).
+@interface HoneycordScreenAudioRelay : NSObject <FlutterScreenCaptureKitAudioDelegate>
+@property(nonatomic, strong) RTCCustomAudioSource *source;
+@end
+
+@implementation HoneycordScreenAudioRelay
+
+- (void)screenCapturerDidOutputAudioBuffer:(CMSampleBufferRef)sampleBuffer {
+  if (sampleBuffer == NULL || self.source == nil) {
+    return;
+  }
+  CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(sampleBuffer);
+  if (fmt == NULL) {
+    return;
+  }
+  const AudioStreamBasicDescription *asbd =
+      CMAudioFormatDescriptionGetStreamBasicDescription(fmt);
+  if (asbd == NULL) {
+    return;
+  }
+  // Erwartet: Float32, 48 kHz, 2 Kanäle (so haben wir SCK konfiguriert).
+  // Andere Formate würden eine vollständige AVAudioConverter-Pipeline brauchen
+  // — hier bewusst nur die konkrete Konfiguration unterstützen, alles andere
+  // verwirft den Buffer.
+  if (asbd->mFormatID != kAudioFormatLinearPCM ||
+      (asbd->mFormatFlags & kAudioFormatFlagIsFloat) == 0) {
+    return;
+  }
+  const int sampleRate = (int)asbd->mSampleRate;
+  const size_t channels = asbd->mChannelsPerFrame;
+  if (sampleRate <= 0 || channels == 0 || channels > 8) {
+    return;
+  }
+  CMItemCount numFrames = CMSampleBufferGetNumSamples(sampleBuffer);
+  if (numFrames <= 0) {
+    return;
+  }
+  // Audio-Sample-Bytes aus dem CMSampleBuffer holen.
+  size_t totalListSize = 0;
+  AudioBufferList listProbe;
+  OSStatus status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+      sampleBuffer, &totalListSize, &listProbe, sizeof(listProbe), NULL, NULL,
+      kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment, NULL);
+  if (status != noErr || totalListSize == 0) {
+    return;
+  }
+  AudioBufferList *list = (AudioBufferList *)malloc(totalListSize);
+  CMBlockBufferRef block = NULL;
+  status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+      sampleBuffer, NULL, list, totalListSize, NULL, NULL,
+      kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment, &block);
+  if (status != noErr) {
+    free(list);
+    if (block != NULL) CFRelease(block);
+    return;
+  }
+  // SCK liefert non-interleaved → ein AudioBuffer pro Kanal.
+  // WebRTC will interleaved Int16; wir mischen Stereo nur, wenn beide Kanäle
+  // gleich viele Frames haben, sonst auf min runter und Rest verwerfen.
+  const size_t outChannels = MIN(channels, (size_t)2);
+  size_t frames = numFrames;
+  for (size_t c = 0; c < outChannels; c++) {
+    size_t framesAvail = list->mBuffers[c].mDataByteSize / sizeof(float);
+    frames = MIN(frames, framesAvail);
+  }
+  if (frames == 0) {
+    free(list);
+    if (block != NULL) CFRelease(block);
+    return;
+  }
+  int16_t *interleaved = (int16_t *)malloc(frames * outChannels * sizeof(int16_t));
+  for (size_t f = 0; f < frames; f++) {
+    for (size_t c = 0; c < outChannels; c++) {
+      const float *src = (const float *)list->mBuffers[c].mData;
+      float sample = src[f];
+      // Clamp + Scale.
+      if (sample > 1.0f) sample = 1.0f;
+      if (sample < -1.0f) sample = -1.0f;
+      interleaved[f * outChannels + c] = (int16_t)(sample * 32767.0f);
+    }
+  }
+  [self.source pushData:interleaved
+          bitsPerSample:16
+             sampleRate:sampleRate
+               channels:outChannels
+                 frames:frames];
+  free(interleaved);
+  free(list);
+  if (block != NULL) CFRelease(block);
+}
+
+@end
 #endif
 
 #if TARGET_OS_OSX
@@ -118,6 +217,17 @@ NSArray<RTCDesktopSource*>* _captureSources;
       }
     }
   }
+  // System-Audio des freigegebenen Bildschirms mit übertragen, wenn die
+  // Constraint `audio: true` gesetzt wurde. Erfordert SCK (macOS 13+) — beim
+  // legacy RTCDesktopCapturer-Pfad still ignoriert.
+  BOOL captureAudio = NO;
+  id audioConstraint = constraints[@"audio"];
+  if ([audioConstraint isKindOfClass:[NSNumber class]]) {
+    captureAudio = [audioConstraint boolValue];
+  } else if ([audioConstraint isKindOfClass:[NSDictionary class]]) {
+    captureAudio = YES;
+  }
+
   RTCDesktopCapturer* desktopCapturer;
   FlutterScreenCaptureKitCapturer* screenCaptureKitCapturer = nil;
   RTCDesktopSource* source = nil;
@@ -139,18 +249,36 @@ NSArray<RTCDesktopSource*>* _captureSources;
                                                    captureDelegate:videoProcessingAdapter];
     }
   }
+  // Pro Capture-Session ein RTCCustomAudioSource + RTCAudioTrack. Wird nur
+  // angelegt, wenn captureAudio=YES UND wir SCK nutzen (legacy DesktopCapturer
+  // hat keinen Audio-Pfad). Strong Ref via Closure, damit der Relay den
+  // Capture-Lifetime überlebt.
+  RTCCustomAudioSource *screenAudioSource = nil;
+  HoneycordScreenAudioRelay *audioRelay = nil;
+  NSString *audioTrackUUID = nil;
+  if (captureAudio && useScreenCaptureKit && @available(macOS 13.0, *)) {
+    screenAudioSource =
+        [[RTCCustomAudioSource alloc] initWithFactory:self.peerConnectionFactory];
+    audioRelay = [[HoneycordScreenAudioRelay alloc] init];
+    audioRelay.source = screenAudioSource;
+    audioTrackUUID = [[NSUUID UUID] UUIDString];
+  }
   if (useScreenCaptureKit) {
     if (@available(macOS 12.3, *)) {
       screenCaptureKitCapturer =
           [[FlutterScreenCaptureKitCapturer alloc] initWithDelegate:videoProcessingAdapter];
+      if (audioRelay != nil) {
+        screenCaptureKitCapturer.audioDelegate = audioRelay;
+      }
       [screenCaptureKitCapturer startCaptureWithFPS:fps
                                            sourceId:sourceId
+                                       captureAudio:(audioRelay != nil)
                                           onStarted:^(NSError * _Nullable error) {
                                             if (error != nil) {
                                               NSLog(@"ScreenCaptureKit start failed: %@", error);
                                             } else {
-                                              NSLog(@"start screencapturekit capture: for  sourceId: %@, fps: %lu",
-                                                    sourceId, fps);
+                                              NSLog(@"start screencapturekit capture: for  sourceId: %@, fps: %lu, audio=%@",
+                                                    sourceId, fps, (audioRelay != nil) ? @"YES" : @"NO");
                                             }
                                           }];
     } else {
@@ -174,6 +302,8 @@ NSArray<RTCDesktopSource*>* _captureSources;
   } else {
     self.videoCapturerStopHandlers[trackUUID] = ^(CompletionHandler handler) {
       NSLog(@"stop screencapturekit capture: trackID %@", trackUUID);
+      // Audio-Source mit beenden — Relay-Strong-Ref durch das Closure freigegeben.
+      [screenAudioSource stop];
       [screenCaptureKitCapturer stopCaptureWithCompletion:handler];
     };
   }
@@ -189,6 +319,29 @@ NSArray<RTCDesktopSource*>* _captureSources;
 
   NSMutableArray* audioTracks = [NSMutableArray array];
   NSMutableArray* videoTracks = [NSMutableArray array];
+
+#if TARGET_OS_OSX
+  if (screenAudioSource != nil && audioTrackUUID != nil) {
+    RTCAudioTrack *screenAudioTrack =
+        [self.peerConnectionFactory audioTrackWithSource:screenAudioSource
+                                                 trackId:audioTrackUUID];
+    [mediaStream addAudioTrack:screenAudioTrack];
+    LocalAudioTrack *localAudioTrack =
+        [[LocalAudioTrack alloc] initWithTrack:screenAudioTrack];
+    [self.localTracks setObject:localAudioTrack forKey:audioTrackUUID];
+  }
+#endif
+
+  for (RTCAudioTrack* track in mediaStream.audioTracks) {
+    [audioTracks addObject:@{
+      @"id" : track.trackId,
+      @"kind" : track.kind,
+      @"label" : track.trackId,
+      @"enabled" : @(track.isEnabled),
+      @"remote" : @(YES),
+      @"readyState" : @"live"
+    }];
+  }
 
   for (RTCVideoTrack* track in mediaStream.videoTracks) {
     [videoTracks addObject:@{

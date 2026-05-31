@@ -16,6 +16,9 @@ A new flutter plugin project.
 
   s.dependency 'FlutterMacOS'
   s.weak_frameworks = 'ScreenCaptureKit'
-  s.dependency 'WebRTC-SDK', '144.7559.01'
+  # HoneyCord-Fork-Build statt CocoaPods 'WebRTC-SDK' 144.7559.01 — enthält
+  # webrtc::HoneycordCustomAudioSource + RTCCustomAudioSource für separates
+  # Screen-Share-Audio (Mac: SCK / Win: WASAPI-Loopback).
+  s.vendored_frameworks = 'WebRTC.xcframework'
   s.osx.deployment_target = '10.15'
 end
