@@ -17,52 +17,86 @@
 #import "FlutterScreenCaptureKitCapturer.h"
 
 // Pipe für System-Audio aus ScreenCaptureKit in eine RTCCustomAudioSource.
-// Konvertiert die SCK-typischen Float32-Non-Interleaved-Samples in das von
-// WebRTC erwartete Int16-Interleaved-PCM, ringgeladen in 10-ms-Chunks pro
-// PushData-Aufruf (WebRTC.OnData bevorzugt 10 ms).
-@interface HoneycordScreenAudioRelay : NSObject <FlutterScreenCaptureKitAudioDelegate>
+// SCK liefert Float32 PCM, in der Praxis INTERLEAVED (mBuffers[0] enthält alle
+// Kanäle verflochten). Wir unterstützen beide Layouts (interleaved + non-
+// interleaved), wandeln in Int16-interleaved und pushen in die CustomAudioSource.
+// Hilfs-Ringbuffer für 10-ms-Chunking. libwebrtc' AudioSendStream::SendAudioData
+// hat ein RTC_CHECK_EQ(samples_per_channel, sample_rate/100) — wir MÜSSEN in
+// 10-ms-Schritten (480 Frames @ 48 kHz) pushen, sonst SIGABRT.
+@interface HoneycordScreenAudioRelay : NSObject <FlutterScreenCaptureKitAudioDelegate> {
+  BOOL _logged;
+  uint64_t _bufferCount;
+  int16_t *_chunkBuf;   // interleaved Int16, Größe = capacity * outChannels
+  size_t _chunkCap;     // capacity in Frames
+  size_t _chunkLen;     // momentan belegte Frames
+  size_t _chunkChannels;
+}
 @property(nonatomic, strong) RTCCustomAudioSource *source;
 @end
 
 @implementation HoneycordScreenAudioRelay
 
 - (void)screenCapturerDidOutputAudioBuffer:(CMSampleBufferRef)sampleBuffer {
+  static uint64_t entries = 0;
+  entries++;
+  BOOL diag = (entries == 1 || (entries % 200) == 0);
+  if (diag) {
+    NSLog(@"[scr-audio relay] entry #%llu source=%@ sampleBuffer=%p",
+          (unsigned long long)entries, self.source, sampleBuffer);
+  }
   if (sampleBuffer == NULL || self.source == nil) {
+    if (diag) NSLog(@"[scr-audio relay] EARLY: sb/source nil");
     return;
   }
   CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(sampleBuffer);
   if (fmt == NULL) {
+    if (diag) NSLog(@"[scr-audio relay] EARLY: no format description");
     return;
   }
   const AudioStreamBasicDescription *asbd =
       CMAudioFormatDescriptionGetStreamBasicDescription(fmt);
   if (asbd == NULL) {
+    if (diag) NSLog(@"[scr-audio relay] EARLY: no asbd");
     return;
   }
-  // Erwartet: Float32, 48 kHz, 2 Kanäle (so haben wir SCK konfiguriert).
-  // Andere Formate würden eine vollständige AVAudioConverter-Pipeline brauchen
-  // — hier bewusst nur die konkrete Konfiguration unterstützen, alles andere
-  // verwirft den Buffer.
+  if (diag) {
+    NSLog(@"[scr-audio relay] asbd: formatID=0x%x flags=0x%x sr=%.0f ch=%u "
+          @"framesPerPacket=%u bytesPerPacket=%u bytesPerFrame=%u bitsPerChannel=%u",
+          (unsigned)asbd->mFormatID, (unsigned)asbd->mFormatFlags,
+          asbd->mSampleRate, (unsigned)asbd->mChannelsPerFrame,
+          (unsigned)asbd->mFramesPerPacket, (unsigned)asbd->mBytesPerPacket,
+          (unsigned)asbd->mBytesPerFrame, (unsigned)asbd->mBitsPerChannel);
+  }
   if (asbd->mFormatID != kAudioFormatLinearPCM ||
       (asbd->mFormatFlags & kAudioFormatFlagIsFloat) == 0) {
+    if (diag) NSLog(@"[scr-audio relay] EARLY: format not LinearPCM/Float "
+                    @"id=0x%x flags=0x%x",
+                    (unsigned)asbd->mFormatID, (unsigned)asbd->mFormatFlags);
     return;
   }
   const int sampleRate = (int)asbd->mSampleRate;
   const size_t channels = asbd->mChannelsPerFrame;
   if (sampleRate <= 0 || channels == 0 || channels > 8) {
+    if (diag) NSLog(@"[scr-audio relay] EARLY: bad sr/ch sr=%d ch=%zu",
+                    sampleRate, channels);
     return;
   }
   CMItemCount numFrames = CMSampleBufferGetNumSamples(sampleBuffer);
   if (numFrames <= 0) {
+    if (diag) NSLog(@"[scr-audio relay] EARLY: numFrames=%lld", (long long)numFrames);
     return;
   }
-  // Audio-Sample-Bytes aus dem CMSampleBuffer holen.
+  // Probe: NULL bufferList -> Größe in totalListSize. Apple gibt hier noErr
+  // zurück, wenn nur die Größe abgefragt wird; das vorherige Pattern mit
+  // einer Stack-AudioBufferList lieferte kCMSampleBufferError_ArrayTooSmall
+  // und wurde fälschlich als Fehler behandelt.
   size_t totalListSize = 0;
-  AudioBufferList listProbe;
   OSStatus status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-      sampleBuffer, &totalListSize, &listProbe, sizeof(listProbe), NULL, NULL,
+      sampleBuffer, &totalListSize, NULL, 0, NULL, NULL,
       kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment, NULL);
-  if (status != noErr || totalListSize == 0) {
+  if ((status != noErr && status != -12737 /* ArrayTooSmall */) || totalListSize == 0) {
+    if (diag) NSLog(@"[scr-audio relay] EARLY: probe status=%d size=%zu",
+                    (int)status, totalListSize);
     return;
   }
   AudioBufferList *list = (AudioBufferList *)malloc(totalListSize);
@@ -71,43 +105,128 @@
       sampleBuffer, NULL, list, totalListSize, NULL, NULL,
       kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment, &block);
   if (status != noErr) {
+    if (diag) NSLog(@"[scr-audio relay] EARLY: getABL status=%d", (int)status);
     free(list);
     if (block != NULL) CFRelease(block);
     return;
   }
-  // SCK liefert non-interleaved → ein AudioBuffer pro Kanal.
-  // WebRTC will interleaved Int16; wir mischen Stereo nur, wenn beide Kanäle
-  // gleich viele Frames haben, sonst auf min runter und Rest verwerfen.
+
+  const BOOL isNonInterleaved =
+      (asbd->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
   const size_t outChannels = MIN(channels, (size_t)2);
+
+  // Einmalig Format-Diagnose loggen, damit wir sehen, was SCK wirklich liefert.
+  if (!_logged) {
+    _logged = YES;
+    NSLog(@"[scr-audio relay] format: sr=%d ch=%zu interleaved=%@ "
+          @"mBuffers=%u buf0.ch=%u buf0.bytes=%u flags=0x%x numFrames=%lld",
+          sampleRate, channels, isNonInterleaved ? @"NO" : @"YES",
+          list->mNumberBuffers,
+          list->mBuffers[0].mNumberChannels,
+          list->mBuffers[0].mDataByteSize,
+          asbd->mFormatFlags,
+          (long long)numFrames);
+  }
+
   size_t frames = numFrames;
-  for (size_t c = 0; c < outChannels; c++) {
-    size_t framesAvail = list->mBuffers[c].mDataByteSize / sizeof(float);
+  int16_t *interleaved = NULL;
+
+  if (isNonInterleaved) {
+    // ein AudioBuffer pro Kanal
+    for (size_t c = 0; c < outChannels && c < list->mNumberBuffers; c++) {
+      size_t framesAvail = list->mBuffers[c].mDataByteSize / sizeof(float);
+      frames = MIN(frames, framesAvail);
+    }
+    if (frames == 0) goto cleanup;
+    interleaved = (int16_t *)malloc(frames * outChannels * sizeof(int16_t));
+    float peak = 0.0f;
+    for (size_t f = 0; f < frames; f++) {
+      for (size_t c = 0; c < outChannels; c++) {
+        const float *src = (const float *)list->mBuffers[c].mData;
+        float sample = src[f];
+        if (sample > 1.0f) sample = 1.0f;
+        if (sample < -1.0f) sample = -1.0f;
+        float ab = sample < 0 ? -sample : sample;
+        if (ab > peak) peak = ab;
+        interleaved[f * outChannels + c] = (int16_t)(sample * 32767.0f);
+      }
+    }
+    if ((_bufferCount++ % 200) == 0) {
+      NSLog(@"[scr-audio relay] non-interleaved peak=%.4f frames=%zu", peak, frames);
+    }
+  } else {
+    // mBuffers[0] enthält alle Kanäle interleaved
+    const float *src = (const float *)list->mBuffers[0].mData;
+    size_t framesAvail =
+        list->mBuffers[0].mDataByteSize / sizeof(float) / channels;
     frames = MIN(frames, framesAvail);
-  }
-  if (frames == 0) {
-    free(list);
-    if (block != NULL) CFRelease(block);
-    return;
-  }
-  int16_t *interleaved = (int16_t *)malloc(frames * outChannels * sizeof(int16_t));
-  for (size_t f = 0; f < frames; f++) {
-    for (size_t c = 0; c < outChannels; c++) {
-      const float *src = (const float *)list->mBuffers[c].mData;
-      float sample = src[f];
-      // Clamp + Scale.
-      if (sample > 1.0f) sample = 1.0f;
-      if (sample < -1.0f) sample = -1.0f;
-      interleaved[f * outChannels + c] = (int16_t)(sample * 32767.0f);
+    if (frames == 0) goto cleanup;
+    interleaved = (int16_t *)malloc(frames * outChannels * sizeof(int16_t));
+    float peak = 0.0f;
+    for (size_t f = 0; f < frames; f++) {
+      for (size_t c = 0; c < outChannels; c++) {
+        float sample = src[f * channels + c];
+        if (sample > 1.0f) sample = 1.0f;
+        if (sample < -1.0f) sample = -1.0f;
+        float ab = sample < 0 ? -sample : sample;
+        if (ab > peak) peak = ab;
+        interleaved[f * outChannels + c] = (int16_t)(sample * 32767.0f);
+      }
+    }
+    if ((_bufferCount++ % 200) == 0) {
+      NSLog(@"[scr-audio relay] interleaved peak=%.4f frames=%zu", peak, frames);
     }
   }
-  [self.source pushData:interleaved
-          bitsPerSample:16
-             sampleRate:sampleRate
-               channels:outChannels
-                 frames:frames];
-  free(interleaved);
+
+  // 10-ms-Chunking. libwebrtc verlangt EXAKT 10-ms-AudioFrames im
+  // Sender-Pfad (AudioSendStream::SendAudioData hat ein RTC_CHECK_EQ
+  // samples_per_channel == sample_rate/100). SCK liefert aber 1024-/2048-
+  // Frame-Buffer → wir puffern und drainen in chunks von 480 Frames @ 48 kHz.
+  const size_t chunkFrames = (size_t)sampleRate / 100;  // 10 ms
+  if (chunkFrames > 0) {
+    // Buffer (neu) reservieren wenn Kanal-/Größenänderung.
+    const size_t needCap = chunkFrames * 4;  // genug für Backlog
+    if (_chunkBuf == NULL || _chunkCap < needCap || _chunkChannels != outChannels) {
+      free(_chunkBuf);
+      _chunkBuf = (int16_t *)malloc(needCap * outChannels * sizeof(int16_t));
+      _chunkCap = needCap;
+      _chunkLen = 0;
+      _chunkChannels = outChannels;
+    }
+    size_t srcOffset = 0;
+    while (srcOffset < frames) {
+      size_t copyFrames = MIN(frames - srcOffset, _chunkCap - _chunkLen);
+      memcpy(_chunkBuf + _chunkLen * outChannels,
+             interleaved + srcOffset * outChannels,
+             copyFrames * outChannels * sizeof(int16_t));
+      _chunkLen += copyFrames;
+      srcOffset += copyFrames;
+      while (_chunkLen >= chunkFrames) {
+        [self.source pushData:_chunkBuf
+                bitsPerSample:16
+                   sampleRate:sampleRate
+                     channels:outChannels
+                       frames:chunkFrames];
+        const size_t remaining = _chunkLen - chunkFrames;
+        if (remaining > 0) {
+          memmove(_chunkBuf,
+                  _chunkBuf + chunkFrames * outChannels,
+                  remaining * outChannels * sizeof(int16_t));
+        }
+        _chunkLen = remaining;
+      }
+    }
+  }
+
+cleanup:
+  if (interleaved != NULL) free(interleaved);
   free(list);
   if (block != NULL) CFRelease(block);
+}
+
+- (void)dealloc {
+  free(_chunkBuf);
+  _chunkBuf = NULL;
 }
 
 @end

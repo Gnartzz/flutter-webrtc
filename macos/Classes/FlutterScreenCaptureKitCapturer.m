@@ -89,13 +89,17 @@
       // Backpressure zwischen Video- und Audio-Pfad.
       if (captureAudio && @available(macOS 13.0, *)) {
         NSError *audioOutputError = nil;
-        [self.stream addStreamOutput:self
-                                type:SCStreamOutputTypeAudio
-                  sampleHandlerQueue:self.audioQueue
-                               error:&audioOutputError];
-        if (audioOutputError != nil) {
-          NSLog(@"[Honeycord] SCK addStreamOutput audio failed: %@", audioOutputError);
-        }
+        BOOL ok = [self.stream addStreamOutput:self
+                                          type:SCStreamOutputTypeAudio
+                            sampleHandlerQueue:self.audioQueue
+                                         error:&audioOutputError];
+        NSLog(@"[scr-audio sck] addStreamOutput audio: ok=%d err=%@ "
+              @"capturesAudio=%d sr=%lu ch=%lu excludeOwn=%d",
+              ok, audioOutputError,
+              config.capturesAudio,
+              (unsigned long)config.sampleRate,
+              (unsigned long)config.channelCount,
+              config.excludesCurrentProcessAudio);
       }
 
       [self.stream startCaptureWithCompletionHandler:^(NSError * _Nullable startError) {
@@ -174,7 +178,13 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
   }
   if (@available(macOS 13.0, *)) {
     if (type == SCStreamOutputTypeAudio) {
+      static uint64_t audioCalls = 0;
+      audioCalls++;
       id<FlutterScreenCaptureKitAudioDelegate> delegate = self.audioDelegate;
+      if (audioCalls == 1 || (audioCalls % 200) == 0) {
+        NSLog(@"[scr-audio sck] audio buffer #%llu delegate=%@",
+              (unsigned long long)audioCalls, delegate);
+      }
       if (delegate != nil) {
         [delegate screenCapturerDidOutputAudioBuffer:sampleBuffer];
       }
