@@ -1,5 +1,9 @@
 #include "flutter_screen_capture.h"
 
+#if defined(_WIN32)
+#include "../../../windows/honeycord_wasapi_loopback.h"
+#endif
+
 namespace flutter_webrtc_plugin {
 
 FlutterScreenCapture::FlutterScreenCapture(FlutterWebRTCBase* base)
@@ -218,12 +222,59 @@ void FlutterScreenCapture::GetDisplayMedia(
   scoped_refptr<RTCMediaStream> stream =
       base_->factory_->CreateStream(uuid.c_str());
 
+  // System-Audio-Capture des freigegebenen Render-Devices (HoneyCord). Nur
+  // dann aktiv, wenn die Dart-Seite getDisplayMedia mit `audio: true`
+  // aufgerufen hat. WASAPI shared-mode Loopback → Int16-interleaved →
+  // libwebrtc::RTCAudioSource(kCustom) → eigener RTCAudioTrack mit
+  // TrackSource.screenShareAudio (LiveKit-side). Pendant zum Mac-SCK-Pfad
+  // (FlutterRTCDesktopCapturer.m / HoneycordScreenAudioRelay).
+  bool capture_audio = false;
+  {
+    auto it_audio = constraints.find(EncodableValue("audio"));
+    if (it_audio != constraints.end()) {
+      if (TypeIs<bool>(it_audio->second)) {
+        capture_audio = GetValue<bool>(it_audio->second);
+      } else if (TypeIs<EncodableMap>(it_audio->second)) {
+        capture_audio = true;
+      }
+    }
+  }
+
   EncodableMap params;
   params[EncodableValue("streamId")] = EncodableValue(uuid);
 
   // AUDIO
 
-  params[EncodableValue("audioTracks")] = EncodableValue(EncodableList());
+  EncodableList audio_tracks;
+#if defined(_WIN32)
+  if (capture_audio) {
+    scoped_refptr<RTCAudioSource> audio_source =
+        base_->factory_->CreateAudioSource(
+            "screen-share-audio", RTCAudioSource::SourceType::kCustom);
+    if (audio_source.get()) {
+      auto audio_uuid = base_->GenerateUUID();
+      scoped_refptr<RTCAudioTrack> audio_track =
+          base_->factory_->CreateAudioTrack(audio_source, audio_uuid.c_str());
+      if (audio_track.get()) {
+        auto loopback = std::make_unique<honeycord::WasapiLoopback>(audio_source);
+        if (loopback->Start()) {
+          EncodableMap a_info;
+          a_info[EncodableValue("id")] = EncodableValue(audio_track->id().std_string());
+          a_info[EncodableValue("label")] = EncodableValue(audio_track->id().std_string());
+          a_info[EncodableValue("kind")] = EncodableValue(audio_track->kind().std_string());
+          a_info[EncodableValue("enabled")] = EncodableValue(audio_track->enabled());
+          audio_tracks.push_back(EncodableValue(a_info));
+          stream->AddTrack(audio_track);
+          base_->local_tracks_[audio_track->id().std_string()] = audio_track;
+          wasapi_loopbacks_[uuid] = std::move(loopback);
+        }
+      }
+    }
+  }
+#else
+  (void)capture_audio;
+#endif
+  params[EncodableValue("audioTracks")] = EncodableValue(audio_tracks);
 
   // VIDEO
 

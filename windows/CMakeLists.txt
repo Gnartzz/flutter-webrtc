@@ -30,6 +30,7 @@ add_library(${PLUGIN_NAME} SHARED
   "../common/cpp/src/flutter_webrtc_base.cc"
   "flutter_webrtc_plugin.cc"
   "task_runner_windows.cc"
+  "honeycord_wasapi_loopback.cc"
 )
 
 include_directories(
@@ -48,10 +49,13 @@ target_include_directories(${PLUGIN_NAME} INTERFACE
   "${CMAKE_CURRENT_SOURCE_DIR}/../common/cpp/include"
   "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/libwebrtc/include"
 )
-target_link_libraries(${PLUGIN_NAME} PRIVATE 
+target_link_libraries(${PLUGIN_NAME} PRIVATE
   flutter
   flutter_wrapper_plugin
   "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/libwebrtc/lib/win64/libwebrtc.dll.lib"
+  # HoneyCord WASAPI-Loopback braucht COM + AudioClient-Interfaces.
+  ole32
+  mmdevapi
 )
 
 # List of absolute paths to libraries that should be bundled with the plugin

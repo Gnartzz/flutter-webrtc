@@ -7,6 +7,10 @@
 #include "rtc_desktop_capturer.h"
 #include "rtc_desktop_media_list.h"
 
+#if defined(_WIN32)
+namespace honeycord { class WasapiLoopback; }
+#endif
+
 namespace flutter_webrtc_plugin {
 
 class FlutterScreenCapture : public MediaListObserver,
@@ -53,6 +57,13 @@ class FlutterScreenCapture : public MediaListObserver,
   FlutterWebRTCBase* base_;
   std::map<DesktopType, scoped_refptr<RTCDesktopMediaList>> medialist_;
   std::vector<scoped_refptr<MediaSource>> sources_;
+#if defined(_WIN32)
+  // Aktive WASAPI-Loopback-Capturer; Key ist die Stream-UUID, damit wir
+  // den Capturer beim Stop des dazugehoerigen Screen-Share-Tracks
+  // schließen können.
+  std::map<std::string, std::unique_ptr<honeycord::WasapiLoopback>>
+      wasapi_loopbacks_;
+#endif
 };
 
 }  // namespace flutter_webrtc_plugin
