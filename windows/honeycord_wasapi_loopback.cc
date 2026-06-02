@@ -1,15 +1,22 @@
 // HoneyCord WASAPI-Loopback — Implementierung. Siehe Header.
 #include "honeycord_wasapi_loopback.h"
 
-#include <Audioclient.h>
-#include <Functiondiscoverykeys_devpkey.h>
-#include <Mmdeviceapi.h>
-#include <combaseapi.h>
-#include <ksmedia.h>
 #include <objbase.h>
+#include <mmdeviceapi.h>
+#include <audioclient.h>
+#include <mmreg.h>
 
 #include <algorithm>
 #include <cstring>
+
+// KSDATAFORMAT_SUBTYPE_IEEE_FLOAT braucht ksmedia.h, aber das definiert
+// PROPERTYKEY-Konstanten doppelt mit dem WinSDK 10.0.26100. Wir definieren
+// das einzige Subformat das wir brauchen manuell und sparen uns ksmedia.h.
+#ifndef HONEYCORD_DEFINE_KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+#define HONEYCORD_DEFINE_KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+static const GUID HC_KSDATAFORMAT_SUBTYPE_IEEE_FLOAT = {
+    0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+#endif
 
 namespace honeycord {
 
@@ -28,7 +35,8 @@ bool IsFloatFormat(const WAVEFORMATEX* fmt) {
   if (fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) return true;
   if (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
     const auto* ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(fmt);
-    return ext->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+    return std::memcmp(&ext->SubFormat, &HC_KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
+                       sizeof(GUID)) == 0;
   }
   return false;
 }
