@@ -1,7 +1,12 @@
 // HoneyCord WASAPI-Loopback — Implementierung. Siehe Header.
 #include "honeycord_wasapi_loopback.h"
 
+// WinSDK 10.0.26100 hat in `Functiondiscoverykeys_devpkey.h` den Include von
+// `devpropdef.h` (definiert DEFINE_PROPERTYKEY) auskommentiert. Wir ziehen
+// es manuell vor mmdeviceapi.h ein, sonst bricht der Compile mit
+// "DEFINE_PROPERTYKEY: Mehrfachinitialisierung / nichtdeklarierter Bezeichner".
 #include <objbase.h>
+#include <devpropdef.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <mmreg.h>
