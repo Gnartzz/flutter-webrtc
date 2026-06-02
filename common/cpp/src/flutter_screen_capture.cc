@@ -9,6 +9,8 @@ namespace flutter_webrtc_plugin {
 FlutterScreenCapture::FlutterScreenCapture(FlutterWebRTCBase* base)
     : base_(base) {}
 
+FlutterScreenCapture::~FlutterScreenCapture() = default;
+
 bool FlutterScreenCapture::BuildDesktopSourcesList(const EncodableList& types,
                                                    bool force_reload) {
   size_t size = types.size();

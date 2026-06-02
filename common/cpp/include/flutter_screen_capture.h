@@ -17,6 +17,10 @@ class FlutterScreenCapture : public MediaListObserver,
                              public DesktopCapturerObserver {
  public:
   FlutterScreenCapture(FlutterWebRTCBase* base);
+  // Out-of-line dtor wegen unique_ptr<WasapiLoopback> (Forward-Declare —
+  // damit muss der Destruktor in der .cc instanziiert werden, wo der Typ
+  // voll bekannt ist).
+  ~FlutterScreenCapture();
 
   void GetDisplayMedia(const EncodableMap& constraints,
                        std::unique_ptr<MethodResultProxy> result);
