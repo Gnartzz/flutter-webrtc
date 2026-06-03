@@ -250,16 +250,27 @@ void FlutterScreenCapture::GetDisplayMedia(
   EncodableList audio_tracks;
 #if defined(_WIN32)
   if (capture_audio) {
+    honeycord::WasapiLogFromPlugin("getDisplayMedia: capture_audio=true uuid=%s",
+                                    uuid.c_str());
     scoped_refptr<RTCAudioSource> audio_source =
         base_->factory_->CreateAudioSource(
             "screen-share-audio", RTCAudioSource::SourceType::kCustom);
+    honeycord::WasapiLogFromPlugin("  CreateAudioSource(kCustom) -> %p",
+                                    audio_source.get());
     if (audio_source.get()) {
       auto audio_uuid = base_->GenerateUUID();
       scoped_refptr<RTCAudioTrack> audio_track =
           base_->factory_->CreateAudioTrack(audio_source, audio_uuid.c_str());
+      honeycord::WasapiLogFromPlugin(
+          "  CreateAudioTrack uuid=%s -> %p (kind=%s)", audio_uuid.c_str(),
+          audio_track.get(),
+          audio_track.get() ? audio_track->kind().std_string().c_str() : "<null>");
       if (audio_track.get()) {
         auto loopback = std::make_unique<honeycord::WasapiLoopback>(audio_source);
-        if (loopback->Start()) {
+        bool started = loopback->Start();
+        honeycord::WasapiLogFromPlugin("  WasapiLoopback::Start = %d",
+                                        started ? 1 : 0);
+        if (started) {
           EncodableMap a_info;
           a_info[EncodableValue("id")] = EncodableValue(audio_track->id().std_string());
           a_info[EncodableValue("label")] = EncodableValue(audio_track->id().std_string());
@@ -269,9 +280,14 @@ void FlutterScreenCapture::GetDisplayMedia(
           stream->AddTrack(audio_track);
           base_->local_tracks_[audio_track->id().std_string()] = audio_track;
           wasapi_loopbacks_[uuid] = std::move(loopback);
+          honeycord::WasapiLogFromPlugin(
+              "  Audio-Track an Stream gehaengt: track_id=%s",
+              audio_track->id().std_string().c_str());
         }
       }
     }
+  } else {
+    honeycord::WasapiLogFromPlugin("getDisplayMedia: capture_audio=false");
   }
 #else
   (void)capture_audio;

@@ -32,6 +32,10 @@ typedef struct tWAVEFORMATEX WAVEFORMATEX;
 
 namespace honeycord {
 
+// Schreibt eine Zeile nach %TEMP%\honeycord-wasapi.log (auch nutzbar aus
+// dem Plugin-Code, nicht nur intern). printf-style.
+void WasapiLogFromPlugin(const char* fmt, ...);
+
 class WasapiLoopback {
  public:
   explicit WasapiLoopback(
