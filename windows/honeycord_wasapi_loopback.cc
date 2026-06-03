@@ -1,4 +1,9 @@
 // HoneyCord WASAPI-Loopback — Implementierung. Siehe Header.
+// Wir nutzen ein einfaches File-Log via fopen/strncat — der Plugin-Build
+// laeuft mit /WX (warnings-as-errors); deshalb hier _CRT_SECURE_NO_WARNINGS
+// statt die Variante mit den _s-Helpern, die unter MSYS/clang-cl Probleme
+// machen.
+#define _CRT_SECURE_NO_WARNINGS 1
 #include "honeycord_wasapi_loopback.h"
 
 // WinSDK 10.0.26100 hat in `Functiondiscoverykeys_devpkey.h` den Include von
