@@ -179,14 +179,23 @@ bool WasapiLoopback::Start() {
   HcLog("Start: client->Start = 0x%08lx", (long)hr);
   if (FAILED(hr)) return false;
 
-  sample_rate_ = static_cast<int>(mix_format_->nSamplesPerSec);
+  in_sample_rate_ = static_cast<int>(mix_format_->nSamplesPerSec);
+  // libwebrtc/Opus akzeptiert keine 44100 Hz; wir resampeln intern auf
+  // 48 kHz. Bei einem Input-Format das eh schon 48 kHz ist (z. B. wenn
+  // der Nutzer 48-kHz-Default-Render hat), wird das Resampling zu einer
+  // 1:1-Kopie.
+  out_sample_rate_ = 48000;
   channels_ = std::min<int>(2, mix_format_->nChannels);
   input_is_float_ = IsFloatFormat(mix_format_);
-  chunk_frames_ = sample_rate_ / 100;   // 10 ms
+  chunk_frames_ = out_sample_rate_ / 100;   // 480 frames @ 48 kHz = 10 ms
   chunk_buf_.assign(chunk_frames_ * channels_, 0);
   chunk_filled_frames_ = 0;
-  HcLog("Start: ready sr=%d out_ch=%d float=%d chunk_frames=%zu",
-        sample_rate_, channels_, input_is_float_ ? 1 : 0, chunk_frames_);
+  resample_phase_ = 0.0;
+  prev_left_ = 0;
+  prev_right_ = 0;
+  HcLog("Start: ready in_sr=%d out_sr=%d ch=%d float=%d chunk_frames=%zu",
+        in_sample_rate_, out_sample_rate_, channels_,
+        input_is_float_ ? 1 : 0, chunk_frames_);
 
   running_ = true;
   thread_ = std::thread(&WasapiLoopback::CaptureLoop, this);
@@ -279,8 +288,13 @@ void WasapiLoopback::CaptureLoop() {
     if (silent) ++silent_packets;
     total_in_frames += num_frames;
 
-    // Pro Input-Frame: in den 10-ms-Akkumulator schreiben (mit Down-Mix
-    // auf 2 Kanäle falls Quelle mehr hat). Drainen, sobald 10 ms voll.
+    // Linear-Interpolation-Resampler. Pro Input-Frame skalieren wir den
+    // Phasen-Zähler um (in_sr / out_sr); jedes Mal wenn Phase >= 1 wird,
+    // emittieren wir ein Output-Sample, das eine lineare Mischung von
+    // (prev, current) ist. Phase bleibt zwischen Calls erhalten, damit
+    // 44100→48000 sauber durchläuft (Verhältnis = 0.91875).
+    const double step = static_cast<double>(in_sample_rate_) /
+                        static_cast<double>(out_sample_rate_);
     for (UINT32 f = 0; f < num_frames; ++f) {
       const BYTE* in_frame = data + f * in_frame_bytes;
       int16_t left = 0, right = 0;
@@ -296,25 +310,36 @@ void WasapiLoopback::CaptureLoop() {
           left = s[0];
           right = (in_channels >= 2) ? s[1] : s[0];
         } else {
-          // unbekanntes Format → silence
           left = 0;
           right = 0;
         }
       }
-      int16_t* out = chunk_buf_.data() + chunk_filled_frames_ * channels_;
-      out[0] = left;
-      if (channels_ >= 2) out[1] = right;
-      ++chunk_filled_frames_;
-      if (chunk_filled_frames_ >= chunk_frames_) {
-        if (source_.get()) {
-          source_->CaptureFrame(chunk_buf_.data(), 16, sample_rate_,
-                                static_cast<size_t>(channels_), chunk_frames_);
-          ++pushed_chunks;
-        } else if (pushed_chunks == 0) {
-          HcLog("CaptureLoop: source_ ist nullptr, kann nicht pushen");
+      // Phase < 1 → kein Output dieses Frame; >= 1 → eines (oder mehrere)
+      // Output-Samples zwischen prev und current interpolieren.
+      resample_phase_ += 1.0;
+      while (resample_phase_ >= step) {
+        resample_phase_ -= step;
+        const double t = 1.0 - (resample_phase_ / step);  // 0..1
+        const double out_l = prev_left_ + t * (left - prev_left_);
+        const double out_r = prev_right_ + t * (right - prev_right_);
+        int16_t* out = chunk_buf_.data() + chunk_filled_frames_ * channels_;
+        out[0] = static_cast<int16_t>(out_l);
+        if (channels_ >= 2) out[1] = static_cast<int16_t>(out_r);
+        ++chunk_filled_frames_;
+        if (chunk_filled_frames_ >= chunk_frames_) {
+          if (source_.get()) {
+            source_->CaptureFrame(chunk_buf_.data(), 16, out_sample_rate_,
+                                  static_cast<size_t>(channels_),
+                                  chunk_frames_);
+            ++pushed_chunks;
+          } else if (pushed_chunks == 0) {
+            HcLog("CaptureLoop: source_ ist nullptr, kann nicht pushen");
+          }
+          chunk_filled_frames_ = 0;
         }
-        chunk_filled_frames_ = 0;
       }
+      prev_left_ = left;
+      prev_right_ = right;
     }
     capture_->ReleaseBuffer(num_frames);
   }

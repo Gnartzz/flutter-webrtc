@@ -63,13 +63,23 @@ class WasapiLoopback {
   IAudioCaptureClient* capture_ = nullptr;
   WAVEFORMATEX* mix_format_ = nullptr;
 
-  // 10-ms-Akkumulator (interleaved Int16). Größe = chunk_frames_ * channels_.
+  // 10-ms-Akkumulator (interleaved Int16) NACH Resampling auf
+  // libwebrtc-Opus-fähige Sample-Rate. Größe = chunk_frames_ * channels_.
   std::vector<int16_t> chunk_buf_;
-  size_t chunk_frames_ = 0;        // 10 ms in Frames (sample_rate / 100)
+  size_t chunk_frames_ = 0;        // 10 ms @ out_sample_rate_ in Frames
   size_t chunk_filled_frames_ = 0; // wie weit im Akkumulator wir sind
-  int sample_rate_ = 0;
+  int in_sample_rate_ = 0;         // WASAPI-Mix-Format-Rate (z. B. 44100)
+  int out_sample_rate_ = 0;        // Ziel-Rate (48000), libwebrtc/Opus
   int channels_ = 0;
   bool input_is_float_ = false;    // Float32-Input statt PCM16
+
+  // Linear-Interpolation-Resampler-State (Phase + letzte Input-Samples pro
+  // Kanal). Bei 44100 → 48000 ist das Verhältnis ~0.91875; pro Output-Frame
+  // konsumieren wir im Mittel 0.918... Input-Frames. Phase trackt den
+  // Bruchteil über CaptureLoop-Iterationen hinweg.
+  double resample_phase_ = 0.0;
+  int16_t prev_left_ = 0;
+  int16_t prev_right_ = 0;
 };
 
 }  // namespace honeycord
