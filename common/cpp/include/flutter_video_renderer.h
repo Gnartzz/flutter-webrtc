@@ -52,6 +52,7 @@ class FlutterVideoRenderer
   // plain-SHARED-BGRA-Textur konvertieren+hochladen (Fallback, Layer 3b).
   const FlutterDesktopGpuSurfaceDescriptor* ObtainGpuSurface(
       size_t width, size_t height) const;
+  void set_gpu_surface(bool v) { is_gpu_surface_ = v; }
 #endif
 
  private:
@@ -84,6 +85,13 @@ class FlutterVideoRenderer
   mutable int fb_h_ = 0;
   mutable std::shared_ptr<uint8_t> fb_cpu_;
   bool EnsureFallbackTexture(int w, int h) const;
+
+  // Self-View-Drossel: die GpuSurface-Kachel (eigener Bildschirm-Stream) zeigt
+  // den Schirm, den man eh sieht -> auf ~25 fps drosseln, damit nicht jeder
+  // 60-fps-Frame ein teures Flutter-Fenster-Composite (ANGLE) ausloest. Der
+  // Sende-Pfad (Encoder) ist davon unberuehrt.
+  bool is_gpu_surface_ = false;
+  int64_t last_mark_ms_ = 0;
 #endif
 };
 

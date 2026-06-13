@@ -1,5 +1,9 @@
 #include "flutter_video_renderer.h"
 
+#ifdef _WINDOWS
+#include <chrono>
+#endif
+
 namespace flutter_webrtc_plugin {
 
 FlutterVideoRenderer::~FlutterVideoRenderer() {}
@@ -146,6 +150,20 @@ void FlutterVideoRenderer::OnFrame(scoped_refptr<RTCVideoFrame> frame) {
   mutex_.lock();
   frame_ = frame;
   mutex_.unlock();
+#ifdef _WINDOWS
+  // Self-View-Drossel auf ~25 fps (40 ms): jeder MarkTextureFrameAvailable
+  // triggert ein Flutter-Fenster-Composite (ANGLE, teuer bei grossen Fenstern).
+  // Nur fuer die GpuSurface-Self-View-Kachel; Kamera/Remote (PixelBuffer) nicht
+  // drosseln. frame_ ist bereits aktualisiert -> der naechste Mark zeigt das
+  // neueste Bild (max. 40 ms Verzug, unmerklich). Sende-Pfad unberuehrt.
+  if (is_gpu_surface_) {
+    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count();
+    if (now - last_mark_ms_ < 40) return;
+    last_mark_ms_ = now;
+  }
+#endif
   registrar_->MarkTextureFrameAvailable(texture_id_);
 }
 
@@ -190,6 +208,7 @@ void FlutterVideoRendererManager::CreateVideoRendererTexture(
   std::unique_ptr<flutter::TextureVariant> textureVariant;
 #ifdef _WINDOWS
   if (use_gpu_surface) {
+    texture->set_gpu_surface(true);  // -> Self-View-Drossel in OnFrame
     textureVariant = std::make_unique<flutter::TextureVariant>(
         flutter::GpuSurfaceTexture(
             kFlutterDesktopGpuSurfaceTypeDxgiSharedHandle,
