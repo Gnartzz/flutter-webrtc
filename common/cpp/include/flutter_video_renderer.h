@@ -8,6 +8,10 @@
 #include "rtc_video_renderer.h"
 
 #include <mutex>
+#ifdef _WINDOWS
+#include <d3d11.h>
+#include <wrl/client.h>
+#endif
 
 namespace flutter_webrtc_plugin {
 
@@ -41,6 +45,15 @@ class FlutterVideoRenderer
 
   std::string media_stream_id;
 
+#ifdef _WINDOWS
+  // GPU-Zero-Copy-Vorschau: Callback fuer Flutters GpuSurfaceTexture. Native
+  // (GPU) Frames -> DXGI-Shared-Handle des Capturers direkt an ANGLE (kein
+  // Readback). Nicht-native Frames (Kamera/Remote, I420) -> in eine eigene
+  // plain-SHARED-BGRA-Textur konvertieren+hochladen (Fallback, Layer 3b).
+  const FlutterDesktopGpuSurfaceDescriptor* ObtainGpuSurface(
+      size_t width, size_t height) const;
+#endif
+
  private:
   struct FrameSize {
     size_t width;
@@ -58,13 +71,28 @@ class FlutterVideoRenderer
   mutable std::shared_ptr<uint8_t> rgb_buffer_;
   mutable std::mutex mutex_;
   RTCVideoFrame::VideoRotation rotation_ = RTCVideoFrame::kVideoRotation_0;
+#ifdef _WINDOWS
+  mutable FlutterDesktopGpuSurfaceDescriptor gpu_descriptor_ = {};
+  // Fallback fuer nicht-native Frames (Kamera/Remote): eigene plain-SHARED
+  // BGRA-Textur (kein Keyed-Mutex), in die per ConvertToARGB(kBGRA)+Upload
+  // geschrieben wird; ihr Legacy-Handle geht an ANGLE.
+  mutable Microsoft::WRL::ComPtr<ID3D11Device> fb_dev_;
+  mutable Microsoft::WRL::ComPtr<ID3D11DeviceContext> fb_ctx_;
+  mutable Microsoft::WRL::ComPtr<ID3D11Texture2D> fb_tex_;
+  mutable void* fb_handle_ = nullptr;
+  mutable int fb_w_ = 0;
+  mutable int fb_h_ = 0;
+  mutable std::shared_ptr<uint8_t> fb_cpu_;
+  bool EnsureFallbackTexture(int w, int h) const;
+#endif
 };
 
 class FlutterVideoRendererManager {
  public:
   FlutterVideoRendererManager(FlutterWebRTCBase* base);
 
-  void CreateVideoRendererTexture(std::unique_ptr<MethodResultProxy> result);
+  void CreateVideoRendererTexture(bool use_gpu_surface,
+                                  std::unique_ptr<MethodResultProxy> result);
 
   void VideoRendererSetSrcObject(int64_t texture_id,
                                  const std::string& stream_id,

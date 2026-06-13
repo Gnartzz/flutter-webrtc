@@ -486,7 +486,18 @@ void FlutterWebRTC::HandleMethodCall(
     }
     RTCPeerConnectionDispose(pc, peerConnectionId, std::move(result));
   } else if (method_call.method_name().compare("createVideoRenderer") == 0) {
-    CreateVideoRendererTexture(std::move(result));
+    // honeycord: optionales Flag gpuSurface (nur Windows-Self-View) -> der
+    // Renderer registriert eine GpuSurfaceTexture statt PixelBuffer.
+    bool use_gpu_surface = false;
+    if (method_call.arguments()) {
+      const EncodableMap params =
+          GetValue<EncodableMap>(*method_call.arguments());
+      auto it = params.find(EncodableValue("gpuSurface"));
+      if (it != params.end() && std::holds_alternative<bool>(it->second)) {
+        use_gpu_surface = std::get<bool>(it->second);
+      }
+    }
+    CreateVideoRendererTexture(use_gpu_surface, std::move(result));
   } else if (method_call.method_name().compare("videoRendererDispose") == 0) {
     if (!method_call.arguments()) {
       result->Error("Bad Arguments", "Null constraints arguments received");

@@ -18,6 +18,13 @@ class RTCVideoRenderer extends ValueNotifier<RTCVideoValue>
   MediaStream? _srcObject;
   StreamSubscription<dynamic>? _eventSubscription;
 
+  /// honeycord: Windows GPU-Zero-Copy-Vorschau. VOR initialize() auf true
+  /// setzen -> der native Renderer registriert eine GpuSurfaceTexture (D3D11-
+  /// Shared-Handle) statt eines CPU-PixelBuffers. Nur fuer Tracks sinnvoll, die
+  /// native GPU-Frames liefern (lokaler Bildschirm-Share auf Windows/NVIDIA);
+  /// fuer alles andere false lassen (Kamera/Remote bleiben PixelBuffer).
+  bool gpuSurface = false;
+
   @override
   Future<void> initialize() async {
     if (_initializing != null) {
@@ -25,7 +32,8 @@ class RTCVideoRenderer extends ValueNotifier<RTCVideoValue>
       return;
     }
     _initializing = Completer();
-    final response = await WebRTC.invokeMethod('createVideoRenderer', {});
+    final response = await WebRTC.invokeMethod(
+        'createVideoRenderer', {'gpuSurface': gpuSurface});
     _textureId = response['textureId'];
     _eventSubscription = EventChannel('FlutterWebRTC/Texture$textureId')
         .receiveBroadcastStream()

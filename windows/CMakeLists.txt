@@ -56,6 +56,10 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
   # HoneyCord WASAPI-Loopback braucht COM + AudioClient-Interfaces.
   ole32
   mmdevapi
+  # honeycord GPU-Zero-Copy-Vorschau: der Renderer erzeugt eine eigene
+  # D3D11-Shared-Textur (D3D11CreateDevice / IDXGIResource::GetSharedHandle).
+  d3d11
+  dxgi
 )
 
 # List of absolute paths to libraries that should be bundled with the plugin

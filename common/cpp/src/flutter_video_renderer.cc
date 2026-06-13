@@ -44,6 +44,74 @@ const FlutterDesktopPixelBuffer* FlutterVideoRenderer::CopyPixelBuffer(
   return nullptr;
 }
 
+#ifdef _WINDOWS
+// Fallback-Textur fuer nicht-native Frames (Kamera/Remote): eigene plain-SHARED
+// BGRA-Textur auf dem Default-Adapter (Adapter 0; ANGLE laeuft auf demselben,
+// daher oeffnet das Legacy-Shared-Handle). Kein Keyed-Mutex.
+bool FlutterVideoRenderer::EnsureFallbackTexture(int w, int h) const {
+  using Microsoft::WRL::ComPtr;
+  if (!fb_dev_) {
+    D3D_FEATURE_LEVEL fl;
+    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+                                 nullptr, 0, D3D11_SDK_VERSION, &fb_dev_, &fl,
+                                 &fb_ctx_)))
+      return false;
+  }
+  if (fb_tex_ && fb_w_ == w && fb_h_ == h) return true;
+  fb_tex_.Reset();
+  fb_handle_ = nullptr;
+  D3D11_TEXTURE2D_DESC d = {};
+  d.Width = w; d.Height = h; d.MipLevels = 1; d.ArraySize = 1;
+  d.Format = DXGI_FORMAT_B8G8R8A8_UNORM; d.SampleDesc.Count = 1;
+  d.Usage = D3D11_USAGE_DEFAULT;
+  d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+  d.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+  if (FAILED(fb_dev_->CreateTexture2D(&d, nullptr, &fb_tex_))) return false;
+  ComPtr<IDXGIResource> res;
+  if (FAILED(fb_tex_.As(&res)) ||
+      FAILED(res->GetSharedHandle(&fb_handle_)) || !fb_handle_) {
+    fb_tex_.Reset();
+    fb_handle_ = nullptr;
+    return false;
+  }
+  fb_w_ = w;
+  fb_h_ = h;
+  fb_cpu_.reset(new uint8_t[static_cast<size_t>(w) * h * 4]);
+  return true;
+}
+
+const FlutterDesktopGpuSurfaceDescriptor* FlutterVideoRenderer::ObtainGpuSurface(
+    size_t width, size_t height) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!frame_.get()) return nullptr;
+  const int w = frame_->width();
+  const int h = frame_->height();
+  if (w <= 0 || h <= 0) return nullptr;
+
+  void* handle = frame_->native_shared_handle();
+  if (!handle) {
+    // Nicht-nativer Frame (Kamera/Remote, I420): nach BGRA konvertieren und in
+    // die eigene Shared-Textur hochladen. Producer (Upload) + Consumer (ANGLE)
+    // laufen beide sequenziell auf dem Raster-Thread -> kein Keyed-Mutex noetig.
+    if (!EnsureFallbackTexture(w, h)) return nullptr;
+    frame_->ConvertToARGB(RTCVideoFrame::Type::kBGRA, fb_cpu_.get(), 0, w, h);
+    fb_ctx_->UpdateSubresource(fb_tex_.Get(), 0, nullptr, fb_cpu_.get(),
+                               static_cast<UINT>(w) * 4, 0);
+    fb_ctx_->Flush();
+    handle = fb_handle_;
+  }
+
+  gpu_descriptor_.struct_size = sizeof(FlutterDesktopGpuSurfaceDescriptor);
+  gpu_descriptor_.handle = handle;
+  gpu_descriptor_.width = gpu_descriptor_.visible_width = static_cast<size_t>(w);
+  gpu_descriptor_.height = gpu_descriptor_.visible_height = static_cast<size_t>(h);
+  gpu_descriptor_.format = kFlutterDesktopPixelFormatBGRA8888;
+  gpu_descriptor_.release_callback = nullptr;
+  gpu_descriptor_.release_context = nullptr;
+  return &gpu_descriptor_;
+}
+#endif
+
 void FlutterVideoRenderer::OnFrame(scoped_refptr<RTCVideoFrame> frame) {
   if (!first_frame_rendered) {
     EncodableMap params;
@@ -112,14 +180,33 @@ FlutterVideoRendererManager::FlutterVideoRendererManager(
     : base_(base) {}
 
 void FlutterVideoRendererManager::CreateVideoRendererTexture(
-    std::unique_ptr<MethodResultProxy> result) {
+    bool use_gpu_surface, std::unique_ptr<MethodResultProxy> result) {
   auto texture = new RefCountedObject<FlutterVideoRenderer>();
-  auto textureVariant =
-      std::make_unique<flutter::TextureVariant>(flutter::PixelBufferTexture(
-          [texture](size_t width,
-                    size_t height) -> const FlutterDesktopPixelBuffer* {
-            return texture->CopyPixelBuffer(width, height);
-          }));
+  // Default: PixelBuffer (Kamera/Remote) -- bewaehrt, fasst nichts an. NUR wenn
+  // die App explizit gpuSurface=true setzt (chirurgisch: lokale Bildschirm-
+  // Selbst-Kachel auf Windows) wird eine GpuSurfaceTexture (Zero-Copy via
+  // DXGI-Shared-Handle) registriert. So trifft ein Fehler dort NIE Kamera/
+  // Remote/UI.
+  std::unique_ptr<flutter::TextureVariant> textureVariant;
+#ifdef _WINDOWS
+  if (use_gpu_surface) {
+    textureVariant = std::make_unique<flutter::TextureVariant>(
+        flutter::GpuSurfaceTexture(
+            kFlutterDesktopGpuSurfaceTypeDxgiSharedHandle,
+            [texture](size_t width, size_t height)
+                -> const FlutterDesktopGpuSurfaceDescriptor* {
+              return texture->ObtainGpuSurface(width, height);
+            }));
+  }
+#endif
+  if (!textureVariant) {
+    textureVariant =
+        std::make_unique<flutter::TextureVariant>(flutter::PixelBufferTexture(
+            [texture](size_t width,
+                      size_t height) -> const FlutterDesktopPixelBuffer* {
+              return texture->CopyPixelBuffer(width, height);
+            }));
+  }
 
   auto texture_id = base_->textures_->RegisterTexture(textureVariant.get());
   texture->initialize(base_->textures_, base_->messenger_, base_->task_runner_,
