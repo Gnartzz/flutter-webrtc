@@ -36,6 +36,8 @@
 - (void)startCaptureWithFPS:(NSInteger)fps
                    sourceId:(NSString* _Nullable)sourceId
                captureAudio:(BOOL)captureAudio
+                   maxWidth:(NSInteger)maxWidth
+                  maxHeight:(NSInteger)maxHeight
                   onStarted:(void (^)(NSError * _Nullable error))onStarted {
 #if __has_include(<ScreenCaptureKit/ScreenCaptureKit.h>)
   if (@available(macOS 12.3, *)) {
@@ -56,8 +58,23 @@
 
       SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
       SCStreamConfiguration *config = [SCStreamConfiguration new];
-      config.width = display.width;
-      config.height = display.height;
+      // GPU-seitiges Downscale: SCK skaliert beim Capturen (gratis, zero-copy) in
+      // die Deckel-Box statt die volle Display-Aufloesung zu liefern und sie
+      // spaeter per webrtc-CPU-I420-Scaling zu verkleinern. Aspekt-korrekt (gleicher
+      // Faktor auf W+H), nie hochskaliert, gerade Kanten (H.264 4:2:0).
+      NSInteger outW = display.width;
+      NSInteger outH = display.height;
+      if (maxWidth > 0 && maxHeight > 0 && display.width > 0 && display.height > 0) {
+        double scale = fmin(fmin((double)maxWidth / (double)display.width,
+                                 (double)maxHeight / (double)display.height),
+                            1.0);
+        outW = ((NSInteger)lround((double)display.width * scale)) & ~(NSInteger)1;
+        outH = ((NSInteger)lround((double)display.height * scale)) & ~(NSInteger)1;
+        if (outW < 2) outW = 2;
+        if (outH < 2) outH = 2;
+      }
+      config.width = outW;
+      config.height = outH;
       config.minimumFrameInterval = CMTimeMake(1, (int32_t)MAX(1, fps));
       config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
       if (@available(macOS 13.0, *)) {

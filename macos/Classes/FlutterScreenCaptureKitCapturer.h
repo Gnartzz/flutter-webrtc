@@ -16,9 +16,15 @@
 
 @property(nonatomic, strong) id<FlutterScreenCaptureKitAudioDelegate> _Nullable audioDelegate;
 
+/// `maxWidth`/`maxHeight` = Deckel-Box fuer GPU-seitiges Downscale direkt in der
+/// SCStreamConfiguration (seitenverhaeltnis-korrekt, nie hochskaliert). 0 = volle
+/// Display-Aufloesung. Spart das spaetere webrtc-CPU-I420-Scaling auf dem
+/// Sende-Pfad und verkleinert zugleich die Frames fuer die Self-View.
 - (void)startCaptureWithFPS:(NSInteger)fps
                    sourceId:(NSString* _Nullable)sourceId
                captureAudio:(BOOL)captureAudio
+                   maxWidth:(NSInteger)maxWidth
+                  maxHeight:(NSInteger)maxHeight
                   onStarted:(void (^)(NSError * _Nullable error))onStarted;
 
 - (void)stopCaptureWithCompletion:(void (^)(void))completion;

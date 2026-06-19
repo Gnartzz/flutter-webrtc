@@ -311,6 +311,9 @@ NSArray<RTCDesktopSource*>* _captureSources;
   NSString* sourceId = nil;
   BOOL useDefaultScreen = NO;
   NSInteger fps = 30;
+  // Deckel-Box fuer SCK-GPU-Downscale (0 = volle Display-Aufloesung).
+  NSInteger maxWidth = 0;
+  NSInteger maxHeight = 0;
   id videoConstraints = constraints[@"video"];
   if ([videoConstraints isKindOfClass:[NSNumber class]] && [videoConstraints boolValue] == YES) {
     useDefaultScreen = YES;
@@ -333,6 +336,14 @@ NSArray<RTCDesktopSource*>* _captureSources;
       id frameRate = mandatory[@"frameRate"];
       if (frameRate != nil && [frameRate isKindOfClass:[NSNumber class]]) {
         fps = [frameRate integerValue];
+      }
+      id mw = mandatory[@"maxWidth"];
+      if (mw != nil && [mw isKindOfClass:[NSNumber class]]) {
+        maxWidth = [mw integerValue];
+      }
+      id mh = mandatory[@"maxHeight"];
+      if (mh != nil && [mh isKindOfClass:[NSNumber class]]) {
+        maxHeight = [mh integerValue];
       }
     }
   }
@@ -392,6 +403,8 @@ NSArray<RTCDesktopSource*>* _captureSources;
       [screenCaptureKitCapturer startCaptureWithFPS:fps
                                            sourceId:sourceId
                                        captureAudio:(audioRelay != nil)
+                                           maxWidth:maxWidth
+                                          maxHeight:maxHeight
                                           onStarted:^(NSError * _Nullable error) {
                                             if (error != nil) {
                                               NSLog(@"ScreenCaptureKit start failed: %@", error);

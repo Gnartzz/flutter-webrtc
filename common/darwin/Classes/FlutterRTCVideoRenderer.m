@@ -6,6 +6,9 @@
 #import <WebRTC/RTCYUVPlanarBuffer.h>
 #import <WebRTC/WebRTC.h>
 
+#import <CoreImage/CoreImage.h>
+#import <Metal/Metal.h>
+
 #import <objc/runtime.h>
 
 #import "FlutterWebRTCPlugin.h"
@@ -20,6 +23,7 @@
   bool _isFirstFrameRendered;
   bool _frameAvailable;
   os_unfair_lock _lock;
+  CIContext* _ciContext;
 }
 
 @synthesize textureId = _textureId;
@@ -70,6 +74,7 @@
     CVBufferRelease(_pixelBufferRef);
     _pixelBufferRef = nil;
   }
+  _ciContext = nil;
   _frameAvailable = false;
   os_unfair_lock_unlock(&_lock);
 }
@@ -190,6 +195,48 @@
   CVPixelBufferUnlockBaseAddress(outputPixelBuffer, 0);
 }
 
+// Zero-Copy/GPU-Pfad fuer native CVPixelBuffer-Frames (ScreenCaptureKit-
+// Bildschirm, Mac-Kamera): die NV12-IOSurface ohne den teuren `toI420`-Readback
+// + libyuv-Ketten direkt per CoreImage auf der GPU (Metal) in den BGRA-
+// Ausgabepuffer rendern. Spart pro Frame den GPU->CPU-Readback + 3 libyuv-
+// Durchlaeufe — relevant fuer die Vollbild-Self-View. Nur fuer unrotierte
+// RTCCVPixelBuffer-Frames; alles andere (Remote-I420, rotierte Kamera) faellt
+// auf copyI420ToCVPixelBuffer zurueck. Gibt NO zurueck, wenn der Fast-Path nicht
+// greift, damit der Aufrufer sauber faellt.
+- (BOOL)renderNativePixelBuffer:(RTCVideoFrame*)frame toOutput:(CVPixelBufferRef)output {
+  if (frame.rotation != RTCVideoRotation_0) return NO;
+  if (![frame.buffer isKindOfClass:[RTCCVPixelBuffer class]]) return NO;
+  CVPixelBufferRef src = ((RTCCVPixelBuffer*)frame.buffer).pixelBuffer;
+  if (src == NULL) return NO;
+
+  if (_ciContext == nil) {
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (device == nil) return NO;
+    // Farbmanagement aus = schneller und farbtreu zur Standard-Video-
+    // Konvertierung (YUV->RGB kommt aus den Buffer-Attachments).
+    _ciContext = [CIContext contextWithMTLDevice:device
+                                         options:@{
+                                           kCIContextWorkingColorSpace : [NSNull null],
+                                           kCIContextOutputColorSpace : [NSNull null],
+                                         }];
+    if (_ciContext == nil) return NO;
+  }
+
+  CIImage* image = [CIImage imageWithCVPixelBuffer:src];
+  if (image == nil) return NO;
+  const CGRect extent = image.extent;
+  if (extent.size.width <= 0 || extent.size.height <= 0) return NO;
+  const size_t dstW = CVPixelBufferGetWidth(output);
+  const size_t dstH = CVPixelBufferGetHeight(output);
+  if ((size_t)extent.size.width != dstW || (size_t)extent.size.height != dstH) {
+    image = [image imageByApplyingTransform:CGAffineTransformMakeScale(
+                                                (CGFloat)dstW / extent.size.width,
+                                                (CGFloat)dstH / extent.size.height)];
+  }
+  [_ciContext render:image toCVPixelBuffer:output];
+  return YES;
+}
+
 #pragma mark - RTCVideoRenderer methods
 - (void)renderFrame:(RTCVideoFrame*)frame {
 
@@ -199,7 +246,9 @@
     return;
   }
   if(!_frameAvailable && _pixelBufferRef) {
-    [self copyI420ToCVPixelBuffer:_pixelBufferRef withFrame:frame];
+    if (![self renderNativePixelBuffer:frame toOutput:_pixelBufferRef]) {
+      [self copyI420ToCVPixelBuffer:_pixelBufferRef withFrame:frame];
+    }
     if(_textureId != -1) {
       [_registry textureFrameAvailable:_textureId];
     }
@@ -261,7 +310,12 @@
     if (_pixelBufferRef) {
       CVBufferRelease(_pixelBufferRef);
     }
-    NSDictionary* pixelAttributes = @{(id)kCVPixelBufferIOSurfacePropertiesKey : @{}};
+    NSDictionary* pixelAttributes = @{
+      (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
+      // Metal-kompatibel, damit der CoreImage/Metal-Fast-Path direkt in diesen
+      // Puffer rendern kann (renderNativePixelBuffer:).
+      (id)kCVPixelBufferMetalCompatibilityKey : @YES,
+    };
     CVPixelBufferCreate(kCFAllocatorDefault, size.width, size.height, kCVPixelFormatType_32BGRA,
                         (__bridge CFDictionaryRef)(pixelAttributes), &_pixelBufferRef);
     _frameAvailable = false;

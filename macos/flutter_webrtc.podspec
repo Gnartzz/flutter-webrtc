@@ -16,6 +16,9 @@ A new flutter plugin project.
 
   s.dependency 'FlutterMacOS'
   s.weak_frameworks = 'ScreenCaptureKit'
+  # CoreImage/Metal fuer den GPU-Vorschau-Fast-Path (NV12-IOSurface -> BGRA ohne
+  # CPU-Readback) in FlutterRTCVideoRenderer.
+  s.frameworks = 'CoreImage', 'Metal'
   # WebRTC-SDK 144.7559.01 wird im App-Podfile per `:path =>` auf einen lokalen
   # HoneyCord-Build umgelenkt, der webrtc::HoneycordCustomAudioSource +
   # RTCCustomAudioSource für separates Screen-Share-Audio enthält
