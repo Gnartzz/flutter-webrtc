@@ -16,13 +16,15 @@
 
 @property(nonatomic, strong) id<FlutterScreenCaptureKitAudioDelegate> _Nullable audioDelegate;
 
-/// `maxWidth`/`maxHeight` = Deckel-Box fuer GPU-seitiges Downscale direkt in der
-/// SCStreamConfiguration (seitenverhaeltnis-korrekt, nie hochskaliert). 0 = volle
-/// Display-Aufloesung. Spart das spaetere webrtc-CPU-I420-Scaling auf dem
-/// Sende-Pfad und verkleinert zugleich die Frames fuer die Self-View.
+/// `isWindow`=YES nimmt EIN FENSTER zero-copy auf (SCContentFilter
+/// initWithDesktopIndependentWindow:, `sourceId` = CGWindowID) — das Mac-Gegenstueck
+/// zur Windows-WGC-Fenster-Capture; sonst den ganzen Bildschirm (Display per
+/// displayID). `maxWidth`/`maxHeight` = Deckel-Box fuer GPU-seitiges Downscale
+/// direkt in der SCStreamConfiguration (aspekt-korrekt, nie hochskaliert; 0 = nativ).
 - (void)startCaptureWithFPS:(NSInteger)fps
                    sourceId:(NSString* _Nullable)sourceId
                captureAudio:(BOOL)captureAudio
+                   isWindow:(BOOL)isWindow
                    maxWidth:(NSInteger)maxWidth
                   maxHeight:(NSInteger)maxHeight
                   onStarted:(void (^)(NSError * _Nullable error))onStarted;

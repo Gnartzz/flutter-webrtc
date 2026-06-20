@@ -362,6 +362,7 @@ NSArray<RTCDesktopSource*>* _captureSources;
   FlutterScreenCaptureKitCapturer* screenCaptureKitCapturer = nil;
   RTCDesktopSource* source = nil;
   BOOL useScreenCaptureKit = NO;
+  BOOL isWindow = NO;
 
   if (useDefaultScreen) {
     useScreenCaptureKit = YES;
@@ -373,6 +374,11 @@ NSArray<RTCDesktopSource*>* _captureSources;
     }
     if (source.sourceType == RTCDesktopSourceTypeScreen) {
       useScreenCaptureKit = YES;
+    } else if (@available(macOS 12.3, *)) {
+      // FENSTER zero-copy via SCK (Mac-Gegenstueck zur Windows-WGC-Fenster-Capture);
+      // sourceId = CGWindowID. Fallback (kein SCK <12.3): legacy CPU-Capturer unten.
+      useScreenCaptureKit = YES;
+      isWindow = YES;
     } else {
       desktopCapturer = [[RTCDesktopCapturer alloc] initWithSource:source
                                                           delegate:self
@@ -403,6 +409,7 @@ NSArray<RTCDesktopSource*>* _captureSources;
       [screenCaptureKitCapturer startCaptureWithFPS:fps
                                            sourceId:sourceId
                                        captureAudio:(audioRelay != nil)
+                                           isWindow:isWindow
                                            maxWidth:maxWidth
                                           maxHeight:maxHeight
                                           onStarted:^(NSError * _Nullable error) {

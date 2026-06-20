@@ -1,5 +1,6 @@
 #import "FlutterScreenCaptureKitCapturer.h"
 
+#import <AppKit/AppKit.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <CoreMedia/CoreMedia.h>
 
@@ -36,6 +37,7 @@
 - (void)startCaptureWithFPS:(NSInteger)fps
                    sourceId:(NSString* _Nullable)sourceId
                captureAudio:(BOOL)captureAudio
+                   isWindow:(BOOL)isWindow
                    maxWidth:(NSInteger)maxWidth
                   maxHeight:(NSInteger)maxHeight
                   onStarted:(void (^)(NSError * _Nullable error))onStarted {
@@ -47,29 +49,48 @@
         return;
       }
 
-      SCDisplay *display = [self selectDisplayFromContent:content sourceId:sourceId];
-      if (display == nil) {
-        NSError *noDisplay = [NSError errorWithDomain:@"FlutterScreenCaptureKit"
-                                                 code:-1
-                                             userInfo:@{NSLocalizedDescriptionKey: @"No matching display"}];
-        onStarted(noDisplay);
-        return;
+      // Quelle waehlen: FENSTER (SCWindow, zero-copy wie Bildschirm) oder DISPLAY.
+      SCContentFilter *filter = nil;
+      NSInteger srcW = 0, srcH = 0;
+      if (isWindow) {
+        SCWindow *win = [self selectWindowFromContent:content sourceId:sourceId];
+        if (win == nil) {
+          onStarted([NSError errorWithDomain:@"FlutterScreenCaptureKit" code:-3
+                      userInfo:@{NSLocalizedDescriptionKey: @"No matching window"}]);
+          return;
+        }
+        filter = [[SCContentFilter alloc] initWithDesktopIndependentWindow:win];
+        // SCWindow.frame ist in Punkten -> in Pixel umrechnen (Retina), sonst
+        // capturet SCK das Fenster weich. Box-Fit (unten) deckelt es danach.
+        CGFloat sc = [NSScreen mainScreen].backingScaleFactor;
+        if (sc < 1.0) sc = 1.0;
+        srcW = (NSInteger)lround(win.frame.size.width * sc);
+        srcH = (NSInteger)lround(win.frame.size.height * sc);
+      } else {
+        SCDisplay *display = [self selectDisplayFromContent:content sourceId:sourceId];
+        if (display == nil) {
+          onStarted([NSError errorWithDomain:@"FlutterScreenCaptureKit" code:-1
+                      userInfo:@{NSLocalizedDescriptionKey: @"No matching display"}]);
+          return;
+        }
+        filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
+        srcW = display.width;
+        srcH = display.height;
       }
 
-      SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
       SCStreamConfiguration *config = [SCStreamConfiguration new];
       // GPU-seitiges Downscale: SCK skaliert beim Capturen (gratis, zero-copy) in
-      // die Deckel-Box statt die volle Display-Aufloesung zu liefern und sie
-      // spaeter per webrtc-CPU-I420-Scaling zu verkleinern. Aspekt-korrekt (gleicher
-      // Faktor auf W+H), nie hochskaliert, gerade Kanten (H.264 4:2:0).
-      NSInteger outW = display.width;
-      NSInteger outH = display.height;
-      if (maxWidth > 0 && maxHeight > 0 && display.width > 0 && display.height > 0) {
-        double scale = fmin(fmin((double)maxWidth / (double)display.width,
-                                 (double)maxHeight / (double)display.height),
+      // die Deckel-Box statt die volle Quelle zu liefern und sie spaeter per
+      // webrtc-CPU-I420-Scaling zu verkleinern. Aspekt-korrekt, nie hochskaliert,
+      // gerade Kanten (H.264 4:2:0).
+      NSInteger outW = srcW;
+      NSInteger outH = srcH;
+      if (maxWidth > 0 && maxHeight > 0 && srcW > 0 && srcH > 0) {
+        double scale = fmin(fmin((double)maxWidth / (double)srcW,
+                                 (double)maxHeight / (double)srcH),
                             1.0);
-        outW = ((NSInteger)lround((double)display.width * scale)) & ~(NSInteger)1;
-        outH = ((NSInteger)lround((double)display.height * scale)) & ~(NSInteger)1;
+        outW = ((NSInteger)lround((double)srcW * scale)) & ~(NSInteger)1;
+        outH = ((NSInteger)lround((double)srcH * scale)) & ~(NSInteger)1;
         if (outW < 2) outW = 2;
         if (outH < 2) outH = 2;
       }
@@ -174,6 +195,22 @@
   }
 
   return content.displays.firstObject;
+}
+
+// Fenster per CGWindowID (= sourceId aus dem Picker) finden. nil -> Aufrufer
+// liefert "No matching window" (z.B. Fenster inzwischen geschlossen).
+- (SCWindow *)selectWindowFromContent:(SCShareableContent *)content
+                             sourceId:(NSString *)sourceId API_AVAILABLE(macos(12.3)) {
+  if (sourceId == nil || sourceId.length == 0 || content.windows.count == 0) {
+    return nil;
+  }
+  CGWindowID wid = (CGWindowID)[sourceId longLongValue];
+  for (SCWindow *w in content.windows) {
+    if (w.windowID == wid) {
+      return w;
+    }
+  }
+  return nil;
 }
 
 - (void)stream:(SCStream *)stream
