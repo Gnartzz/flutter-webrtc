@@ -15,6 +15,8 @@
 #import <AVFoundation/AVFoundation.h>
 #import <WebRTC/RTCCustomAudioSource.h>
 #import "FlutterScreenCaptureKitCapturer.h"
+#import <ScreenCaptureKit/ScreenCaptureKit.h>
+#import <CoreGraphics/CoreGraphics.h>
 
 // Pipe für System-Audio aus ScreenCaptureKit in eine RTCCustomAudioSource.
 // SCK liefert Float32 PCM, in der Praxis INTERLEAVED (mBuffers[0] enthält alle
@@ -236,6 +238,10 @@ cleanup:
 RTCDesktopMediaList* _screen = nil;
 RTCDesktopMediaList* _window = nil;
 NSArray<RTCDesktopSource*>* _captureSources;
+// Per SCK ergaenzte Fenster-IDs, die CGWindowList/RTCDesktopMediaList NICHT
+// liefert (v.a. Fullscreen-Apps auf eigenem Space). Damit der Capture-Pfad
+// (getDisplayMedia) so eine sourceId trotzdem als Fenster annimmt.
+NSSet<NSString*>* _sckExtraWindowIds = nil;
 #endif
 
 @implementation FlutterWebRTCPlugin (DesktopCapturer)
@@ -368,11 +374,20 @@ NSArray<RTCDesktopSource*>* _captureSources;
     useScreenCaptureKit = YES;
   } else {
     source = [self getSourceById:sourceId];
-    if (source == nil) {
+    // sourceId nicht in der RTCDesktopMediaList? Dann evtl. ein per SCK
+    // nachgereichtes (Fullscreen-)Fenster -> direkt als Fenster via SCK aufnehmen.
+    BOOL isSckExtra = NO;
+    if (@available(macOS 12.3, *)) {
+      isSckExtra = (source == nil) && [_sckExtraWindowIds containsObject:sourceId];
+    }
+    if (source == nil && !isSckExtra) {
       result(@{@"error" : [NSString stringWithFormat:@"No source found for id: %@", sourceId]});
       return;
     }
-    if (source.sourceType == RTCDesktopSourceTypeScreen) {
+    if (isSckExtra) {
+      useScreenCaptureKit = YES;
+      isWindow = YES;
+    } else if (source.sourceType == RTCDesktopSourceTypeScreen) {
       useScreenCaptureKit = YES;
     } else if (@available(macOS 12.3, *)) {
       // FENSTER zero-copy via SCK (Mac-Gegenstueck zur Windows-WGC-Fenster-Capture);
@@ -498,6 +513,136 @@ NSArray<RTCDesktopSource*>* _captureSources;
       @{@"streamId" : mediaStreamId, @"audioTracks" : audioTracks, @"videoTracks" : videoTracks});
 }
 
+#if TARGET_OS_OSX
+// CGImage -> JPEG-NSData (Flutter Image.memory dekodiert JPEG, NICHT TIFF).
+static NSData* HCJpegFromCGImage(CGImageRef img) {
+  if (img == NULL) return nil;
+  NSBitmapImageRep* rep = [[NSBitmapImageRep alloc] initWithCGImage:img];
+  return [rep representationUsingType:NSBitmapImageFileTypeJPEG
+                           properties:@{NSImageCompressionFactor : @0.6}];
+}
+
+// Bundle-IDs aller "regulaeren" (Dock-)Apps. Filtert Service-/Helper-Prozesse
+// (CursorUIViewService, Open-and-Save-Panel-Service, Menulets) zuverlaessig raus.
+- (NSSet<NSString*>*)hcRegularAppBundleIds {
+  NSMutableSet<NSString*>* ids = [NSMutableSet set];
+  for (NSRunningApplication* a in [NSWorkspace sharedWorkspace].runningApplications) {
+    if (a.activationPolicy == NSApplicationActivationPolicyRegular &&
+        a.bundleIdentifier != nil) {
+      [ids addObject:a.bundleIdentifier];
+    }
+  }
+  return ids;
+}
+
+// Fenster-Quellen KOMPLETT via ScreenCaptureKit aufbauen (statt RTCDesktopMediaList):
+// eine Quelle -> keine Duplikate, kein Race mit der async-Liste, und Fullscreen-Apps
+// auf eigenem Space sind dabei (onScreenWindowsOnly:NO). Stark gefiltert: nur normale
+// Fenster (windowLayer==0) regulaerer Dock-Apps, Mindestgroesse, nicht wir selbst.
+// sourceId = CGWindowID (wie der SCK-Capture-Pfad erwartet). JPEG-Thumbnails inline
+// per SCScreenshotManager (14+); aeltere macOS zeigen Platzhalter.
+- (void)buildSckWindowSources:(void (^)(NSArray<NSDictionary*>* windowDicts))completion
+    API_AVAILABLE(macos(12.3)) {
+  NSString* ownBundleId = [[NSBundle mainBundle] bundleIdentifier];
+  NSSet<NSString*>* regular = [self hcRegularAppBundleIds];
+  [SCShareableContent
+      getShareableContentExcludingDesktopWindows:YES
+                             onScreenWindowsOnly:NO
+                               completionHandler:^(SCShareableContent* content,
+                                                   NSError* error) {
+        NSMutableArray<SCWindow*>* wins = [NSMutableArray array];
+        NSMutableArray<NSMutableDictionary*>* dicts = [NSMutableArray array];
+        NSMutableSet<NSString*>* ids = [NSMutableSet set];
+        if (content != nil) {
+          for (SCWindow* w in content.windows) {
+            if (w.windowLayer != 0) continue;
+            if (w.frame.size.width < 80 || w.frame.size.height < 60) continue;
+            // Nur SICHTBARE Fenster — ODER bildschirmfuellende (eine Fullscreen-App
+            // auf eigenem Space meldet isOnScreen=NO, soll aber dabei sein). Das
+            // wirft inaktive Hintergrund-/Dialog-Fenster raus (z.B. die vielen
+            // versteckten Bambu-Studio-Helferfenster).
+            BOOL keep = w.isOnScreen;
+            if (!keep) {
+              for (SCDisplay* disp in content.displays) {
+                if (w.frame.size.width >= disp.frame.size.width * 0.9 &&
+                    w.frame.size.height >= disp.frame.size.height * 0.9) {
+                  keep = YES;
+                  break;
+                }
+              }
+            }
+            if (!keep) continue;
+            NSString* bid = w.owningApplication.bundleIdentifier;
+            if (bid == nil || ![regular containsObject:bid]) continue;
+            if (ownBundleId != nil && [bid isEqualToString:ownBundleId]) continue;
+            NSString* appName = w.owningApplication.applicationName ?: @"";
+            if (appName.length == 0) continue;
+            NSString* sid = [NSString stringWithFormat:@"%u", (unsigned)w.windowID];
+            NSString* title = w.title ?: @"";
+            NSString* name = title.length > 0
+                                 ? [NSString stringWithFormat:@"%@ — %@", appName, title]
+                                 : appName;
+            [wins addObject:w];
+            [dicts addObject:[@{
+              @"id" : sid,
+              @"name" : name,
+              @"thumbnailSize" : @{@"width" : @0, @"height" : @0},
+              @"type" : @"window",
+            } mutableCopy]];
+            [ids addObject:sid];
+          }
+        } else if (error != nil) {
+          NSLog(@"buildSckWindowSources: SCShareableContent error: %@", error);
+        }
+        _sckExtraWindowIds = ids;
+
+        // Thumbnails (JPEG) parallel holen; danach erst die Liste liefern.
+        dispatch_group_t group = dispatch_group_create();
+        if (@available(macOS 14.0, *)) {
+          for (NSUInteger i = 0; i < wins.count; i++) {
+            SCWindow* w = wins[i];
+            NSMutableDictionary* d = dicts[i];
+            SCContentFilter* filter =
+                [[SCContentFilter alloc] initWithDesktopIndependentWindow:w];
+            SCStreamConfiguration* cfg = [[SCStreamConfiguration alloc] init];
+            CGFloat sw = w.frame.size.width, sh = w.frame.size.height;
+            CGFloat scl = sw > 0 ? MIN(1.0, 480.0 / sw) : 1.0;
+            cfg.width = (size_t)MAX((CGFloat)2, sw * scl);
+            cfg.height = (size_t)MAX((CGFloat)2, sh * scl);
+            CGWindowID wid = w.windowID;
+            dispatch_group_enter(group);
+            [SCScreenshotManager
+                captureImageWithFilter:filter
+                         configuration:cfg
+                     completionHandler:^(CGImageRef _Nullable img,
+                                         NSError* _Nullable err) {
+                       NSData* jpeg = HCJpegFromCGImage(img);
+                       if (jpeg == nil) {
+                         // Fallback fuer Fenster, die SCScreenshotManager nicht
+                         // erwischt (z.B. Fullscreen-App auf eigenem Space):
+                         // Legacy-Window-Snapshot aus dem Window-Server.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+                         CGImageRef cg = CGWindowListCreateImage(
+                             CGRectNull, kCGWindowListOptionIncludingWindow, wid,
+                             kCGWindowImageBoundsIgnoreFraming |
+                                 kCGWindowImageNominalResolution);
+#pragma clang diagnostic pop
+                         jpeg = HCJpegFromCGImage(cg);
+                         if (cg != NULL) CGImageRelease(cg);
+                       }
+                       if (jpeg != nil) d[@"thumbnail"] = jpeg;
+                       dispatch_group_leave(group);
+                     }];
+          }
+        }
+        dispatch_group_notify(group, dispatch_get_main_queue(), ^{
+          completion(dicts);
+        });
+      }];
+}
+#endif
+
 - (void)getDesktopSources:(NSDictionary*)argsMap result:(FlutterResult)result {
 #if TARGET_OS_OSX
   NSLog(@"getDesktopSources");
@@ -514,22 +659,26 @@ NSArray<RTCDesktopSource*>* _captureSources;
   }
 
   NSMutableArray* sources = [NSMutableArray array];
-  NSEnumerator* enumerator = [_captureSources objectEnumerator];
-  RTCDesktopSource* object;
-  while ((object = enumerator.nextObject) != nil) {
-    /*NSData *data = nil;
-    if([object thumbnail]) {
-        data = [[NSData alloc] init];
-        NSImage *resizedImg = [self resizeImage:[object thumbnail] forSize:NSMakeSize(320, 180)];
-        data = [resizedImg TIFFRepresentation];
-    }*/
+  // _captureSources enthaelt (ab 12.3) nur noch Screens — Fenster kommen via SCK.
+  for (RTCDesktopSource* object in _captureSources) {
     [sources addObject:@{
       @"id" : object.sourceId,
       @"name" : object.name,
       @"thumbnailSize" : @{@"width" : @0, @"height" : @0},
       @"type" : object.sourceType == RTCDesktopSourceTypeScreen ? @"screen" : @"window",
-      //@"thumbnail": data,
     }];
+  }
+
+  // Fenster komplett via ScreenCaptureKit (eine Quelle -> keine Dupes/kein Race,
+  // inkl. Fullscreen-Apps). Async -> result() im Completion (schon auf Main-Thread).
+  if ([types containsObject:@"window"]) {
+    if (@available(macOS 12.3, *)) {
+      [self buildSckWindowSources:^(NSArray<NSDictionary*>* windowDicts) {
+        [sources addObjectsFromArray:windowDicts];
+        result(@{@"sources" : sources});
+      }];
+      return;
+    }
   }
   result(@{@"sources" : sources});
 #else
@@ -541,6 +690,28 @@ NSArray<RTCDesktopSource*>* _captureSources;
 #if TARGET_OS_OSX
   NSLog(@"getDesktopSourceThumbnail");
   NSString* sourceId = argsMap[@"sourceId"];
+  // SCK-nachgereichtes Fenster: Vorschau best-effort per CGWindowListCreateImage
+  // (greift auch ueber Space-Grenzen fuer eine konkrete windowID).
+  if (@available(macOS 12.3, *)) {
+    if ([_sckExtraWindowIds containsObject:sourceId]) {
+      CGWindowID wid = (CGWindowID)[sourceId longLongValue];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+      CGImageRef cg = CGWindowListCreateImage(
+          CGRectNull, kCGWindowListOptionIncludingWindow, wid,
+          kCGWindowImageBoundsIgnoreFraming | kCGWindowImageNominalResolution);
+#pragma clang diagnostic pop
+      if (cg != NULL) {
+        NSImage* img = [[NSImage alloc] initWithCGImage:cg size:NSZeroSize];
+        CGImageRelease(cg);
+        NSImage* resized = [self resizeImage:img forSize:NSMakeSize(320, 180)];
+        result([resized TIFFRepresentation]);
+      } else {
+        result(@{@"error" : @"No thumbnail found"});
+      }
+      return;
+    }
+  }
   RTCDesktopSource* object = [self getSourceById:sourceId];
   if (object == nil) {
     result(@{@"error" : @"No source found"});
@@ -662,11 +833,17 @@ NSArray<RTCDesktopSource*>* _captureSources;
   }
 
   if (captureWindow) {
-    if (!_window)
-      _window = [[RTCDesktopMediaList alloc] initWithType:RTCDesktopSourceTypeWindow delegate:self];
-    [_window UpdateSourceList:forceReload updateAllThumbnails:YES];
-    NSArray<RTCDesktopSource*>* sources = [_window getSources];
-    _captureSources = [_captureSources arrayByAddingObjectsFromArray:sources];
+    if (@available(macOS 12.3, *)) {
+      // Fenster kommen via ScreenCaptureKit (buildSckWindowSources) — hier bewusst
+      // NICHT ueber RTCDesktopMediaList (sonst Dupes + Race mit dessen async-Liste).
+    } else {
+      // Fallback auf altem macOS ohne SCK: RTCDesktopMediaList.
+      if (!_window)
+        _window = [[RTCDesktopMediaList alloc] initWithType:RTCDesktopSourceTypeWindow delegate:self];
+      [_window UpdateSourceList:forceReload updateAllThumbnails:YES];
+      NSArray<RTCDesktopSource*>* sources = [_window getSources];
+      _captureSources = [_captureSources arrayByAddingObjectsFromArray:sources];
+    }
   }
   if (captureScreen) {
     if (!_screen)
