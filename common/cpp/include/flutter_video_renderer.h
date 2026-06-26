@@ -53,6 +53,7 @@ class FlutterVideoRenderer
   const FlutterDesktopGpuSurfaceDescriptor* ObtainGpuSurface(
       size_t width, size_t height) const;
   void set_gpu_surface(bool v) { is_gpu_surface_ = v; }
+  void set_throttle(bool v) { is_throttle_ = v; }
 #endif
 
  private:
@@ -86,11 +87,13 @@ class FlutterVideoRenderer
   mutable std::shared_ptr<uint8_t> fb_cpu_;
   bool EnsureFallbackTexture(int w, int h) const;
 
-  // Self-View-Drossel: die GpuSurface-Kachel (eigener Bildschirm-Stream) zeigt
-  // den Schirm, den man eh sieht -> auf ~25 fps drosseln, damit nicht jeder
-  // 60-fps-Frame ein teures Flutter-Fenster-Composite (ANGLE) ausloest. Der
-  // Sende-Pfad (Encoder) ist davon unberuehrt.
+  // Self-View-Drossel: die EIGENE Bildschirm-Selbstansicht zeigt den Schirm, den
+  // man eh sieht -> auf ~25 fps drosseln, damit nicht jeder 60-fps-Frame ein
+  // teures Flutter-Fenster-Composite (ANGLE) ausloest. Der Sende-Pfad (Encoder)
+  // ist davon unberuehrt. Greift NUR wenn is_throttle_ gesetzt ist; Remote-
+  // Kacheln nutzen denselben GpuSurface-Pfad, aber OHNE Drossel (volle FPS).
   bool is_gpu_surface_ = false;
+  bool is_throttle_ = false;
   int64_t last_mark_ms_ = 0;
 #endif
 };
@@ -99,7 +102,7 @@ class FlutterVideoRendererManager {
  public:
   FlutterVideoRendererManager(FlutterWebRTCBase* base);
 
-  void CreateVideoRendererTexture(bool use_gpu_surface,
+  void CreateVideoRendererTexture(bool use_gpu_surface, bool throttle,
                                   std::unique_ptr<MethodResultProxy> result);
 
   void VideoRendererSetSrcObject(int64_t texture_id,

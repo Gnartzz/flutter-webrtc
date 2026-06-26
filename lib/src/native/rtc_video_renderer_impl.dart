@@ -25,6 +25,12 @@ class RTCVideoRenderer extends ValueNotifier<RTCVideoValue>
   /// fuer alles andere false lassen (Kamera/Remote bleiben PixelBuffer).
   bool gpuSurface = false;
 
+  /// honeycord: nur fuer die EIGENE Bildschirm-Selbstansicht auf true setzen.
+  /// Drosselt die GpuSurface-Kachel nativ auf ~25 fps (spart teure Flutter-
+  /// Composites fuer eine Vorschau, die man ohnehin sieht). Remote-Kacheln NICHT
+  /// drosseln (false lassen) -> sie sollen mit voller Sender-FPS laufen.
+  bool gpuSurfaceThrottle = false;
+
   @override
   Future<void> initialize() async {
     if (_initializing != null) {
@@ -32,8 +38,8 @@ class RTCVideoRenderer extends ValueNotifier<RTCVideoValue>
       return;
     }
     _initializing = Completer();
-    final response = await WebRTC.invokeMethod(
-        'createVideoRenderer', {'gpuSurface': gpuSurface});
+    final response = await WebRTC.invokeMethod('createVideoRenderer',
+        {'gpuSurface': gpuSurface, 'gpuSurfaceThrottle': gpuSurfaceThrottle});
     _textureId = response['textureId'];
     _eventSubscription = EventChannel('FlutterWebRTC/Texture$textureId')
         .receiveBroadcastStream()

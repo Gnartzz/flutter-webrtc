@@ -153,10 +153,11 @@ void FlutterVideoRenderer::OnFrame(scoped_refptr<RTCVideoFrame> frame) {
 #ifdef _WINDOWS
   // Self-View-Drossel auf ~25 fps (40 ms): jeder MarkTextureFrameAvailable
   // triggert ein Flutter-Fenster-Composite (ANGLE, teuer bei grossen Fenstern).
-  // Nur fuer die GpuSurface-Self-View-Kachel; Kamera/Remote (PixelBuffer) nicht
-  // drosseln. frame_ ist bereits aktualisiert -> der naechste Mark zeigt das
-  // neueste Bild (max. 40 ms Verzug, unmerklich). Sende-Pfad unberuehrt.
-  if (is_gpu_surface_) {
+  // NUR fuer die eigene Bildschirm-Selbstansicht (is_throttle_); Remote-Kacheln
+  // nutzen denselben GpuSurface-Pfad, sollen aber mit voller FPS laufen ->
+  // nicht drosseln. frame_ ist bereits aktualisiert -> der naechste Mark zeigt
+  // das neueste Bild (max. 40 ms Verzug, unmerklich). Sende-Pfad unberuehrt.
+  if (is_gpu_surface_ && is_throttle_) {
     int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
                       std::chrono::steady_clock::now().time_since_epoch())
                       .count();
@@ -198,7 +199,8 @@ FlutterVideoRendererManager::FlutterVideoRendererManager(
     : base_(base) {}
 
 void FlutterVideoRendererManager::CreateVideoRendererTexture(
-    bool use_gpu_surface, std::unique_ptr<MethodResultProxy> result) {
+    bool use_gpu_surface, bool throttle,
+    std::unique_ptr<MethodResultProxy> result) {
   auto texture = new RefCountedObject<FlutterVideoRenderer>();
   // Default: PixelBuffer (Kamera/Remote) -- bewaehrt, fasst nichts an. NUR wenn
   // die App explizit gpuSurface=true setzt (chirurgisch: lokale Bildschirm-
@@ -208,7 +210,8 @@ void FlutterVideoRendererManager::CreateVideoRendererTexture(
   std::unique_ptr<flutter::TextureVariant> textureVariant;
 #ifdef _WINDOWS
   if (use_gpu_surface) {
-    texture->set_gpu_surface(true);  // -> Self-View-Drossel in OnFrame
+    texture->set_gpu_surface(true);
+    texture->set_throttle(throttle);  // nur Self-View drosselt (OnFrame)
     textureVariant = std::make_unique<flutter::TextureVariant>(
         flutter::GpuSurfaceTexture(
             kFlutterDesktopGpuSurfaceTypeDxgiSharedHandle,

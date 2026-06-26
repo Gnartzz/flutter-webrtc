@@ -489,6 +489,7 @@ void FlutterWebRTC::HandleMethodCall(
     // honeycord: optionales Flag gpuSurface (nur Windows-Self-View) -> der
     // Renderer registriert eine GpuSurfaceTexture statt PixelBuffer.
     bool use_gpu_surface = false;
+    bool throttle = false;
     if (method_call.arguments()) {
       const EncodableMap params =
           GetValue<EncodableMap>(*method_call.arguments());
@@ -496,8 +497,13 @@ void FlutterWebRTC::HandleMethodCall(
       if (it != params.end() && std::holds_alternative<bool>(it->second)) {
         use_gpu_surface = std::get<bool>(it->second);
       }
+      // throttle: nur die Self-View drosselt sich; Remote-Kacheln laufen voll.
+      auto it_t = params.find(EncodableValue("gpuSurfaceThrottle"));
+      if (it_t != params.end() && std::holds_alternative<bool>(it_t->second)) {
+        throttle = std::get<bool>(it_t->second);
+      }
     }
-    CreateVideoRendererTexture(use_gpu_surface, std::move(result));
+    CreateVideoRendererTexture(use_gpu_surface, throttle, std::move(result));
   } else if (method_call.method_name().compare("videoRendererDispose") == 0) {
     if (!method_call.arguments()) {
       result->Error("Bad Arguments", "Null constraints arguments received");
