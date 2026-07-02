@@ -110,6 +110,11 @@ class FlutterVideoRenderer
   mutable int dbg_native_ = -1;
   mutable double dbg_fb_ms_ = 0.0;
   mutable unsigned dbg_fb_n_ = 0;
+  // Dauer von MarkTextureFrameAvailable (im ONFRAME-Log als mark=X). Blockiert das
+  // ~140ms, ist Flutters Composite der Decoder-Textur der 7-fps-Deckel (Sink-
+  // Backpressure) -> WebRTCs Render-Pacing wirft die restlichen Frames weg.
+  double dbg_mark_ms_ = 0.0;
+  unsigned dbg_mark_n_ = 0;
 #endif
 };
 

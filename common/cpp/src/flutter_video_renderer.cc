@@ -21,13 +21,15 @@ inline int64_t NowMs() {
 #pragma warning(push)
 #pragma warning(disable : 4996)
 void RenderLog(int64_t tex, int throttled, const char* what, double fps, int w, int h,
-               int native, double fb_ms) {
+               int native, double fb_ms, double mark_ms) {
   if (const char* base = std::getenv("LOCALAPPDATA")) {
     std::string path = std::string(base) + "\\HoneyCord\\render.log";
     if (FILE* f = std::fopen(path.c_str(), "a")) {
       std::fprintf(f,
-                   "[render] tex=%lld throttled=%d %s=%.1f fps %dx%d native=%d fbconv=%.2f ms\n",
-                   static_cast<long long>(tex), throttled, what, fps, w, h, native, fb_ms);
+                   "[render] tex=%lld throttled=%d %s=%.1f fps %dx%d native=%d "
+                   "fbconv=%.2f ms mark=%.1f ms\n",
+                   static_cast<long long>(tex), throttled, what, fps, w, h, native,
+                   fb_ms, mark_ms);
       std::fclose(f);
     }
   }
@@ -156,7 +158,7 @@ const FlutterDesktopGpuSurfaceDescriptor* FlutterVideoRenderer::ObtainGpuSurface
       double fbavg = dbg_fb_n_ ? dbg_fb_ms_ / dbg_fb_n_ : 0.0;
       RenderLog(texture_id_, is_throttle_ ? 1 : 0, "COMPOSITE",
                 dbg_ob_calls_ * 1000.0 / (now - dbg_ob_last_ms_), w, h,
-                dbg_native_, fbavg);
+                dbg_native_, fbavg, -1.0);
       dbg_ob_calls_ = 0;
       dbg_ob_last_ms_ = now;
       dbg_fb_ms_ = 0.0;
@@ -174,12 +176,15 @@ void FlutterVideoRenderer::OnFrame(scoped_refptr<RTCVideoFrame> frame) {
     if (dbg_of_last_ms_ == 0) dbg_of_last_ms_ = now;
     dbg_of_calls_++;
     if (now - dbg_of_last_ms_ >= 2000) {
+      double markavg = dbg_mark_n_ ? dbg_mark_ms_ / dbg_mark_n_ : 0.0;
       RenderLog(texture_id_, is_throttle_ ? 1 : 0, "ONFRAME",
                 dbg_of_calls_ * 1000.0 / (now - dbg_of_last_ms_),
                 frame->width(), frame->height(),
-                frame->native_shared_handle() ? 1 : 0, -1.0);
+                frame->native_shared_handle() ? 1 : 0, -1.0, markavg);
       dbg_of_calls_ = 0;
       dbg_of_last_ms_ = now;
+      dbg_mark_ms_ = 0.0;
+      dbg_mark_n_ = 0;
     }
   }
 #endif
@@ -230,6 +235,13 @@ void FlutterVideoRenderer::OnFrame(scoped_refptr<RTCVideoFrame> frame) {
     if (now - last_mark_ms_ < 40) return;
     last_mark_ms_ = now;
   }
+  auto _t_mark = std::chrono::steady_clock::now();
+  registrar_->MarkTextureFrameAvailable(texture_id_);
+  dbg_mark_ms_ += std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - _t_mark)
+                      .count();
+  dbg_mark_n_++;
+  return;
 #endif
   registrar_->MarkTextureFrameAvailable(texture_id_);
 }
