@@ -17,6 +17,9 @@ inline int64_t NowMs() {
       .count();
 }
 // Diagnose: Render-fps pro Kachel nach %LOCALAPPDATA%\HoneyCord\render.log.
+// getenv/fopen loesen unter MSVC C4996 aus (bei /WX = Fehler) -> nur hier unterdruecken.
+#pragma warning(push)
+#pragma warning(disable : 4996)
 void RenderLog(int64_t tex, int throttled, const char* what, double fps, int w, int h,
                int native, double fb_ms) {
   if (const char* base = std::getenv("LOCALAPPDATA")) {
@@ -29,6 +32,7 @@ void RenderLog(int64_t tex, int throttled, const char* what, double fps, int w, 
     }
   }
 }
+#pragma warning(pop)
 }  // namespace
 #endif
 
