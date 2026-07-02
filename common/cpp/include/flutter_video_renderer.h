@@ -95,6 +95,14 @@ class FlutterVideoRenderer
   bool is_gpu_surface_ = false;
   bool is_throttle_ = false;
   int64_t last_mark_ms_ = 0;
+  // Diagnose (2026-07-02): echte Render-fps messen. COMPOSITE = wie oft Flutter die
+  // Kachel wirklich zeichnet (ObtainGpuSurface/s); ONFRAME = wie oft ein Frame an
+  // den Sink geliefert wird. Selbst-Ansicht (throttled) sagt: schafft der Composite
+  // ~25 fps (Render schnell) oder haengt er bei ~8 (Render = der Engpass)?
+  mutable unsigned dbg_ob_calls_ = 0;
+  mutable int64_t dbg_ob_last_ms_ = 0;
+  unsigned dbg_of_calls_ = 0;
+  int64_t dbg_of_last_ms_ = 0;
 #endif
 };
 

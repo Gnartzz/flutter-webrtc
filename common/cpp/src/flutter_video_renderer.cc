@@ -2,9 +2,33 @@
 
 #ifdef _WINDOWS
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 #endif
 
 namespace flutter_webrtc_plugin {
+
+#ifdef _WINDOWS
+namespace {
+inline int64_t NowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+// Diagnose: Render-fps pro Kachel nach %LOCALAPPDATA%\HoneyCord\render.log.
+void RenderLog(int64_t tex, int throttled, const char* what, double fps, int w, int h) {
+  if (const char* base = std::getenv("LOCALAPPDATA")) {
+    std::string path = std::string(base) + "\\HoneyCord\\render.log";
+    if (FILE* f = std::fopen(path.c_str(), "a")) {
+      std::fprintf(f, "[render] tex=%lld throttled=%d %s=%.1f fps %dx%d\n",
+                   static_cast<long long>(tex), throttled, what, fps, w, h);
+      std::fclose(f);
+    }
+  }
+}
+}  // namespace
+#endif
 
 FlutterVideoRenderer::~FlutterVideoRenderer() {}
 
@@ -112,11 +136,36 @@ const FlutterDesktopGpuSurfaceDescriptor* FlutterVideoRenderer::ObtainGpuSurface
   gpu_descriptor_.format = kFlutterDesktopPixelFormatBGRA8888;
   gpu_descriptor_.release_callback = nullptr;
   gpu_descriptor_.release_context = nullptr;
+  {
+    int64_t now = NowMs();
+    if (dbg_ob_last_ms_ == 0) dbg_ob_last_ms_ = now;
+    dbg_ob_calls_++;
+    if (now - dbg_ob_last_ms_ >= 2000) {
+      RenderLog(texture_id_, is_throttle_ ? 1 : 0, "COMPOSITE",
+                dbg_ob_calls_ * 1000.0 / (now - dbg_ob_last_ms_), w, h);
+      dbg_ob_calls_ = 0;
+      dbg_ob_last_ms_ = now;
+    }
+  }
   return &gpu_descriptor_;
 }
 #endif
 
 void FlutterVideoRenderer::OnFrame(scoped_refptr<RTCVideoFrame> frame) {
+#ifdef _WINDOWS
+  {
+    int64_t now = NowMs();
+    if (dbg_of_last_ms_ == 0) dbg_of_last_ms_ = now;
+    dbg_of_calls_++;
+    if (now - dbg_of_last_ms_ >= 2000) {
+      RenderLog(texture_id_, is_throttle_ ? 1 : 0, "ONFRAME",
+                dbg_of_calls_ * 1000.0 / (now - dbg_of_last_ms_),
+                frame->width(), frame->height());
+      dbg_of_calls_ = 0;
+      dbg_of_last_ms_ = now;
+    }
+  }
+#endif
   if (!first_frame_rendered) {
     EncodableMap params;
     params[EncodableValue("event")] = "didFirstFrameRendered";
