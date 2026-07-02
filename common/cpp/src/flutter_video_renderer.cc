@@ -17,12 +17,14 @@ inline int64_t NowMs() {
       .count();
 }
 // Diagnose: Render-fps pro Kachel nach %LOCALAPPDATA%\HoneyCord\render.log.
-void RenderLog(int64_t tex, int throttled, const char* what, double fps, int w, int h) {
+void RenderLog(int64_t tex, int throttled, const char* what, double fps, int w, int h,
+               int native, double fb_ms) {
   if (const char* base = std::getenv("LOCALAPPDATA")) {
     std::string path = std::string(base) + "\\HoneyCord\\render.log";
     if (FILE* f = std::fopen(path.c_str(), "a")) {
-      std::fprintf(f, "[render] tex=%lld throttled=%d %s=%.1f fps %dx%d\n",
-                   static_cast<long long>(tex), throttled, what, fps, w, h);
+      std::fprintf(f,
+                   "[render] tex=%lld throttled=%d %s=%.1f fps %dx%d native=%d fbconv=%.2f ms\n",
+                   static_cast<long long>(tex), throttled, what, fps, w, h, native, fb_ms);
       std::fclose(f);
     }
   }
@@ -117,15 +119,21 @@ const FlutterDesktopGpuSurfaceDescriptor* FlutterVideoRenderer::ObtainGpuSurface
   if (w <= 0 || h <= 0) return nullptr;
 
   void* handle = frame_->native_shared_handle();
+  dbg_native_ = handle ? 1 : 0;
   if (!handle) {
     // Nicht-nativer Frame (Kamera/Remote, I420): nach BGRA konvertieren und in
     // die eigene Shared-Textur hochladen. Producer (Upload) + Consumer (ANGLE)
     // laufen beide sequenziell auf dem Raster-Thread -> kein Keyed-Mutex noetig.
     if (!EnsureFallbackTexture(w, h)) return nullptr;
+    auto _t_fb = std::chrono::steady_clock::now();
     frame_->ConvertToARGB(RTCVideoFrame::Type::kBGRA, fb_cpu_.get(), 0, w, h);
     fb_ctx_->UpdateSubresource(fb_tex_.Get(), 0, nullptr, fb_cpu_.get(),
                                static_cast<UINT>(w) * 4, 0);
     fb_ctx_->Flush();
+    dbg_fb_ms_ += std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - _t_fb)
+                      .count();
+    dbg_fb_n_++;
     handle = fb_handle_;
   }
 
@@ -141,10 +149,14 @@ const FlutterDesktopGpuSurfaceDescriptor* FlutterVideoRenderer::ObtainGpuSurface
     if (dbg_ob_last_ms_ == 0) dbg_ob_last_ms_ = now;
     dbg_ob_calls_++;
     if (now - dbg_ob_last_ms_ >= 2000) {
+      double fbavg = dbg_fb_n_ ? dbg_fb_ms_ / dbg_fb_n_ : 0.0;
       RenderLog(texture_id_, is_throttle_ ? 1 : 0, "COMPOSITE",
-                dbg_ob_calls_ * 1000.0 / (now - dbg_ob_last_ms_), w, h);
+                dbg_ob_calls_ * 1000.0 / (now - dbg_ob_last_ms_), w, h,
+                dbg_native_, fbavg);
       dbg_ob_calls_ = 0;
       dbg_ob_last_ms_ = now;
+      dbg_fb_ms_ = 0.0;
+      dbg_fb_n_ = 0;
     }
   }
   return &gpu_descriptor_;
@@ -160,7 +172,8 @@ void FlutterVideoRenderer::OnFrame(scoped_refptr<RTCVideoFrame> frame) {
     if (now - dbg_of_last_ms_ >= 2000) {
       RenderLog(texture_id_, is_throttle_ ? 1 : 0, "ONFRAME",
                 dbg_of_calls_ * 1000.0 / (now - dbg_of_last_ms_),
-                frame->width(), frame->height());
+                frame->width(), frame->height(),
+                frame->native_shared_handle() ? 1 : 0, -1.0);
       dbg_of_calls_ = 0;
       dbg_of_last_ms_ = now;
     }

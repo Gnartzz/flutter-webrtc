@@ -103,6 +103,13 @@ class FlutterVideoRenderer
   mutable int64_t dbg_ob_last_ms_ = 0;
   unsigned dbg_of_calls_ = 0;
   int64_t dbg_of_last_ms_ = 0;
+  // native=1: HW-Frame kam als GPU-Shared-Handle an (Zero-Copy-Pfad). native=0:
+  // I420-Fallback (frame->native_shared_handle()==null) -> jeder Composite
+  // konvertiert+laedt hoch (dbg_fb_ms_ = Summe dieser Kosten im 2s-Fenster).
+  // Beantwortet: ueberlebt die HW-Textur bis zum Renderer, und was kostet der Pfad?
+  mutable int dbg_native_ = -1;
+  mutable double dbg_fb_ms_ = 0.0;
+  mutable unsigned dbg_fb_n_ = 0;
 #endif
 };
 
