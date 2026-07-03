@@ -31,6 +31,7 @@ add_library(${PLUGIN_NAME} SHARED
   "flutter_webrtc_plugin.cc"
   "task_runner_windows.cc"
   "honeycord_wasapi_loopback.cc"
+  "honeycord_mem_telemetry.cc"
 )
 
 include_directories(
@@ -59,6 +60,8 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
   # Per-App-Audio (id16): HWND -> PID des geteilten Fensters
   # (IsWindow / GetWindowThreadProcessId).
   user32
+  # Memory-Telemetrie (mem.log): GetProcessMemoryInfo.
+  psapi
   # honeycord GPU-Zero-Copy-Vorschau: der Renderer erzeugt eine eigene
   # D3D11-Shared-Textur (D3D11CreateDevice / IDXGIResource::GetSharedHandle).
   d3d11

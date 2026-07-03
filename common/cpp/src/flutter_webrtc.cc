@@ -3,6 +3,10 @@
 
 #include "flutter_webrtc/flutter_web_r_t_c_plugin.h"
 
+#if defined(_WIN32)
+#include "../../../windows/honeycord_mem_telemetry.h"
+#endif
+
 namespace flutter_webrtc_plugin {
 
 static EventChannelProxy* eventChannelProxy = nullptr;
@@ -17,7 +21,12 @@ FlutterWebRTC::FlutterWebRTC(FlutterWebRTCPlugin* plugin)
       FlutterScreenCapture::FlutterScreenCapture(this),
       FlutterDataChannel::FlutterDataChannel(this),
       FlutterFrameCryptor::FlutterFrameCryptor(this),
-      FlutterDataPacketCryptor::FlutterDataPacketCryptor(this) {}
+      FlutterDataPacketCryptor::FlutterDataPacketCryptor(this) {
+#if defined(_WIN32)
+  // OOM-Diagnose (Abendtest 2026-07-03): RAM/VRAM/Handle-Kurve nach mem.log.
+  honeycord::StartMemTelemetryOnce();
+#endif
+}
 
 FlutterWebRTC::~FlutterWebRTC() {}
 
