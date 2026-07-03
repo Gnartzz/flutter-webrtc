@@ -416,6 +416,10 @@ void FlutterWebRTC::HandleMethodCall(
     const EncodableMap params =
         GetValue<EncodableMap>(*method_call.arguments());
     const std::string stream_id = findString(params, "streamId");
+#if defined(_WIN32)
+    // Screen-Share-Ende: zugehoerigen WASAPI-Loopback stoppen (id10-Leak-Fix).
+    StopLoopbackForStream(stream_id);
+#endif
     MediaStreamDispose(stream_id, std::move(result));
   } else if (method_call.method_name().compare("mediaStreamTrackSetEnable") ==
              0) {

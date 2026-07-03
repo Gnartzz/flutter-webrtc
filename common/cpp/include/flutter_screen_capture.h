@@ -36,6 +36,14 @@ class FlutterScreenCapture : public MediaListObserver,
                                  int height,
                                  std::unique_ptr<MethodResultProxy> result);
 
+#if defined(_WIN32)
+  // Stoppt + entfernt den WASAPI-Loopback des Streams (id10-Leak-Fix): wird
+  // aus dem streamDispose-Handler gerufen (LiveKits LocalTrack.stop() ->
+  // mediaStream.dispose()). Ohne das lief der Capture-Thread nach Share-Ende
+  // fuer immer weiter (ein Thread pro beendetem Share).
+  void StopLoopbackForStream(const std::string& stream_id);
+#endif
+
  protected:
   void OnMediaSourceAdded(scoped_refptr<MediaSource> source) override;
 

@@ -184,6 +184,18 @@ void FlutterScreenCapture::GetDesktopSourceThumbnail(
   result->Success(EncodableValue(source->thumbnail().std_vector()));
 }
 
+#if defined(_WIN32)
+void FlutterScreenCapture::StopLoopbackForStream(const std::string& stream_id) {
+  auto it = wasapi_loopbacks_.find(stream_id);
+  if (it == wasapi_loopbacks_.end()) return;
+  honeycord::WasapiLogFromPlugin(
+      "streamDispose: stoppe WASAPI-Loopback fuer stream=%s",
+      stream_id.c_str());
+  it->second->Stop();
+  wasapi_loopbacks_.erase(it);
+}
+#endif
+
 void FlutterScreenCapture::GetDisplayMedia(
     const EncodableMap& constraints,
     std::unique_ptr<MethodResultProxy> result) {
