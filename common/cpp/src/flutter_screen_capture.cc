@@ -1,6 +1,8 @@
 #include "flutter_screen_capture.h"
 
 #if defined(_WIN32)
+#include <windows.h>
+#include <cstdlib>
 #include "../../../windows/honeycord_wasapi_loopback.h"
 #endif
 
@@ -252,6 +254,23 @@ void FlutterScreenCapture::GetDisplayMedia(
   if (capture_audio) {
     honeycord::WasapiLogFromPlugin("getDisplayMedia: capture_audio=true uuid=%s",
                                     uuid.c_str());
+    // Per-App-Audio (id16): Ist die gewaehlte Quelle ein FENSTER, capturen wir
+    // nur das Audio der App dahinter (HWND -> PID, Include-Modus im Loopback).
+    // Screen-Shares (oder PID nicht ermittelbar) -> 0 = System-Mix ohne uns.
+    unsigned long include_pid = 0;
+    for (auto src : sources_) {
+      if (src->id().std_string() == source_id && src->type() == kWindow) {
+        HWND hwnd = reinterpret_cast<HWND>(
+            static_cast<uintptr_t>(std::strtoull(source_id.c_str(), nullptr, 10)));
+        DWORD pid = 0;
+        if (hwnd && IsWindow(hwnd)) GetWindowThreadProcessId(hwnd, &pid);
+        include_pid = pid;
+        honeycord::WasapiLogFromPlugin(
+            "  Fenster-Share erkannt: hwnd=%p -> pid=%lu (Per-App-Audio)",
+            reinterpret_cast<void*>(hwnd), include_pid);
+        break;
+      }
+    }
     scoped_refptr<RTCAudioSource> audio_source =
         base_->factory_->CreateAudioSource(
             "screen-share-audio", RTCAudioSource::SourceType::kCustom);
@@ -266,7 +285,8 @@ void FlutterScreenCapture::GetDisplayMedia(
           audio_track.get(),
           audio_track.get() ? audio_track->kind().std_string().c_str() : "<null>");
       if (audio_track.get()) {
-        auto loopback = std::make_unique<honeycord::WasapiLoopback>(audio_source);
+        auto loopback =
+            std::make_unique<honeycord::WasapiLoopback>(audio_source, include_pid);
         bool started = loopback->Start();
         honeycord::WasapiLogFromPlugin("  WasapiLoopback::Start = %d",
                                         started ? 1 : 0);

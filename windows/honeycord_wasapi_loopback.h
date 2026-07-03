@@ -48,8 +48,15 @@ void WasapiLogFromPlugin(const char* fmt, ...);
 
 class WasapiLoopback {
  public:
+  // include_pid == 0 (Default, Screen-Share): System-Mix OHNE den eigenen
+  // Prozessbaum (EXCLUDE, id13-Echo-Fix). include_pid != 0 (Fenster-/Game-
+  // Share, id16 Per-App-Audio): NUR das Audio des Prozessbaums dieser PID
+  // (INCLUDE) — z. B. nur das geteilte Spiel, keine Musik/Notifys daneben.
+  // Schlaegt der Include-Modus fehl, faellt Start() auf Exclude (System-Mix)
+  // und zuletzt aufs Endpoint-Loopback zurueck.
   explicit WasapiLoopback(
-      libwebrtc::scoped_refptr<libwebrtc::RTCAudioSource> source);
+      libwebrtc::scoped_refptr<libwebrtc::RTCAudioSource> source,
+      unsigned long include_pid = 0);
   ~WasapiLoopback();
 
   // Startet den COM-/WASAPI-Stack und den Capture-Thread. Gibt false zurück,
@@ -63,9 +70,11 @@ class WasapiLoopback {
 
  private:
   void CaptureLoop();
-  // Versucht Process-Loopback mit Selbst-Ausschluss (bevorzugt); setzt
-  // client_/mix_format_/capture_event_. false = Fallback noetig.
-  bool TryStartProcessLoopback();
+  // Versucht Process-Loopback (bevorzugt); setzt client_/mix_format_/
+  // capture_event_. include_mode=true -> NUR include_pid_-Prozessbaum
+  // (Per-App-Audio); false -> alles AUSSER dem eigenen Prozessbaum.
+  // false-Rueckgabe = naechste Fallback-Stufe versuchen.
+  bool TryStartProcessLoopback(bool include_mode);
   // Klassisches Endpoint-Loopback auf dem Default-Render-Device (Fallback).
   bool StartEndpointLoopback();
   // Gibt COM-Objekte/Format/Event frei (fuer Stop + Aufraeumen zwischen den
@@ -73,6 +82,9 @@ class WasapiLoopback {
   void ReleaseCom();
 
   libwebrtc::scoped_refptr<libwebrtc::RTCAudioSource> source_;
+  // Per-App-Audio (id16): PID des geteilten Fensters (0 = Screen-Share ->
+  // System-Mix im Exclude-Modus).
+  unsigned long include_pid_ = 0;
   std::atomic<bool> running_{false};
   std::thread thread_;
 

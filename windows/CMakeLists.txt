@@ -56,6 +56,9 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
   # HoneyCord WASAPI-Loopback braucht COM + AudioClient-Interfaces.
   ole32
   mmdevapi
+  # Per-App-Audio (id16): HWND -> PID des geteilten Fensters
+  # (IsWindow / GetWindowThreadProcessId).
+  user32
   # honeycord GPU-Zero-Copy-Vorschau: der Renderer erzeugt eine eigene
   # D3D11-Shared-Textur (D3D11CreateDevice / IDXGIResource::GetSharedHandle).
   d3d11

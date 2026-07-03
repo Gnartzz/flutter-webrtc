@@ -199,8 +199,9 @@ class ActivateHandler : public IActivateAudioInterfaceCompletionHandler,
 }  // namespace
 
 WasapiLoopback::WasapiLoopback(
-    libwebrtc::scoped_refptr<libwebrtc::RTCAudioSource> source)
-    : source_(std::move(source)) {}
+    libwebrtc::scoped_refptr<libwebrtc::RTCAudioSource> source,
+    unsigned long include_pid)
+    : source_(std::move(source)), include_pid_(include_pid) {}
 
 WasapiLoopback::~WasapiLoopback() { Stop(); }
 
@@ -218,21 +219,40 @@ bool WasapiLoopback::Start() {
   HRESULT co_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
   HcLog("Start: CoInitializeEx = 0x%08lx", (long)co_hr);
 
-  // 1) Bevorzugt: Process-Loopback MIT Selbst-Ausschluss (id13-Echo-Fix).
-  // 2) Fallback: klassisches Endpoint-Loopback (Status quo inkl. eigener
+  // Stufenkette:
+  // 1) include_pid_ gesetzt (Fenster-/Game-Share): NUR das Audio der
+  //    geteilten App (id16 Per-App-Audio).
+  // 2) Process-Loopback MIT Selbst-Ausschluss = System-Mix ohne uns
+  //    (id13-Echo-Fix; Standard fuer Screen-Shares).
+  // 3) Fallback: klassisches Endpoint-Loopback (Status quo inkl. eigener
   //    Wiedergabe) — lieber Echo als gar kein Stream-Audio.
-  bool process_mode = TryStartProcessLoopback();
-  if (!process_mode) {
-    ReleaseCom();  // Teilzustand des fehlgeschlagenen Versuchs wegraeumen
-    HcLog("Start: FALLBACK auf Endpoint-Loopback (inkl. eigener Wiedergabe!)");
-    if (!StartEndpointLoopback()) {
+  const char* mode_desc = nullptr;
+  bool ok = false;
+  if (include_pid_ != 0) {
+    ok = TryStartProcessLoopback(/*include_mode=*/true);
+    if (ok) {
+      mode_desc = "process-include (nur geteilte App)";
+    } else {
       ReleaseCom();
-      return false;
+      HcLog("Start: include-Modus (pid=%lu) fehlgeschlagen -> exclude",
+            include_pid_);
     }
   }
-  HcLog("Start: Loopback-Modus = %s",
-        process_mode ? "process-exclude (ohne eigene Wiedergabe)"
-                     : "endpoint-fallback");
+  if (!ok) {
+    ok = TryStartProcessLoopback(/*include_mode=*/false);
+    if (ok) {
+      mode_desc = "process-exclude (ohne eigene Wiedergabe)";
+    } else {
+      ReleaseCom();
+      HcLog("Start: FALLBACK auf Endpoint-Loopback (inkl. eigener Wiedergabe!)");
+      if (!StartEndpointLoopback()) {
+        ReleaseCom();
+        return false;
+      }
+      mode_desc = "endpoint-fallback";
+    }
+  }
+  HcLog("Start: Loopback-Modus = %s", mode_desc);
 
   HRESULT hr = client_->GetService(kIID_IAudioCaptureClient,
                                    reinterpret_cast<void**>(&capture_));
@@ -268,15 +288,21 @@ bool WasapiLoopback::Start() {
   return true;
 }
 
-bool WasapiLoopback::TryStartProcessLoopback() {
-  // Virtuelles Loopback-Device, das ALLES System-Audio AUSSER dem eigenen
-  // Prozessbaum liefert. Eigener Prozessbaum = unsere Voice-Wiedergabe,
-  // Soundboard, Notify-Toene -> genau das, was NICHT in den Stream soll.
+bool WasapiLoopback::TryStartProcessLoopback(bool include_mode) {
+  // Virtuelles Loopback-Device. include_mode=false: ALLES System-Audio AUSSER
+  // dem eigenen Prozessbaum (eigene Voice-Wiedergabe, Soundboard, Notifys ->
+  // genau das, was NICHT in den Stream soll). include_mode=true: NUR der
+  // Prozessbaum der geteilten App (Per-App-Audio beim Fenster-/Game-Share).
   AUDIOCLIENT_ACTIVATION_PARAMS params = {};
   params.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
-  params.ProcessLoopbackParams.TargetProcessId = GetCurrentProcessId();
+  params.ProcessLoopbackParams.TargetProcessId =
+      include_mode ? static_cast<DWORD>(include_pid_) : GetCurrentProcessId();
   params.ProcessLoopbackParams.ProcessLoopbackMode =
-      PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE;
+      include_mode ? PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE
+                   : PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE;
+  HcLog("ProcLoopback: Modus=%s targetPid=%lu",
+        include_mode ? "INCLUDE" : "EXCLUDE",
+        (unsigned long)params.ProcessLoopbackParams.TargetProcessId);
   PROPVARIANT pv = {};
   pv.vt = VT_BLOB;
   pv.blob.cbSize = sizeof(params);
