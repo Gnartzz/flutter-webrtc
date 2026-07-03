@@ -130,6 +130,10 @@ inline int toInt(flutter::EncodableValue inputVal, int defaultVal) {
     intValue = GetValue<int>(inputVal);
   } else if (TypeIs<int32_t>(inputVal)) {
     intValue = GetValue<int32_t>(inputVal);
+  } else if (TypeIs<double>(inputVal)) {
+    // Dart schickt Zahlen oft als double (z.B. frameRate: 60.0) — ohne diesen
+    // Zweig fiel der Wert still auf den Default zurueck (Parser-Loch 2026-07-03).
+    intValue = static_cast<int>(GetValue<double>(inputVal) + 0.5);
   } else if (TypeIs<std::string>(inputVal)) {
     intValue = atoi(GetValue<std::string>(inputVal).c_str());
   }

@@ -193,20 +193,34 @@ std::string getFacingMode(const EncodableMap& mediaConstraints) {
              : "";
 }
 
+// Constraint-Wert als int extrahieren. WICHTIG (Parser-Loch, gefixt
+// 2026-07-03): livekit_client schickt z.B. frameRate als {'max': 60.0} —
+// Map-Key 'max' UND double-Wert. Die alte Fassung verstand nur nackte ints
+// und {'ideal': int} -> JEDE Kamera lief auf Windows mit DEFAULT_FPS=30,
+// egal was die App anforderte (720p60-Setting wirkungslos). Jetzt:
+// ideal > exact > max > min, jeweils int ODER double (gerundet).
+static EncodableValue numToIntValue(const EncodableValue& v) {
+  if (TypeIs<int>(v)) return v;
+  if (TypeIs<double>(v))
+    return EncodableValue(static_cast<int>(GetValue<double>(v) + 0.5));
+  return EncodableValue();
+}
+
 EncodableValue getConstrainInt(const EncodableMap& constraints,
                                const std::string& key) {
-  EncodableValue value;
   auto it = constraints.find(EncodableValue(key));
-  if (it != constraints.end()) {
-    if (TypeIs<int>(it->second)) {
-      return it->second;
-    }
+  if (it == constraints.end()) return EncodableValue();
 
-    if (TypeIs<EncodableMap>(it->second)) {
-      EncodableMap innerMap = GetValue<EncodableMap>(it->second);
-      auto it2 = innerMap.find(EncodableValue("ideal"));
-      if (it2 != innerMap.end() && TypeIs<int>(it2->second)) {
-        return it2->second;
+  EncodableValue direct = numToIntValue(it->second);
+  if (direct != EncodableValue()) return direct;
+
+  if (TypeIs<EncodableMap>(it->second)) {
+    EncodableMap innerMap = GetValue<EncodableMap>(it->second);
+    for (const char* k : {"ideal", "exact", "max", "min"}) {
+      auto it2 = innerMap.find(EncodableValue(k));
+      if (it2 != innerMap.end()) {
+        EncodableValue v = numToIntValue(it2->second);
+        if (v != EncodableValue()) return v;
       }
     }
   }
