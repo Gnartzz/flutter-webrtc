@@ -16,6 +16,36 @@ inline int64_t NowMs() {
              std::chrono::steady_clock::now().time_since_epoch())
       .count();
 }
+// Log-Rotation (wie honeycord_wasapi_loopback.cc): > 1 MB -> <path>.old
+// (ersetzt Vorgaenger), Archiv aelter 14 Tage -> geloescht. Einmal pro Prozess.
+void RotateLogIfNeededA(const char* path) {
+  char old_path[MAX_PATH + 8];
+  std::snprintf(old_path, sizeof(old_path), "%s.old", path);
+  WIN32_FILE_ATTRIBUTE_DATA fad{};
+  if (GetFileAttributesExA(old_path, GetFileExInfoStandard, &fad)) {
+    FILETIME now_ft;
+    GetSystemTimeAsFileTime(&now_ft);
+    ULARGE_INTEGER now_u{}, old_u{};
+    now_u.LowPart = now_ft.dwLowDateTime;
+    now_u.HighPart = now_ft.dwHighDateTime;
+    old_u.LowPart = fad.ftLastWriteTime.dwLowDateTime;
+    old_u.HighPart = fad.ftLastWriteTime.dwHighDateTime;
+    const unsigned long long k14Days100ns = 14ULL * 24 * 3600 * 10000000ULL;
+    if (now_u.QuadPart > old_u.QuadPart &&
+        now_u.QuadPart - old_u.QuadPart > k14Days100ns) {
+      DeleteFileA(old_path);
+    }
+  }
+  if (GetFileAttributesExA(path, GetFileExInfoStandard, &fad)) {
+    const unsigned long long size =
+        (static_cast<unsigned long long>(fad.nFileSizeHigh) << 32) |
+        fad.nFileSizeLow;
+    if (size > 1024ULL * 1024ULL) {
+      MoveFileExA(path, old_path, MOVEFILE_REPLACE_EXISTING);
+    }
+  }
+}
+
 // Diagnose: Render-fps pro Kachel nach %LOCALAPPDATA%\HoneyCord\render.log.
 // getenv/fopen loesen unter MSVC C4996 aus (bei /WX = Fehler) -> nur hier unterdruecken.
 #pragma warning(push)
@@ -24,6 +54,11 @@ void RenderLog(int64_t tex, int throttled, const char* what, double fps, int w, 
                int native, double fb_ms, double mark_ms) {
   if (const char* base = std::getenv("LOCALAPPDATA")) {
     std::string path = std::string(base) + "\\HoneyCord\\render.log";
+    static const bool rotated = [&path] {
+      RotateLogIfNeededA(path.c_str());
+      return true;
+    }();
+    (void)rotated;
     if (FILE* f = std::fopen(path.c_str(), "a")) {
       std::fprintf(f,
                    "[render] tex=%lld throttled=%d %s=%.1f fps %dx%d native=%d "

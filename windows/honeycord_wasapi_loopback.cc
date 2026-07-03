@@ -25,6 +25,38 @@
 #include <cstring>
 #include <mutex>
 
+// Log-Rotation: haelt ein Log unter ~1 MB. Voll -> nach <path>.old verschoben
+// (ersetzt das vorherige Archiv); ein Archiv aelter als 14 Tage wird geloescht.
+// Einmal pro Prozess und Log gerufen — der Zuwachs einer Session ist klein,
+// die Rotation verhindert nur das Anwachsen ueber viele Sessions (Datenmuell).
+static void RotateLogIfNeededA(const char* path) {
+  char old_path[MAX_PATH + 8];
+  std::snprintf(old_path, sizeof(old_path), "%s.old", path);
+  WIN32_FILE_ATTRIBUTE_DATA fad{};
+  if (GetFileAttributesExA(old_path, GetFileExInfoStandard, &fad)) {
+    FILETIME now_ft;
+    GetSystemTimeAsFileTime(&now_ft);
+    ULARGE_INTEGER now_u{}, old_u{};
+    now_u.LowPart = now_ft.dwLowDateTime;
+    now_u.HighPart = now_ft.dwHighDateTime;
+    old_u.LowPart = fad.ftLastWriteTime.dwLowDateTime;
+    old_u.HighPart = fad.ftLastWriteTime.dwHighDateTime;
+    const unsigned long long k14Days100ns = 14ULL * 24 * 3600 * 10000000ULL;
+    if (now_u.QuadPart > old_u.QuadPart &&
+        now_u.QuadPart - old_u.QuadPart > k14Days100ns) {
+      DeleteFileA(old_path);
+    }
+  }
+  if (GetFileAttributesExA(path, GetFileExInfoStandard, &fad)) {
+    const unsigned long long size =
+        (static_cast<unsigned long long>(fad.nFileSizeHigh) << 32) |
+        fad.nFileSizeLow;
+    if (size > 1024ULL * 1024ULL) {
+      MoveFileExA(path, old_path, MOVEFILE_REPLACE_EXISTING);
+    }
+  }
+}
+
 // Diagnose-Logger nach %TEMP%\honeycord-wasapi.log. WASAPI auf Win laeuft
 // im Plugin-Prozess ohne stdout/file-log; OutputDebugString koennte mit
 // DebugView gelesen werden, ein simples File-Log ist aber robuster (auch
@@ -42,6 +74,7 @@ static void HcLogV(const char* fmt, va_list ap) {
     DWORD n = GetTempPathA(MAX_PATH, path);
     if (n == 0 || n > MAX_PATH) return;
     std::strncat(path, "honeycord-wasapi.log", MAX_PATH - n - 1);
+    RotateLogIfNeededA(path);
     f = std::fopen(path, "a");
     if (!f) return;
     SYSTEMTIME st;
