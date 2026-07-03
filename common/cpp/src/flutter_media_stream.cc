@@ -212,7 +212,8 @@ EncodableValue getConstrainInt(const EncodableMap& constraints,
   if (it == constraints.end()) return EncodableValue();
 
   EncodableValue direct = numToIntValue(it->second);
-  if (direct != EncodableValue()) return direct;
+  // Kein operator!= fuer EncodableValue unter MSVC -> !(a == b).
+  if (!(direct == EncodableValue())) return direct;
 
   if (TypeIs<EncodableMap>(it->second)) {
     EncodableMap innerMap = GetValue<EncodableMap>(it->second);
@@ -220,7 +221,7 @@ EncodableValue getConstrainInt(const EncodableMap& constraints,
       auto it2 = innerMap.find(EncodableValue(k));
       if (it2 != innerMap.end()) {
         EncodableValue v = numToIntValue(it2->second);
-        if (v != EncodableValue()) return v;
+        if (!(v == EncodableValue())) return v;
       }
     }
   }
