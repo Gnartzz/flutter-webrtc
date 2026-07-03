@@ -14,9 +14,13 @@
 #include <devpropdef.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
+// Process-Loopback-Aktivierung (AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+// VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK) — WinSDK >= 10.0.19041.
+#include <audioclientactivationparams.h>
 #include <mmreg.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -110,6 +114,55 @@ inline int16_t SaturatingFloatToInt16(float s) {
   return static_cast<int16_t>(s * 32767.0f);
 }
 
+// Minimaler Completion-Handler fuer ActivateAudioInterfaceAsync. IAgileObject
+// als Marker, damit der Callback ohne COM-Marshalling aus jedem Apartment
+// feuern darf (sonst haengt die Aktivierung je nach Thread-Kontext).
+class ActivateHandler : public IActivateAudioInterfaceCompletionHandler,
+                        public IAgileObject {
+ public:
+  ActivateHandler() : done_(CreateEventW(nullptr, TRUE, FALSE, nullptr)) {}
+
+  // IUnknown
+  STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+    if (!ppv) return E_POINTER;
+    if (riid == IID_IUnknown ||
+        riid == __uuidof(IActivateAudioInterfaceCompletionHandler)) {
+      *ppv = static_cast<IActivateAudioInterfaceCompletionHandler*>(this);
+    } else if (riid == __uuidof(IAgileObject)) {
+      *ppv = static_cast<IAgileObject*>(this);
+    } else {
+      *ppv = nullptr;
+      return E_NOINTERFACE;
+    }
+    AddRef();
+    return S_OK;
+  }
+  STDMETHODIMP_(ULONG) AddRef() override { return ++ref_; }
+  STDMETHODIMP_(ULONG) Release() override {
+    ULONG r = --ref_;
+    if (r == 0) delete this;
+    return r;
+  }
+
+  // IActivateAudioInterfaceCompletionHandler
+  STDMETHODIMP ActivateCompleted(
+      IActivateAudioInterfaceAsyncOperation* /*op*/) override {
+    if (done_) SetEvent(done_);
+    return S_OK;
+  }
+
+  bool Wait(DWORD timeout_ms) {
+    return done_ && WaitForSingleObject(done_, timeout_ms) == WAIT_OBJECT_0;
+  }
+
+ private:
+  ~ActivateHandler() {
+    if (done_) CloseHandle(done_);
+  }
+  std::atomic<ULONG> ref_{1};
+  HANDLE done_ = nullptr;
+};
+
 }  // namespace
 
 WasapiLoopback::WasapiLoopback(
@@ -132,6 +185,142 @@ bool WasapiLoopback::Start() {
   HRESULT co_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
   HcLog("Start: CoInitializeEx = 0x%08lx", (long)co_hr);
 
+  // 1) Bevorzugt: Process-Loopback MIT Selbst-Ausschluss (id13-Echo-Fix).
+  // 2) Fallback: klassisches Endpoint-Loopback (Status quo inkl. eigener
+  //    Wiedergabe) — lieber Echo als gar kein Stream-Audio.
+  bool process_mode = TryStartProcessLoopback();
+  if (!process_mode) {
+    ReleaseCom();  // Teilzustand des fehlgeschlagenen Versuchs wegraeumen
+    HcLog("Start: FALLBACK auf Endpoint-Loopback (inkl. eigener Wiedergabe!)");
+    if (!StartEndpointLoopback()) {
+      ReleaseCom();
+      return false;
+    }
+  }
+  HcLog("Start: Loopback-Modus = %s",
+        process_mode ? "process-exclude (ohne eigene Wiedergabe)"
+                     : "endpoint-fallback");
+
+  HRESULT hr = client_->GetService(kIID_IAudioCaptureClient,
+                                   reinterpret_cast<void**>(&capture_));
+  HcLog("Start: GetService(IAudioCaptureClient) = 0x%08lx capture=%p",
+        (long)hr, capture_);
+  if (FAILED(hr) || !capture_) return false;
+
+  hr = client_->Start();
+  HcLog("Start: client->Start = 0x%08lx", (long)hr);
+  if (FAILED(hr)) return false;
+
+  in_sample_rate_ = static_cast<int>(mix_format_->nSamplesPerSec);
+  // libwebrtc/Opus akzeptiert keine 44100 Hz; wir resampeln intern auf
+  // 48 kHz. Bei einem Input-Format das eh schon 48 kHz ist (z. B. wenn
+  // der Nutzer 48-kHz-Default-Render hat), wird das Resampling zu einer
+  // 1:1-Kopie.
+  out_sample_rate_ = 48000;
+  channels_ = std::min<int>(2, mix_format_->nChannels);
+  input_is_float_ = IsFloatFormat(mix_format_);
+  chunk_frames_ = out_sample_rate_ / 100;   // 480 frames @ 48 kHz = 10 ms
+  chunk_buf_.assign(chunk_frames_ * channels_, 0);
+  chunk_filled_frames_ = 0;
+  resample_phase_ = 0.0;
+  prev_left_ = 0;
+  prev_right_ = 0;
+  HcLog("Start: ready in_sr=%d out_sr=%d ch=%d float=%d chunk_frames=%zu",
+        in_sample_rate_, out_sample_rate_, channels_,
+        input_is_float_ ? 1 : 0, chunk_frames_);
+
+  running_ = true;
+  thread_ = std::thread(&WasapiLoopback::CaptureLoop, this);
+  HcLog("Start: capture thread launched");
+  return true;
+}
+
+bool WasapiLoopback::TryStartProcessLoopback() {
+  // Virtuelles Loopback-Device, das ALLES System-Audio AUSSER dem eigenen
+  // Prozessbaum liefert. Eigener Prozessbaum = unsere Voice-Wiedergabe,
+  // Soundboard, Notify-Toene -> genau das, was NICHT in den Stream soll.
+  AUDIOCLIENT_ACTIVATION_PARAMS params = {};
+  params.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
+  params.ProcessLoopbackParams.TargetProcessId = GetCurrentProcessId();
+  params.ProcessLoopbackParams.ProcessLoopbackMode =
+      PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE;
+  PROPVARIANT pv = {};
+  pv.vt = VT_BLOB;
+  pv.blob.cbSize = sizeof(params);
+  pv.blob.pBlobData = reinterpret_cast<BYTE*>(&params);
+
+  ActivateHandler* handler = new ActivateHandler();
+  IActivateAudioInterfaceAsyncOperation* op = nullptr;
+  HRESULT hr = ActivateAudioInterfaceAsync(
+      VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, kIID_IAudioClient, &pv, handler,
+      &op);
+  HcLog("ProcLoopback: ActivateAudioInterfaceAsync = 0x%08lx op=%p", (long)hr,
+        op);
+  if (FAILED(hr) || !op) {
+    if (op) op->Release();
+    handler->Release();
+    return false;
+  }
+  if (!handler->Wait(2000)) {
+    HcLog("ProcLoopback: Aktivierung TIMEOUT (2s)");
+    op->Release();
+    handler->Release();
+    return false;
+  }
+  HRESULT hr_activate = E_FAIL;
+  IUnknown* unk = nullptr;
+  hr = op->GetActivateResult(&hr_activate, &unk);
+  op->Release();
+  handler->Release();
+  HcLog("ProcLoopback: GetActivateResult = 0x%08lx / activate=0x%08lx unk=%p",
+        (long)hr, (long)hr_activate, unk);
+  if (FAILED(hr) || FAILED(hr_activate) || !unk) {
+    if (unk) unk->Release();
+    return false;
+  }
+  hr = unk->QueryInterface(kIID_IAudioClient,
+                           reinterpret_cast<void**>(&client_));
+  unk->Release();
+  HcLog("ProcLoopback: QI(IAudioClient) = 0x%08lx client=%p", (long)hr,
+        client_);
+  if (FAILED(hr) || !client_) return false;
+
+  // Das virtuelle Device hat KEIN GetMixFormat — das Format geben WIR vor.
+  // 48 kHz/16 Bit/stereo = exakt das libwebrtc-Zielformat -> der
+  // Linear-Resampler im CaptureLoop wird zur 1:1-Kopie.
+  mix_format_ =
+      static_cast<WAVEFORMATEX*>(CoTaskMemAlloc(sizeof(WAVEFORMATEX)));
+  if (!mix_format_) return false;
+  std::memset(mix_format_, 0, sizeof(WAVEFORMATEX));
+  mix_format_->wFormatTag = WAVE_FORMAT_PCM;
+  mix_format_->nChannels = 2;
+  mix_format_->nSamplesPerSec = 48000;
+  mix_format_->wBitsPerSample = 16;
+  mix_format_->nBlockAlign = 4;                 // 2 ch * 2 Byte
+  mix_format_->nAvgBytesPerSec = 48000 * 4;
+  mix_format_->cbSize = 0;
+
+  // Process-Loopback verlangt Event-getriebenes Capture (EVENTCALLBACK).
+  const REFERENCE_TIME kBufferDuration100Ns = 200 * 10000;  // 200 ms
+  hr = client_->Initialize(
+      AUDCLNT_SHAREMODE_SHARED,
+      AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+      kBufferDuration100Ns, 0, mix_format_, nullptr);
+  HcLog("ProcLoopback: Initialize(LOOPBACK|EVENT, 48k/16/2) = 0x%08lx",
+        (long)hr);
+  if (FAILED(hr)) return false;
+
+  capture_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  if (!capture_event_) {
+    HcLog("ProcLoopback: CreateEvent fehlgeschlagen");
+    return false;
+  }
+  hr = client_->SetEventHandle(static_cast<HANDLE>(capture_event_));
+  HcLog("ProcLoopback: SetEventHandle = 0x%08lx", (long)hr);
+  return SUCCEEDED(hr);
+}
+
+bool WasapiLoopback::StartEndpointLoopback() {
   HRESULT hr;
   IMMDeviceEnumerator* enumerator = nullptr;
   hr = CoCreateInstance(kCLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL,
@@ -167,48 +356,11 @@ bool WasapiLoopback::Start() {
                            AUDCLNT_STREAMFLAGS_LOOPBACK, kBufferDuration100Ns,
                            0, mix_format_, nullptr);
   HcLog("Start: client->Initialize(LOOPBACK) = 0x%08lx", (long)hr);
-  if (FAILED(hr)) return false;
-
-  hr = client_->GetService(kIID_IAudioCaptureClient,
-                           reinterpret_cast<void**>(&capture_));
-  HcLog("Start: GetService(IAudioCaptureClient) = 0x%08lx capture=%p",
-        (long)hr, capture_);
-  if (FAILED(hr) || !capture_) return false;
-
-  hr = client_->Start();
-  HcLog("Start: client->Start = 0x%08lx", (long)hr);
-  if (FAILED(hr)) return false;
-
-  in_sample_rate_ = static_cast<int>(mix_format_->nSamplesPerSec);
-  // libwebrtc/Opus akzeptiert keine 44100 Hz; wir resampeln intern auf
-  // 48 kHz. Bei einem Input-Format das eh schon 48 kHz ist (z. B. wenn
-  // der Nutzer 48-kHz-Default-Render hat), wird das Resampling zu einer
-  // 1:1-Kopie.
-  out_sample_rate_ = 48000;
-  channels_ = std::min<int>(2, mix_format_->nChannels);
-  input_is_float_ = IsFloatFormat(mix_format_);
-  chunk_frames_ = out_sample_rate_ / 100;   // 480 frames @ 48 kHz = 10 ms
-  chunk_buf_.assign(chunk_frames_ * channels_, 0);
-  chunk_filled_frames_ = 0;
-  resample_phase_ = 0.0;
-  prev_left_ = 0;
-  prev_right_ = 0;
-  HcLog("Start: ready in_sr=%d out_sr=%d ch=%d float=%d chunk_frames=%zu",
-        in_sample_rate_, out_sample_rate_, channels_,
-        input_is_float_ ? 1 : 0, chunk_frames_);
-
-  running_ = true;
-  thread_ = std::thread(&WasapiLoopback::CaptureLoop, this);
-  HcLog("Start: capture thread launched");
-  return true;
+  return SUCCEEDED(hr);
 }
 
-void WasapiLoopback::Stop() {
-  bool was_running = running_.exchange(false);
-  HcLog("Stop: was_running=%d", was_running ? 1 : 0);
-  if (thread_.joinable()) thread_.join();
+void WasapiLoopback::ReleaseCom() {
   if (client_) {
-    client_->Stop();
     client_->Release();
     client_ = nullptr;
   }
@@ -224,6 +376,18 @@ void WasapiLoopback::Stop() {
     CoTaskMemFree(mix_format_);
     mix_format_ = nullptr;
   }
+  if (capture_event_) {
+    CloseHandle(static_cast<HANDLE>(capture_event_));
+    capture_event_ = nullptr;
+  }
+}
+
+void WasapiLoopback::Stop() {
+  bool was_running = running_.exchange(false);
+  HcLog("Stop: was_running=%d", was_running ? 1 : 0);
+  if (thread_.joinable()) thread_.join();
+  if (client_) client_->Stop();
+  ReleaseCom();
   // CoInitialize hatten wir per-Aufrufer refcounted gemacht; das passende
   // CoUninitialize lassen wir weg, weil der Plugin-Thread sonst andere
   // COM-Nutzer stört.
@@ -249,8 +413,19 @@ void WasapiLoopback::CaptureLoop() {
   uint64_t empty_polls = 0;
   uint64_t last_log_ms = GetTickCount64();
 
+  // Event-Modus: nur warten, wenn der Puffer LEER war — nach einem
+  // verarbeiteten Paket koennten weitere anstehen (Auto-Reset-Event ist dann
+  // schon konsumiert; erneutes Warten wuerde bis 100 ms stottern).
+  bool wait_next = true;
   while (running_) {
     ++loop_iters;
+    // Process-Loopback-Modus ist Event-getrieben: aufs Capture-Event warten
+    // (Timeout als Watchdog), dann unten die anstehenden Pakete abholen.
+    // Fallback-Modus pollt wie bisher (Sleep unten bei leerem Puffer).
+    if (capture_event_ && wait_next) {
+      WaitForSingleObject(static_cast<HANDLE>(capture_event_), 100);
+      if (!running_) break;
+    }
     UINT32 packet_size = 0;
     if (FAILED(capture_->GetNextPacketSize(&packet_size))) {
       Sleep(2);
@@ -258,7 +433,8 @@ void WasapiLoopback::CaptureLoop() {
     }
     if (packet_size == 0) {
       ++empty_polls;
-      Sleep(2);
+      wait_next = true;
+      if (!capture_event_) Sleep(2);
       // Periodisches "lebt noch"-Log alle 2 s, damit man auch dann sieht
       // dass der Thread laeuft wenn gerade nichts spielt.
       uint64_t now = GetTickCount64();
@@ -274,6 +450,7 @@ void WasapiLoopback::CaptureLoop() {
       }
       continue;
     }
+    wait_next = false;  // Paket da -> danach ohne Warten weiter drainen
     BYTE* data = nullptr;
     UINT32 num_frames = 0;
     DWORD flags = 0;

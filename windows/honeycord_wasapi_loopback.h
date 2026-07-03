@@ -7,11 +7,21 @@
 // publiziert wird — separat vom Mikrofon-Track.
 //
 // Implementierung:
-//  - WASAPI shared-mode Loopback (IAudioClient::Initialize mit
-//    AUDCLNT_STREAMFLAGS_LOOPBACK), liefert das gemixte Render-Stream als
-//    Capture.
-//  - WASAPI gibt typischerweise Float32 (IEEE754) im Geräte-Mix-Format
-//    (oft 48 kHz, 2 Kanäle). Wir konvertieren zu Int16-interleaved.
+//  - BEVORZUGT (Win10 2004+, Fix id13-Echo): Process-Loopback mit
+//    Selbst-Ausschluss (ActivateAudioInterfaceAsync +
+//    AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK im Modus
+//    EXCLUDE_TARGET_PROCESS_TREE auf die eigene PID) — captured ALLES
+//    System-Audio AUSSER HoneyCords eigener Wiedergabe. Windows-Pendant zu
+//    SCKs excludesCurrentProcessAudio (Mac). Vorher ging die eigene
+//    Voice-WIEDERGABE (= die Stimmen der Zuschauer) mit in den Stream und kam
+//    zu ihnen zurueck — digital sauber, an jedem AEC vorbei. Format geben wir
+//    vor (48 kHz/16 Bit/stereo), Capture Event-getrieben.
+//  - FALLBACK (Aktivierung schlaegt fehl): klassisches Endpoint-Loopback
+//    (Default-Render-Device + AUDCLNT_STREAMFLAGS_LOOPBACK) = bisheriges
+//    Verhalten inkl. eigener Wiedergabe — Status quo statt Crash.
+//  - WASAPI liefert im Fallback typischerweise Float32 im Geraete-Mix-Format
+//    (oft 48 kHz, 2 Kanäle). Wir konvertieren zu Int16-interleaved; fremde
+//    Raten via Linear-Resampler auf 48 kHz (bei 48-kHz-Input 1:1).
 //  - libwebrtc' AudioSink-API erwartet exakt 10-ms-Frames pro Push (gleicher
 //    RTC_CHECK_EQ wie auf Mac → SIGABRT bei abweichender Größe), daher
 //    Ring-Buffer mit Drain in 480-Frame-Blöcken @ 48 kHz.
@@ -53,6 +63,14 @@ class WasapiLoopback {
 
  private:
   void CaptureLoop();
+  // Versucht Process-Loopback mit Selbst-Ausschluss (bevorzugt); setzt
+  // client_/mix_format_/capture_event_. false = Fallback noetig.
+  bool TryStartProcessLoopback();
+  // Klassisches Endpoint-Loopback auf dem Default-Render-Device (Fallback).
+  bool StartEndpointLoopback();
+  // Gibt COM-Objekte/Format/Event frei (fuer Stop + Aufraeumen zwischen den
+  // beiden Start-Versuchen). Stoppt NICHT den Thread.
+  void ReleaseCom();
 
   libwebrtc::scoped_refptr<libwebrtc::RTCAudioSource> source_;
   std::atomic<bool> running_{false};
@@ -62,6 +80,9 @@ class WasapiLoopback {
   IAudioClient* client_ = nullptr;
   IAudioCaptureClient* capture_ = nullptr;
   WAVEFORMATEX* mix_format_ = nullptr;
+  // Capture-Event (nur Process-Loopback-Modus; Fallback pollt wie bisher).
+  // void* statt HANDLE, damit der Header ohne windows.h auskommt.
+  void* capture_event_ = nullptr;
 
   // 10-ms-Akkumulator (interleaved Int16) NACH Resampling auf
   // libwebrtc-Opus-fähige Sample-Rate. Größe = chunk_frames_ * channels_.
