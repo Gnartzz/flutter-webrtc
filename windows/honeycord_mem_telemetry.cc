@@ -71,27 +71,38 @@ void LogLine() {
   DWORD gdi = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
   DWORD usr = GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS);
 
-  // VRAM: lokales Segment des ersten Hardware-Adapters (Budget vs. Usage).
+  // VRAM: lokales Segment. WICHTIG (Fix 2026-07-04): auf Multi-GPU-Maschinen
+  // (AIX1 = AMD-iGPU + NVIDIA 2070) nahm der alte Code den ERSTEN Nicht-
+  // Software-Adapter — das war mal die iGPU (vram=0/16289, blind) statt der
+  // NVIDIA, auf der ENCODE/DECODE/Render laufen. Jetzt: den Adapter mit dem
+  // GROESSTEN dedizierten VRAM waehlen = die diskrete GPU (dort sitzt ein
+  // etwaiges D3D11-Surface-Leck beim Gamestream-Oeffnen).
   unsigned long long vram_usage = 0, vram_budget = 0;
   {
     using Microsoft::WRL::ComPtr;
     ComPtr<IDXGIFactory1> fac;
     if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&fac)))) {
       ComPtr<IDXGIAdapter1> a;
+      ComPtr<IDXGIAdapter3> best;
+      SIZE_T best_dedicated = 0;
       for (UINT i = 0; fac->EnumAdapters1(i, &a) == S_OK; ++i) {
         DXGI_ADAPTER_DESC1 d{};
         a->GetDesc1(&d);
         ComPtr<IDXGIAdapter3> a3;
-        if (!(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && SUCCEEDED(a.As(&a3))) {
-          DXGI_QUERY_VIDEO_MEMORY_INFO mi{};
-          if (SUCCEEDED(a3->QueryVideoMemoryInfo(
-                  0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mi))) {
-            vram_usage = mi.CurrentUsage;
-            vram_budget = mi.Budget;
-          }
-          break;
+        if (!(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+            SUCCEEDED(a.As(&a3)) && d.DedicatedVideoMemory >= best_dedicated) {
+          best_dedicated = d.DedicatedVideoMemory;
+          best = a3;
         }
         a.Reset();
+      }
+      if (best) {
+        DXGI_QUERY_VIDEO_MEMORY_INFO mi{};
+        if (SUCCEEDED(best->QueryVideoMemoryInfo(
+                0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mi))) {
+          vram_usage = mi.CurrentUsage;
+          vram_budget = mi.Budget;
+        }
       }
     }
   }
