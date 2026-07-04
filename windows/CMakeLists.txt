@@ -32,6 +32,7 @@ add_library(${PLUGIN_NAME} SHARED
   "task_runner_windows.cc"
   "honeycord_wasapi_loopback.cc"
   "honeycord_mem_telemetry.cc"
+  "honeycord_audio_ducking.cc"
 )
 
 include_directories(

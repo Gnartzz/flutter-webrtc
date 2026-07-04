@@ -5,6 +5,7 @@
 
 #if defined(_WIN32)
 #include "../../../windows/honeycord_mem_telemetry.h"
+#include "../../../windows/honeycord_audio_ducking.h"
 #endif
 
 namespace flutter_webrtc_plugin {
@@ -25,6 +26,9 @@ FlutterWebRTC::FlutterWebRTC(FlutterWebRTCPlugin* plugin)
 #if defined(_WIN32)
   // OOM-Diagnose (Abendtest 2026-07-03): RAM/VRAM/Handle-Kurve nach mem.log.
   honeycord::StartMemTelemetryOnce();
+  // Windows-Ducking-Opt-out (Tester 2026-07-03): andere Audio-Apps sollen beim
+  // Mikro-Oeffnen NICHT leiser werden. Jetzt (App-Start) = vor jedem Voice-Join.
+  honeycord::OptOutCommunicationDuckingOnce();
 #endif
 }
 
