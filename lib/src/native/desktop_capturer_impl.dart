@@ -144,7 +144,17 @@ class DesktopCapturerNative extends DesktopCapturer {
   @override
   Future<List<DesktopCapturerSource>> getSources(
       {required List<SourceType> types, ThumbnailSize? thumbnailSize}) async {
-    _sources.clear();
+    // WICHTIG (Fix 2026-07-04, „Vorschaubilder ab 2. Oeffnen schwarz"):
+    // FRUEHER wurde _sources SOFORT geleert und danach mit FRISCHEN Objekten
+    // (Thumbnail=null) befuellt. Zwei Folgen:
+    //  1) Zwischen clear() und dem Neu-Befuellen (waehrend des awaits) trafen
+    //     desktopSourceThumbnailChanged-Events auf ein LEERES _sources und
+    //     wurden verworfen → Kacheln blieben schwarz (beim 2. Oeffnen, wenn die
+    //     gecachte MediaList schnell genug ist, um in dieses Fenster zu treffen).
+    //  2) Selbst ohne Race gingen die schon geladenen Thumbnails des vorigen
+    //     Oeffnens verloren (neue Objekte).
+    // Jetzt: erst holen, DANN atomar ersetzen — und vorhandene Source-Objekte
+    // (mit bereits geladenem Thumbnail + stabiler Identitaet) wiederverwenden.
     final response = await WebRTC.invokeMethod(
       'getDesktopSources',
       <String, dynamic>{
@@ -155,10 +165,16 @@ class DesktopCapturerNative extends DesktopCapturer {
     if (response == null) {
       throw Exception('getDesktopSources return null, something wrong');
     }
+    final next = <String, DesktopCapturerSourceNative>{};
     for (var source in response['sources']) {
-      var desktopSource = DesktopCapturerSourceNative.fromMap(source);
-      _sources[desktopSource.id] = desktopSource;
+      final id = source['id'] as String;
+      // Bestehendes Objekt weiterverwenden (behaelt Thumbnail + Identitaet),
+      // sonst neu aus der Map bauen.
+      next[id] = _sources[id] ?? DesktopCapturerSourceNative.fromMap(source);
     }
+    _sources
+      ..clear()
+      ..addAll(next);
     return _sources.values.toList();
   }
 
