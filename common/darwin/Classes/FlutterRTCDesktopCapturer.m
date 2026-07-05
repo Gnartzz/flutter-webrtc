@@ -266,6 +266,7 @@ static inline BOOL HCIsActiveDisplayId(NSString* sourceId) { return NO; }
 @implementation FlutterWebRTCPlugin (DesktopCapturer)
 
 - (void)getDisplayMedia:(NSDictionary*)constraints result:(FlutterResult)result {
+  NSLog(@"[hc-cap] G0 getDisplayMedia ENTRY (User hat Quelle gewaehlt)");
   NSString* mediaStreamId = [[NSUUID UUID] UUIDString];
   RTCMediaStream* mediaStream = [self.peerConnectionFactory mediaStreamWithStreamId:mediaStreamId];
   RTCVideoSource* videoSource = [self.peerConnectionFactory videoSourceForScreenCast:YES];
@@ -570,11 +571,13 @@ static NSData* HCJpegFromCGImage(CGImageRef img) {
     API_AVAILABLE(macos(12.3)) {
   NSString* ownBundleId = [[NSBundle mainBundle] bundleIdentifier];
   NSSet<NSString*>* regular = [self hcRegularAppBundleIds];
+  NSLog(@"[hc-cap] P0 buildSckSources: SCShareableContent REQUEST (Picker)");
   [SCShareableContent
       getShareableContentExcludingDesktopWindows:YES
                              onScreenWindowsOnly:NO
                                completionHandler:^(SCShareableContent* content,
                                                    NSError* error) {
+        NSLog(@"[hc-cap] P1 buildSckSources: SCShareableContent RESPONSE err=%@ -> Cache gefuellt", error);
         NSMutableArray<SCWindow*>* wins = [NSMutableArray array];
         NSMutableArray<NSMutableDictionary*>* dicts = [NSMutableArray array];
         NSMutableSet<NSString*>* ids = [NSMutableSet set];

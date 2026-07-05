@@ -77,11 +77,13 @@ static NSLock* _hcSckContentLock = nil;
                   onStarted:(void (^)(NSError * _Nullable error))onStarted {
 #if __has_include(<ScreenCaptureKit/ScreenCaptureKit.h>)
   if (@available(macOS 12.3, *)) {
+    NSLog(@"[hc-cap] T0 startCaptureWithFPS entry isWindow=%d src=%@", (int)isWindow, sourceId);
     // Cache zuerst: SCShareableContent kann auf macOS 26 (Berechtigungs-XPC)
     // ~20 s dauern. Der Picker hat den Content gerade geholt -> der Share startet
     // direkt nach der Auswahl. Cache-Miss (z.B. neues Fenster) -> frisch holen.
     SCShareableContent *cached = (SCShareableContent *)
         [FlutterScreenCaptureKitCapturer cachedShareableContentMaxAge:60.0];
+    NSLog(@"[hc-cap] T1 cache %@", cached ? @"HIT" : @"MISS");
     if (cached != nil) {
       [self hcStartWithContent:cached fromCache:YES fps:fps sourceId:sourceId
                   captureAudio:captureAudio isWindow:isWindow
@@ -110,7 +112,9 @@ static NSLock* _hcSckContentLock = nil;
                             maxHeight:(NSInteger)maxHeight
                             onStarted:(void (^)(NSError * _Nullable error))onStarted
     API_AVAILABLE(macos(12.3)) {
+  NSLog(@"[hc-cap] T2 getShareableContent REQUEST (fresh fetch)");
   [SCShareableContent getShareableContentWithCompletionHandler:^(SCShareableContent *content, NSError *error) {
+    NSLog(@"[hc-cap] T3 getShareableContent RESPONSE err=%@", error);
     if (error != nil) {
       onStarted(error);
       return;
@@ -222,6 +226,8 @@ static NSLock* _hcSckContentLock = nil;
         }
       }
 
+      NSLog(@"[hc-cap] T4 filter+config ready (srcW=%ld srcH=%ld out=%ldx%ld) -> SCStream alloc",
+            (long)srcW, (long)srcH, (long)config.width, (long)config.height);
       self.stream = [[SCStream alloc] initWithFilter:filter configuration:config delegate:nil];
       NSError *addOutputError = nil;
       [self.stream addStreamOutput:self
@@ -249,7 +255,9 @@ static NSLock* _hcSckContentLock = nil;
               config.excludesCurrentProcessAudio);
       }
 
+      NSLog(@"[hc-cap] T5 SCStream startCapture REQUEST");
       [self.stream startCaptureWithCompletionHandler:^(NSError * _Nullable startError) {
+        NSLog(@"[hc-cap] T6 SCStream startCapture RESPONSE err=%@", startError);
         onStarted(startError);
       }];
 }
