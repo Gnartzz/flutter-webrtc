@@ -19,4 +19,6 @@
 - (void)getDesktopSourceThumbnail:(nonnull NSDictionary*)argsMap
                            result:(nonnull FlutterResult)result;
 
+- (void)prewarmDesktopCapture:(nonnull FlutterResult)result;
+
 @end

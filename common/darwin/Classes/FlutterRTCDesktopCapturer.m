@@ -842,6 +842,28 @@ static NSData* HCJpegFromCGImage(CGImageRef img) {
 #endif
 }
 
+// SCShareableContent vorwaermen + im SCK-Cache ablegen. Auf macOS 26 kostet der
+// erste Abruf ~20 s (Berechtigungs-XPC) — beim Voice-Beitritt (und periodisch)
+// aufgerufen, damit der Capture-Start den Content aus dem Cache nimmt statt zu
+// warten. Antwortet SOFORT (fire-and-forget); die Cache-Fuellung passiert async.
+- (void)prewarmDesktopCapture:(FlutterResult)result {
+#if TARGET_OS_OSX
+  if (@available(macOS 12.3, *)) {
+    [SCShareableContent getShareableContentExcludingDesktopWindows:YES
+                                               onScreenWindowsOnly:NO
+                                                 completionHandler:^(SCShareableContent* content,
+                                                                     NSError* error) {
+      if (content != nil) {
+        [FlutterScreenCaptureKitCapturer cacheShareableContent:content];
+      }
+    }];
+  }
+  result(@YES);
+#else
+  result(@NO);
+#endif
+}
+
 - (void)updateDesktopSources:(NSDictionary*)argsMap result:(FlutterResult)result {
 #if TARGET_OS_OSX
   NSLog(@"updateDesktopSources");

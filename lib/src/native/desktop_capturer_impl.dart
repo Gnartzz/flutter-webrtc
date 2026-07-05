@@ -185,6 +185,15 @@ class DesktopCapturerNative extends DesktopCapturer {
   }
 
   @override
+  Future<void> prewarm() async {
+    try {
+      await WebRTC.invokeMethod('prewarmDesktopCapture');
+    } catch (_) {
+      // Aeltere native Seite ohne die Methode -> ignorieren.
+    }
+  }
+
+  @override
   Future<bool> updateSources({required List<SourceType> types}) async {
     final response = await WebRTC.invokeMethod(
       'updateDesktopSources',

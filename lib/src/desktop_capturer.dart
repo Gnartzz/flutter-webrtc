@@ -67,4 +67,10 @@ abstract class DesktopCapturer {
 
   /// Updates the list of screen sources of the specified types
   Future<bool> updateSources({required List<SourceType> types});
+
+  /// Pre-warms the platform screen-capture subsystem so a later share starts
+  /// instantly. On macOS 26 the first `SCShareableContent` query costs ~20s
+  /// (permission XPC); calling this on voice-join (and periodically) keeps a
+  /// cached result ready. No-op on other platforms.
+  Future<void> prewarm() async {}
 }

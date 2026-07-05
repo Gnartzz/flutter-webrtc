@@ -1546,6 +1546,11 @@ static FlutterWebRTCPlugin *sharedSingleton;
   } else if ([@"getDesktopSourceThumbnail" isEqualToString:call.method]) {
     NSDictionary* argsMap = call.arguments;
     [self getDesktopSourceThumbnail:argsMap result:result];
+  } else if ([@"prewarmDesktopCapture" isEqualToString:call.method]) {
+    // macOS 26: der erste SCShareableContent-Abruf kostet ~20s (Berechtigungs-
+    // XPC). Beim Voice-Beitritt vorwaermen + warm halten -> der Screen-Share
+    // startet spaeter SOFORT (Cache-Treffer). No-Op ausserhalb macOS.
+    [self prewarmDesktopCapture:result];
   } else if ([@"setCodecPreferences" isEqualToString:call.method]) {
     NSDictionary* argsMap = call.arguments;
     [self transceiverSetCodecPreferences:argsMap result:result];
