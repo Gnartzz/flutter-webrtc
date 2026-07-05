@@ -546,6 +546,29 @@ static NSData* HCJpegFromCGImage(CGImageRef img) {
                            properties:@{NSImageCompressionFactor : @0.6}];
 }
 
+// CGImage aspekt-korrekt auf maxW Breite herunterrechnen + JPEG. Fuer die
+// Picker-Vorschauen: die CG-Vollbilder (v.a. Displays) waeren sonst riesig.
+static NSData* HCThumbJpegFromCGImage(CGImageRef img, CGFloat maxW) {
+  if (img == NULL) return nil;
+  size_t w = CGImageGetWidth(img), h = CGImageGetHeight(img);
+  if (w == 0 || h == 0) return nil;
+  CGFloat scale = w > maxW ? maxW / (CGFloat)w : 1.0;
+  size_t tw = (size_t)MAX((CGFloat)2, (CGFloat)w * scale);
+  size_t th = (size_t)MAX((CGFloat)2, (CGFloat)h * scale);
+  CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+  CGContextRef ctx = CGBitmapContextCreate(NULL, tw, th, 8, 0, cs,
+      kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+  CGColorSpaceRelease(cs);
+  if (ctx == NULL) return HCJpegFromCGImage(img);
+  CGContextSetInterpolationQuality(ctx, kCGInterpolationLow);
+  CGContextDrawImage(ctx, CGRectMake(0, 0, tw, th), img);
+  CGImageRef scaled = CGBitmapContextCreateImage(ctx);
+  CGContextRelease(ctx);
+  NSData* jpeg = HCJpegFromCGImage(scaled);
+  if (scaled != NULL) CGImageRelease(scaled);
+  return jpeg;
+}
+
 // Bundle-IDs aller "regulaeren" (Dock-)Apps. Filtert Service-/Helper-Prozesse
 // (CursorUIViewService, Open-and-Save-Panel-Service, Menulets) zuverlaessig raus.
 - (NSSet<NSString*>*)hcRegularAppBundleIds {
@@ -638,87 +661,52 @@ static NSData* HCJpegFromCGImage(CGImageRef img) {
           completion(dicts);
         });
 
-        if (@available(macOS 14.0, *)) {
-          __weak typeof(self) weakSelf = self;
-          // Thumbnail-Aufgaben sammeln und SERIELL abarbeiten. SCScreenshotManager
-          // teilt sich den SCK-Daemon mit dem echten SCStream.startCapture; alle
-          // parallel gefeuert blockieren sie den Share-Start bis ~30 s (macOS 26,
-          // GEMESSEN 2026-07-05: T5->T6 = 29 s). Seriell + Abbruch, sobald ein
-          // echter Capture startet -> max. 1 Thumbnail in-flight, Start bleibt frei.
-          NSMutableArray<NSDictionary*>* tasks = [NSMutableArray array];
-          for (NSMutableDictionary* sd in screenDicts) {
-            CGDirectDisplayID did = (CGDirectDisplayID)[sd[@"id"] longLongValue];
-            SCDisplay* disp = nil;
-            for (SCDisplay* dd in content.displays) {
-              if (dd.displayID == did) { disp = dd; break; }
-            }
-            if (disp == nil) continue;
-            SCContentFilter* sfilter =
-                [[SCContentFilter alloc] initWithDisplay:disp excludingWindows:@[]];
-            SCStreamConfiguration* scfg = [[SCStreamConfiguration alloc] init];
-            CGFloat dw = (CGFloat)disp.width, dh = (CGFloat)disp.height;
-            CGFloat dscl = dw > 0 ? MIN(1.0, 480.0 / dw) : 1.0;
-            scfg.width = (size_t)MAX((CGFloat)2, dw * dscl);
-            scfg.height = (size_t)MAX((CGFloat)2, dh * dscl);
-            [tasks addObject:@{@"sid" : sd[@"id"], @"filter" : sfilter, @"config" : scfg,
-                               @"win" : @NO, @"wid" : @0}];
-          }
-          for (NSUInteger i = 0; i < wins.count; i++) {
-            SCWindow* w = wins[i];
-            SCContentFilter* filter =
-                [[SCContentFilter alloc] initWithDesktopIndependentWindow:w];
-            SCStreamConfiguration* cfg = [[SCStreamConfiguration alloc] init];
-            CGFloat sw = w.frame.size.width, sh = w.frame.size.height;
-            CGFloat scl = sw > 0 ? MIN(1.0, 480.0 / sw) : 1.0;
-            cfg.width = (size_t)MAX((CGFloat)2, sw * scl);
-            cfg.height = (size_t)MAX((CGFloat)2, sh * scl);
-            [tasks addObject:@{@"sid" : dicts[i][@"id"], @"filter" : filter, @"config" : cfg,
-                               @"win" : @YES, @"wid" : @(w.windowID)}];
-          }
-          NSLog(@"[hc-cap] P2 %lu Thumbnails seriell", (unsigned long)tasks.count);
-          __block void (^captureNext)(NSUInteger);
-          captureNext = ^(NSUInteger i) {
-            typeof(self) s0 = weakSelf;
-            if (s0 == nil || i >= tasks.count) { captureNext = nil; return; }
-            // Ein echter Share startet -> restliche Thumbnails abbrechen.
-            if ([FlutterScreenCaptureKitCapturer isCaptureStarting]) {
-              NSLog(@"[hc-cap] P3 Thumbnails abgebrochen bei %lu (Capture startet)", (unsigned long)i);
-              captureNext = nil;
-              return;
-            }
-            NSDictionary* t = tasks[i];
-            NSString* tid = t[@"sid"];
-            BOOL isWin = [t[@"win"] boolValue];
-            CGWindowID wid = (CGWindowID)[t[@"wid"] unsignedIntValue];
-            [SCScreenshotManager
-                captureImageWithFilter:t[@"filter"]
-                         configuration:t[@"config"]
-                     completionHandler:^(CGImageRef _Nullable img, NSError* _Nullable e) {
-                       NSData* jpeg = HCJpegFromCGImage(img);
-                       if (jpeg == nil && isWin) {
+        // Vorschauen via CoreGraphics auf einem HINTERGRUND-Thread — NICHT via
+        // SCScreenshotManager: der teilt sich den SCK-Daemon mit dem echten
+        // SCStream.startCapture, und EINE haengende Thumbnail-Aufnahme blockierte
+        // den Share-Start ~30 s (macOS 26, GEMESSEN 2026-07-05: T5->T6 = 29 s,
+        // T6 fiel exakt mit dem Ende des haengenden Thumbnails zusammen). CG nutzt
+        // ein eigenes Subsystem -> selbst eine langsame Vorschau haengt den Share
+        // NICHT. Hintergrund-QoS -> kein Main-Thread-Block. (SCK-Fenster-Liste
+        // brauchen wir weiter, nur die THUMBNAILS gehen ueber CG.)
+        NSMutableArray<NSDictionary*>* tasks = [NSMutableArray array];
+        for (NSMutableDictionary* sd in screenDicts) {
+          [tasks addObject:@{@"sid" : sd[@"id"], @"win" : @NO,
+                             @"wid" : @((uint32_t)[sd[@"id"] longLongValue])}];
+        }
+        for (NSUInteger i = 0; i < wins.count; i++) {
+          [tasks addObject:@{@"sid" : dicts[i][@"id"], @"win" : @YES,
+                             @"wid" : @((uint32_t)wins[i].windowID)}];
+        }
+        NSLog(@"[hc-cap] P2 %lu Thumbnails (CG, Hintergrund)", (unsigned long)tasks.count);
+        __weak typeof(self) weakSelf = self;
+        for (NSDictionary* t in tasks) {
+          NSString* tid = t[@"sid"];
+          BOOL isWin = [t[@"win"] boolValue];
+          uint32_t idv = (uint32_t)[t[@"wid"] unsignedIntValue];
+          dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            CGImageRef img = NULL;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-                         CGImageRef cg = CGWindowListCreateImage(
-                             CGRectNull, kCGWindowListOptionIncludingWindow, wid,
-                             kCGWindowImageBoundsIgnoreFraming | kCGWindowImageNominalResolution);
+            if (isWin) {
+              img = CGWindowListCreateImage(CGRectNull, kCGWindowListOptionIncludingWindow,
+                                            (CGWindowID)idv,
+                                            kCGWindowImageBoundsIgnoreFraming | kCGWindowImageNominalResolution);
+            } else {
+              img = CGDisplayCreateImage((CGDirectDisplayID)idv);
+            }
 #pragma clang diagnostic pop
-                         jpeg = HCJpegFromCGImage(cg);
-                         if (cg != NULL) CGImageRelease(cg);
-                       }
-                       dispatch_async(dispatch_get_main_queue(), ^{
-                         typeof(self) s2 = weakSelf;
-                         if (s2 != nil && s2.eventSink != nil && jpeg != nil) {
-                           postEvent(s2.eventSink, @{@"event" : @"desktopSourceThumbnailChanged",
-                                                     @"id" : tid, @"thumbnail" : jpeg});
-                         }
-                         if (captureNext) captureNext(i + 1); // naechstes Thumbnail
-                       });
-                     }];
-          };
-          // Kleiner Versatz: die getDesktopSources-Antwort muss die Dart-_sources-
-          // Map gefuellt haben, BEVOR das erste Thumbnail-Event eintrifft.
-          dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_MSEC)),
-                         dispatch_get_main_queue(), ^{ if (captureNext) captureNext(0); });
+            NSData* jpeg = HCThumbJpegFromCGImage(img, 480.0);
+            if (img != NULL) CGImageRelease(img);
+            if (jpeg == nil) return;
+            dispatch_async(dispatch_get_main_queue(), ^{
+              typeof(self) s2 = weakSelf;
+              if (s2 != nil && s2.eventSink != nil) {
+                postEvent(s2.eventSink, @{@"event" : @"desktopSourceThumbnailChanged",
+                                          @"id" : tid, @"thumbnail" : jpeg});
+              }
+            });
+          });
         }
       }];
 }
