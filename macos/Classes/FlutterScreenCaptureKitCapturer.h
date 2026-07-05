@@ -21,6 +21,13 @@
 + (void)cacheShareableContent:(id _Nullable)content;
 + (id _Nullable)cachedShareableContentMaxAge:(NSTimeInterval)maxAge;
 
+/// TRUE, sobald ein echter Screen-/Fenster-Capture-Start laeuft. ScreenCaptureKit
+/// serialisiert Capture-Operationen ueber EINEN Daemon — die Picker-Thumbnails
+/// (SCScreenshotManager) muessen dann pausieren, sonst blockieren sie den
+/// SCStream.startCapture bis zu ~30 s (macOS-26, gemessen 2026-07-05).
++ (BOOL)isCaptureStarting;
++ (void)setCaptureStarting:(BOOL)v;
+
 @property(nonatomic, strong) id<FlutterScreenCaptureKitAudioDelegate> _Nullable audioDelegate;
 
 /// `isWindow`=YES nimmt EIN FENSTER zero-copy auf (SCContentFilter

@@ -29,6 +29,7 @@
 static id _hcSckContent = nil;             // SCShareableContent (id: pre-12.3-Build)
 static NSDate* _hcSckContentDate = nil;
 static NSLock* _hcSckContentLock = nil;
+static NSDate* _hcCaptureStartingSince = nil; // Zeitpunkt des Capture-Starts (nil=aus)
 
 @implementation FlutterScreenCaptureKitCapturer
 
@@ -44,6 +45,20 @@ static NSLock* _hcSckContentLock = nil;
   _hcSckContent = content;
   _hcSckContentDate = [NSDate date];
   [_hcSckContentLock unlock];
+}
+
++ (BOOL)isCaptureStarting {
+  @synchronized([FlutterScreenCaptureKitCapturer class]) {
+    // Zeitlich begrenzt (Self-Healing): falls ein Fehlerpfad das Loeschen
+    // verpasst, sperrt das Flag die Thumbnails nicht laenger als 40 s.
+    if (_hcCaptureStartingSince == nil) return NO;
+    return -[_hcCaptureStartingSince timeIntervalSinceNow] < 40.0;
+  }
+}
++ (void)setCaptureStarting:(BOOL)v {
+  @synchronized([FlutterScreenCaptureKitCapturer class]) {
+    _hcCaptureStartingSince = v ? [NSDate date] : nil;
+  }
 }
 
 + (id)cachedShareableContentMaxAge:(NSTimeInterval)maxAge {
@@ -78,6 +93,8 @@ static NSLock* _hcSckContentLock = nil;
 #if __has_include(<ScreenCaptureKit/ScreenCaptureKit.h>)
   if (@available(macOS 12.3, *)) {
     NSLog(@"[hc-cap] T0 startCaptureWithFPS entry isWindow=%d src=%@", (int)isWindow, sourceId);
+    // Picker-Thumbnails pausieren -> SCK-Daemon frei fuer den echten Start.
+    [FlutterScreenCaptureKitCapturer setCaptureStarting:YES];
     // Cache zuerst: SCShareableContent kann auf macOS 26 (Berechtigungs-XPC)
     // ~20 s dauern. Der Picker hat den Content gerade geholt -> der Share startet
     // direkt nach der Auswahl. Cache-Miss (z.B. neues Fenster) -> frisch holen.
@@ -258,6 +275,7 @@ static NSLock* _hcSckContentLock = nil;
       NSLog(@"[hc-cap] T5 SCStream startCapture REQUEST");
       [self.stream startCaptureWithCompletionHandler:^(NSError * _Nullable startError) {
         NSLog(@"[hc-cap] T6 SCStream startCapture RESPONSE err=%@", startError);
+        [FlutterScreenCaptureKitCapturer setCaptureStarting:NO];
         onStarted(startError);
       }];
 }
