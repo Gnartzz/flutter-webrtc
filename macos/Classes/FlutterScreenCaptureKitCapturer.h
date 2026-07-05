@@ -14,6 +14,13 @@
 
 - (instancetype)initWithDelegate:(id<RTCVideoCapturerDelegate>)delegate;
 
+/// Prozessweiter SCShareableContent-Cache. Jede SCShareableContent-Abfrage kann
+/// auf macOS 26 durch den Berechtigungs-Daemon ~20 s dauern — der Picker holt den
+/// Content ohnehin frisch; Capture-Start & Co. nutzen den Cache (TTL) statt eine
+/// zweite teure Abfrage zu starten. Thread-safe (interner Lock).
++ (void)cacheShareableContent:(id _Nullable)content;
++ (id _Nullable)cachedShareableContentMaxAge:(NSTimeInterval)maxAge;
+
 @property(nonatomic, strong) id<FlutterScreenCaptureKitAudioDelegate> _Nullable audioDelegate;
 
 /// `isWindow`=YES nimmt EIN FENSTER zero-copy auf (SCContentFilter

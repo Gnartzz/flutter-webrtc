@@ -242,6 +242,25 @@ NSArray<RTCDesktopSource*>* _captureSources;
 // liefert (v.a. Fullscreen-Apps auf eigenem Space). Damit der Capture-Pfad
 // (getDisplayMedia) so eine sourceId trotzdem als Fenster annimmt.
 NSSet<NSString*>* _sckExtraWindowIds = nil;
+
+// Ist die sourceId eine AKTIVE DisplayID? Screens kommen (>=12.3) nicht mehr aus
+// der RTCDesktopMediaList (deren blockierendes GetSourceList stand hinter dem
+// ~20s-Picker-Beachball auf macOS 26) — der Picker baut sie via
+// CGGetActiveDisplayList, der Capture-Pfad erkennt sie hiermit.
+static BOOL HCIsActiveDisplayId(NSString* sourceId) {
+  if (sourceId == nil || sourceId.length == 0) return NO;
+  CGDirectDisplayID want = (CGDirectDisplayID)[sourceId longLongValue];
+  if (want == 0) return NO; // DisplayIDs sind nie 0; "abc" parst zu 0
+  CGDirectDisplayID ids[16];
+  uint32_t n = 0;
+  if (CGGetActiveDisplayList(16, ids, &n) != kCGErrorSuccess) return NO;
+  for (uint32_t i = 0; i < n; i++) {
+    if (ids[i] == want) return YES;
+  }
+  return NO;
+}
+#else
+static inline BOOL HCIsActiveDisplayId(NSString* sourceId) { return NO; }
 #endif
 
 @implementation FlutterWebRTCPlugin (DesktopCapturer)
@@ -371,6 +390,10 @@ NSSet<NSString*>* _sckExtraWindowIds = nil;
   BOOL isWindow = NO;
 
   if (useDefaultScreen) {
+    useScreenCaptureKit = YES;
+  } else if (HCIsActiveDisplayId(sourceId)) {
+    // Screens kommen (>=12.3) NICHT mehr aus der RTCDesktopMediaList — der Picker
+    // baut sie via CGGetActiveDisplayList. sourceId = DisplayID -> direkt SCK.
     useScreenCaptureKit = YES;
   } else {
     source = [self getSourceById:sourceId];
@@ -598,76 +621,108 @@ static NSData* HCJpegFromCGImage(CGImageRef img) {
         }
         _sckExtraWindowIds = ids;
 
-        // Thumbnails (JPEG) parallel holen; danach erst die Liste liefern.
-        dispatch_group_t group = dispatch_group_create();
-        if (@available(macOS 14.0, *)) {
-          // Screens: STATISCHE SCK-Vorschau (initWithDisplay) — ersetzt die bei
-          // drahtlosen Sidecar-Displays korrupte Live-Thumbnail. Match per displayID.
-          for (NSMutableDictionary* sd in screenDicts) {
-            CGDirectDisplayID did = (CGDirectDisplayID)[sd[@"id"] longLongValue];
-            SCDisplay* disp = nil;
-            for (SCDisplay* d in content.displays) {
-              if (d.displayID == did) { disp = d; break; }
-            }
-            if (disp == nil) continue;
-            SCContentFilter* sfilter =
-                [[SCContentFilter alloc] initWithDisplay:disp excludingWindows:@[]];
-            SCStreamConfiguration* scfg = [[SCStreamConfiguration alloc] init];
-            CGFloat dw = (CGFloat)disp.width, dh = (CGFloat)disp.height;
-            CGFloat dscl = dw > 0 ? MIN(1.0, 480.0 / dw) : 1.0;
-            scfg.width = (size_t)MAX((CGFloat)2, dw * dscl);
-            scfg.height = (size_t)MAX((CGFloat)2, dh * dscl);
-            dispatch_group_enter(group);
-            [SCScreenshotManager
-                captureImageWithFilter:sfilter
-                         configuration:scfg
-                     completionHandler:^(CGImageRef _Nullable img,
-                                         NSError* _Nullable e) {
-                       NSData* jpeg = HCJpegFromCGImage(img);
-                       if (jpeg != nil) sd[@"thumbnail"] = jpeg;
-                       dispatch_group_leave(group);
-                     }];
-          }
-          for (NSUInteger i = 0; i < wins.count; i++) {
-            SCWindow* w = wins[i];
-            NSMutableDictionary* d = dicts[i];
-            SCContentFilter* filter =
-                [[SCContentFilter alloc] initWithDesktopIndependentWindow:w];
-            SCStreamConfiguration* cfg = [[SCStreamConfiguration alloc] init];
-            CGFloat sw = w.frame.size.width, sh = w.frame.size.height;
-            CGFloat scl = sw > 0 ? MIN(1.0, 480.0 / sw) : 1.0;
-            cfg.width = (size_t)MAX((CGFloat)2, sw * scl);
-            cfg.height = (size_t)MAX((CGFloat)2, sh * scl);
-            CGWindowID wid = w.windowID;
-            dispatch_group_enter(group);
-            [SCScreenshotManager
-                captureImageWithFilter:filter
-                         configuration:cfg
-                     completionHandler:^(CGImageRef _Nullable img,
-                                         NSError* _Nullable err) {
-                       NSData* jpeg = HCJpegFromCGImage(img);
-                       if (jpeg == nil) {
-                         // Fallback fuer Fenster, die SCScreenshotManager nicht
-                         // erwischt (z.B. Fullscreen-App auf eigenem Space):
-                         // Legacy-Window-Snapshot aus dem Window-Server.
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-                         CGImageRef cg = CGWindowListCreateImage(
-                             CGRectNull, kCGWindowListOptionIncludingWindow, wid,
-                             kCGWindowImageBoundsIgnoreFraming |
-                                 kCGWindowImageNominalResolution);
-#pragma clang diagnostic pop
-                         jpeg = HCJpegFromCGImage(cg);
-                         if (cg != NULL) CGImageRelease(cg);
-                       }
-                       if (jpeg != nil) d[@"thumbnail"] = jpeg;
-                       dispatch_group_leave(group);
-                     }];
-          }
-        }
-        dispatch_group_notify(group, dispatch_get_main_queue(), ^{
+        // Content fuer den Capture-Start cachen: SCShareableContent kann auf
+        // macOS 26 (Berechtigungs-XPC) ~20 s dauern — dank Cache startet der
+        // Share nach der Picker-Wahl SOFORT statt erneut zu warten.
+        [FlutterScreenCaptureKitCapturer cacheShareableContent:content];
+
+        // Liste SOFORT liefern (Picker oeffnet, Namen sichtbar) — die JPEG-
+        // Vorschauen kommen danach EINZELN als desktopSourceThumbnailChanged-
+        // Events (Dart fuellt live nach). Frueher wartete ein dispatch_group auf
+        // ALLE Screenshots; EIN haengender Screenshot (Berechtigungs-XPC)
+        // verzoegerte damit die komplette Picker-Liste um ~20 s.
+        dispatch_async(dispatch_get_main_queue(), ^{
           completion(dicts);
         });
+
+        if (@available(macOS 14.0, *)) {
+          __weak typeof(self) weakSelf = self;
+          // Kurzer Versatz: die getDesktopSources-Antwort muss die Dart-_sources-
+          // Map gefuellt haben, BEVOR das erste Event eintrifft (sonst verworfen).
+          dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_MSEC)),
+                         dispatch_get_main_queue(), ^{
+            typeof(self) strongSelf = weakSelf;
+            if (strongSelf == nil || strongSelf.eventSink == nil) return;
+            // Screens: STATISCHE SCK-Vorschau (initWithDisplay) — ersetzt die bei
+            // drahtlosen Sidecar-Displays korrupte Live-Thumbnail. Match per displayID.
+            for (NSMutableDictionary* sd in screenDicts) {
+              CGDirectDisplayID did = (CGDirectDisplayID)[sd[@"id"] longLongValue];
+              SCDisplay* disp = nil;
+              for (SCDisplay* dd in content.displays) {
+                if (dd.displayID == did) { disp = dd; break; }
+              }
+              if (disp == nil) continue;
+              SCContentFilter* sfilter =
+                  [[SCContentFilter alloc] initWithDisplay:disp excludingWindows:@[]];
+              SCStreamConfiguration* scfg = [[SCStreamConfiguration alloc] init];
+              CGFloat dw = (CGFloat)disp.width, dh = (CGFloat)disp.height;
+              CGFloat dscl = dw > 0 ? MIN(1.0, 480.0 / dw) : 1.0;
+              scfg.width = (size_t)MAX((CGFloat)2, dw * dscl);
+              scfg.height = (size_t)MAX((CGFloat)2, dh * dscl);
+              NSString* sid = sd[@"id"];
+              [SCScreenshotManager
+                  captureImageWithFilter:sfilter
+                           configuration:scfg
+                       completionHandler:^(CGImageRef _Nullable img,
+                                           NSError* _Nullable e) {
+                         NSData* jpeg = HCJpegFromCGImage(img);
+                         if (jpeg == nil) return;
+                         dispatch_async(dispatch_get_main_queue(), ^{
+                           typeof(self) s2 = weakSelf;
+                           if (s2 == nil || s2.eventSink == nil) return;
+                           postEvent(s2.eventSink, @{
+                             @"event" : @"desktopSourceThumbnailChanged",
+                             @"id" : sid,
+                             @"thumbnail" : jpeg
+                           });
+                         });
+                       }];
+            }
+            for (NSUInteger i = 0; i < wins.count; i++) {
+              SCWindow* w = wins[i];
+              NSString* wsid = dicts[i][@"id"];
+              SCContentFilter* filter =
+                  [[SCContentFilter alloc] initWithDesktopIndependentWindow:w];
+              SCStreamConfiguration* cfg = [[SCStreamConfiguration alloc] init];
+              CGFloat sw = w.frame.size.width, sh = w.frame.size.height;
+              CGFloat scl = sw > 0 ? MIN(1.0, 480.0 / sw) : 1.0;
+              cfg.width = (size_t)MAX((CGFloat)2, sw * scl);
+              cfg.height = (size_t)MAX((CGFloat)2, sh * scl);
+              CGWindowID wid = w.windowID;
+              [SCScreenshotManager
+                  captureImageWithFilter:filter
+                           configuration:cfg
+                       completionHandler:^(CGImageRef _Nullable img,
+                                           NSError* _Nullable err) {
+                         NSData* jpeg = HCJpegFromCGImage(img);
+                         if (jpeg == nil) {
+                           // Fallback fuer Fenster, die SCScreenshotManager nicht
+                           // erwischt (z.B. Fullscreen-App auf eigenem Space):
+                           // Legacy-Window-Snapshot aus dem Window-Server.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+                           CGImageRef cg = CGWindowListCreateImage(
+                               CGRectNull, kCGWindowListOptionIncludingWindow, wid,
+                               kCGWindowImageBoundsIgnoreFraming |
+                                   kCGWindowImageNominalResolution);
+#pragma clang diagnostic pop
+                           jpeg = HCJpegFromCGImage(cg);
+                           if (cg != NULL) CGImageRelease(cg);
+                         }
+                         if (jpeg == nil) return;
+                         dispatch_async(dispatch_get_main_queue(), ^{
+                           typeof(self) s2 = weakSelf;
+                           if (s2 == nil || s2.eventSink == nil) return;
+                           postEvent(s2.eventSink, @{
+                             @"event" : @"desktopSourceThumbnailChanged",
+                             @"id" : wsid,
+                             @"thumbnail" : jpeg
+                           });
+                         });
+                       }];
+            }
+          });
+        }
       }];
 }
 #endif
@@ -688,18 +743,37 @@ static NSData* HCJpegFromCGImage(CGImageRef img) {
   }
 
   NSMutableArray* sources = [NSMutableArray array];
-  // _captureSources enthaelt (ab 12.3) nur noch Screens — Fenster kommen via SCK.
-  // Screen-Dicts MUTABLE halten, damit der SCK-Helfer ihre Vorschau nachfuellt.
+  // Screen-Dicts separat halten — der SCK-Helfer schiebt ihre Vorschau nach.
   NSMutableArray<NSMutableDictionary*>* screenDicts = [NSMutableArray array];
-  for (RTCDesktopSource* object in _captureSources) {
-    NSMutableDictionary* d = [@{
-      @"id" : object.sourceId,
-      @"name" : object.name,
-      @"thumbnailSize" : @{@"width" : @0, @"height" : @0},
-      @"type" : object.sourceType == RTCDesktopSourceTypeScreen ? @"screen" : @"window",
-    } mutableCopy];
-    if (object.sourceType == RTCDesktopSourceTypeScreen) [screenDicts addObject:d];
-    [sources addObject:d];
+  if ([types containsObject:@"screen"] && [self hcModernSck]) {
+    // Screens DIREKT via CoreGraphics (instant, ohne webrtc/SCK-Blocking):
+    // id = CGDirectDisplayID — dieselbe ID, auf die SCK-Vorschau (buildSckSources)
+    // und Capture-Start (HCIsActiveDisplayId -> SCK initWithDisplay) matchen.
+    CGDirectDisplayID ids[16];
+    uint32_t n = 0;
+    CGGetActiveDisplayList(16, ids, &n);
+    for (uint32_t i = 0; i < n; i++) {
+      NSMutableDictionary* d = [@{
+        @"id" : [NSString stringWithFormat:@"%u", ids[i]],
+        @"name" : [NSString stringWithFormat:@"Screen %u", i + 1],
+        @"thumbnailSize" : @{@"width" : @0, @"height" : @0},
+        @"type" : @"screen",
+      } mutableCopy];
+      [screenDicts addObject:d];
+      [sources addObject:d];
+    }
+  } else {
+    // Legacy (<12.3): Screens aus der RTCDesktopMediaList.
+    for (RTCDesktopSource* object in _captureSources) {
+      NSMutableDictionary* d = [@{
+        @"id" : object.sourceId,
+        @"name" : object.name,
+        @"thumbnailSize" : @{@"width" : @0, @"height" : @0},
+        @"type" : object.sourceType == RTCDesktopSourceTypeScreen ? @"screen" : @"window",
+      } mutableCopy];
+      if (object.sourceType == RTCDesktopSourceTypeScreen) [screenDicts addObject:d];
+      [sources addObject:d];
+    }
   }
 
   // Fenster komplett via ScreenCaptureKit (eine Quelle -> keine Dupes/kein Race,
@@ -826,6 +900,14 @@ static NSData* HCJpegFromCGImage(CGImageRef img) {
   return newImage;
 }
 
+// @available laesst sich nicht in zusammengesetzten Bedingungen nutzen -> Helper.
+- (BOOL)hcModernSck {
+  if (@available(macOS 12.3, *)) {
+    return YES;
+  }
+  return NO;
+}
+
 - (RTCDesktopSource*)getSourceById:(NSString*)sourceId {
   NSEnumerator* enumerator = [_captureSources objectEnumerator];
   RTCDesktopSource* object;
@@ -883,17 +965,20 @@ static NSData* HCJpegFromCGImage(CGImageRef img) {
     }
   }
   if (captureScreen) {
-    if (!_screen)
-      _screen = [[RTCDesktopMediaList alloc] initWithType:RTCDesktopSourceTypeScreen delegate:self];
-    // updateAllThumbnails:NO — die Legacy-Thumbnails (Vollbild-Screenshot JEDES
-    // Displays ueber die deprecated CG-APIs) werden fuer Screens gar nicht mehr
-    // benutzt (statische SCK-Vorschau via SCScreenshotManager, s. buildSckSources).
-    // Auf macOS 26 laufen die CG-Calls durch den Screen-Capture-XPC-Gate und
-    // blockierten den MAIN-THREAD bis ~30 s (Beachball beim Picker-Oeffnen,
-    // User-Report 2026-07-05). Hier zaehlt nur die Display-Enumeration (schnell).
-    [_screen UpdateSourceList:forceReload updateAllThumbnails:NO];
-    NSArray<RTCDesktopSource*>* sources = [_screen getSources];
-    _captureSources = [_captureSources arrayByAddingObjectsFromArray:sources];
+    if (@available(macOS 12.3, *)) {
+      // KEINE RTCDesktopMediaList fuer Screens mehr: deren GetSourceList blockierte
+      // auf macOS 26 den MAIN-THREAD ~20-30 s (SCK-/Berechtigungs-XPC hinter einer
+      // Semaphore -> Beachball beim Picker-Oeffnen, User-Report 2026-07-05).
+      // getDesktopSources baut Screens direkt via CGGetActiveDisplayList (instant);
+      // der Capture-Pfad erkennt DisplayIDs via HCIsActiveDisplayId; die Vorschau
+      // kommt weiterhin statisch via SCK (buildSckSources).
+    } else {
+      if (!_screen)
+        _screen = [[RTCDesktopMediaList alloc] initWithType:RTCDesktopSourceTypeScreen delegate:self];
+      [_screen UpdateSourceList:forceReload updateAllThumbnails:YES];
+      NSArray<RTCDesktopSource*>* sources = [_screen getSources];
+      _captureSources = [_captureSources arrayByAddingObjectsFromArray:sources];
+    }
   }
   NSLog(@"captureSources: %lu", [_captureSources count]);
   return YES;

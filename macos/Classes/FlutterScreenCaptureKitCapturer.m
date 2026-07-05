@@ -21,7 +21,41 @@
 #endif
 @end
 
+// ── Prozessweiter SCShareableContent-Cache ─────────────────────────────────────
+// Jede SCShareableContent-Abfrage kann auf macOS 26 (Berechtigungs-Daemon/XPC)
+// ~20 s dauern. Der Picker fragt frisch ab und fuettert den Cache; Capture-Start
+// nutzt ihn (TTL) -> der Share startet direkt nach der Auswahl statt erneut zu
+// warten. Zugriff via Lock (Abfragen kommen von Main- und Hintergrund-Queues).
+static id _hcSckContent = nil;             // SCShareableContent (id: pre-12.3-Build)
+static NSDate* _hcSckContentDate = nil;
+static NSLock* _hcSckContentLock = nil;
+
 @implementation FlutterScreenCaptureKitCapturer
+
++ (void)initialize {
+  if (self == [FlutterScreenCaptureKitCapturer class]) {
+    _hcSckContentLock = [[NSLock alloc] init];
+  }
+}
+
++ (void)cacheShareableContent:(id)content {
+  if (content == nil) return;
+  [_hcSckContentLock lock];
+  _hcSckContent = content;
+  _hcSckContentDate = [NSDate date];
+  [_hcSckContentLock unlock];
+}
+
++ (id)cachedShareableContentMaxAge:(NSTimeInterval)maxAge {
+  [_hcSckContentLock lock];
+  id content = nil;
+  if (_hcSckContent != nil && _hcSckContentDate != nil &&
+      -[_hcSckContentDate timeIntervalSinceNow] <= maxAge) {
+    content = _hcSckContent;
+  }
+  [_hcSckContentLock unlock];
+  return content;
+}
 
 - (instancetype)initWithDelegate:(id<RTCVideoCapturerDelegate>)delegate {
   self = [super init];
@@ -43,18 +77,74 @@
                   onStarted:(void (^)(NSError * _Nullable error))onStarted {
 #if __has_include(<ScreenCaptureKit/ScreenCaptureKit.h>)
   if (@available(macOS 12.3, *)) {
-    [SCShareableContent getShareableContentWithCompletionHandler:^(SCShareableContent *content, NSError *error) {
-      if (error != nil) {
-        onStarted(error);
-        return;
-      }
+    // Cache zuerst: SCShareableContent kann auf macOS 26 (Berechtigungs-XPC)
+    // ~20 s dauern. Der Picker hat den Content gerade geholt -> der Share startet
+    // direkt nach der Auswahl. Cache-Miss (z.B. neues Fenster) -> frisch holen.
+    SCShareableContent *cached = (SCShareableContent *)
+        [FlutterScreenCaptureKitCapturer cachedShareableContentMaxAge:60.0];
+    if (cached != nil) {
+      [self hcStartWithContent:cached fromCache:YES fps:fps sourceId:sourceId
+                  captureAudio:captureAudio isWindow:isWindow
+                      maxWidth:maxWidth maxHeight:maxHeight onStarted:onStarted];
+    } else {
+      [self hcFetchContentAndStartWithFPS:fps sourceId:sourceId
+                             captureAudio:captureAudio isWindow:isWindow
+                                 maxWidth:maxWidth maxHeight:maxHeight onStarted:onStarted];
+    }
+    return;
+  }
+#endif
 
+  NSError *unavailable = [NSError errorWithDomain:@"FlutterScreenCaptureKit"
+                                             code:-2
+                                         userInfo:@{NSLocalizedDescriptionKey: @"ScreenCaptureKit not available"}];
+  onStarted(unavailable);
+}
+
+#if __has_include(<ScreenCaptureKit/ScreenCaptureKit.h>)
+- (void)hcFetchContentAndStartWithFPS:(NSInteger)fps
+                             sourceId:(NSString* _Nullable)sourceId
+                         captureAudio:(BOOL)captureAudio
+                             isWindow:(BOOL)isWindow
+                             maxWidth:(NSInteger)maxWidth
+                            maxHeight:(NSInteger)maxHeight
+                            onStarted:(void (^)(NSError * _Nullable error))onStarted
+    API_AVAILABLE(macos(12.3)) {
+  [SCShareableContent getShareableContentWithCompletionHandler:^(SCShareableContent *content, NSError *error) {
+    if (error != nil) {
+      onStarted(error);
+      return;
+    }
+    [FlutterScreenCaptureKitCapturer cacheShareableContent:content];
+    [self hcStartWithContent:content fromCache:NO fps:fps sourceId:sourceId
+                captureAudio:captureAudio isWindow:isWindow
+                    maxWidth:maxWidth maxHeight:maxHeight onStarted:onStarted];
+  }];
+}
+
+- (void)hcStartWithContent:(SCShareableContent *)content
+                 fromCache:(BOOL)fromCache
+                       fps:(NSInteger)fps
+                  sourceId:(NSString* _Nullable)sourceId
+              captureAudio:(BOOL)captureAudio
+                  isWindow:(BOOL)isWindow
+                  maxWidth:(NSInteger)maxWidth
+                 maxHeight:(NSInteger)maxHeight
+                 onStarted:(void (^)(NSError * _Nullable error))onStarted
+    API_AVAILABLE(macos(12.3)) {
       // Quelle waehlen: FENSTER (SCWindow, zero-copy wie Bildschirm) oder DISPLAY.
       SCContentFilter *filter = nil;
       NSInteger srcW = 0, srcH = 0;
       if (isWindow) {
         SCWindow *win = [self selectWindowFromContent:content sourceId:sourceId];
         if (win == nil) {
+          if (fromCache) {
+            // Cache zu alt (Fenster nach dem Cachen geoeffnet) -> frisch holen.
+            [self hcFetchContentAndStartWithFPS:fps sourceId:sourceId
+                                   captureAudio:captureAudio isWindow:isWindow
+                                       maxWidth:maxWidth maxHeight:maxHeight onStarted:onStarted];
+            return;
+          }
           onStarted([NSError errorWithDomain:@"FlutterScreenCaptureKit" code:-3
                       userInfo:@{NSLocalizedDescriptionKey: @"No matching window"}]);
           return;
@@ -69,13 +159,32 @@
       } else {
         SCDisplay *display = [self selectDisplayFromContent:content sourceId:sourceId];
         if (display == nil) {
+          if (fromCache) {
+            [self hcFetchContentAndStartWithFPS:fps sourceId:sourceId
+                                   captureAudio:captureAudio isWindow:isWindow
+                                       maxWidth:maxWidth maxHeight:maxHeight onStarted:onStarted];
+            return;
+          }
           onStarted([NSError errorWithDomain:@"FlutterScreenCaptureKit" code:-1
                       userInfo:@{NSLocalizedDescriptionKey: @"No matching display"}]);
           return;
         }
         filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:@[]];
-        srcW = display.width;
-        srcH = display.height;
+        // SCDisplay meldet PUNKTE. Fuer Retina-/Scaled-Modes mit dem
+        // backingScaleFactor des zugehoerigen NSScreen in PIXEL umrechnen —
+        // sonst captured SCK unscharf unterhalb nativ (User-Report 2026-07-05:
+        // 32:9 im Scaled-Mode 3360x945 Punkte -> Share lief mit „944p").
+        CGFloat dsc = 1.0;
+        for (NSScreen *scr in [NSScreen screens]) {
+          NSNumber *num = scr.deviceDescription[@"NSScreenNumber"];
+          if (num != nil && (CGDirectDisplayID)num.unsignedIntValue == display.displayID) {
+            dsc = scr.backingScaleFactor;
+            break;
+          }
+        }
+        if (dsc < 1.0) dsc = 1.0;
+        srcW = (NSInteger)lround((double)display.width * dsc);
+        srcH = (NSInteger)lround((double)display.height * dsc);
       }
 
       SCStreamConfiguration *config = [SCStreamConfiguration new];
@@ -143,16 +252,8 @@
       [self.stream startCaptureWithCompletionHandler:^(NSError * _Nullable startError) {
         onStarted(startError);
       }];
-    }];
-    return;
-  }
-#endif
-
-  NSError *unavailable = [NSError errorWithDomain:@"FlutterScreenCaptureKit"
-                                             code:-2
-                                         userInfo:@{NSLocalizedDescriptionKey: @"ScreenCaptureKit not available"}];
-  onStarted(unavailable);
 }
+#endif
 
 - (void)stopCaptureWithCompletion:(void (^)(void))completion {
 #if __has_include(<ScreenCaptureKit/ScreenCaptureKit.h>)

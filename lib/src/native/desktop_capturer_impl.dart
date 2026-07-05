@@ -170,7 +170,13 @@ class DesktopCapturerNative extends DesktopCapturer {
       final id = source['id'] as String;
       // Bestehendes Objekt weiterverwenden (behaelt Thumbnail + Identitaet),
       // sonst neu aus der Map bauen.
-      next[id] = _sources[id] ?? DesktopCapturerSourceNative.fromMap(source);
+      final s = _sources[id] ?? DesktopCapturerSourceNative.fromMap(source);
+      // Frisches Inline-Thumbnail (falls die Antwort eines mitbringt) auch fuer
+      // WIEDERVERWENDETE Objekte uebernehmen — sonst bleibt die alte Vorschau.
+      if (source['thumbnail'] != null) {
+        s.thumbnail = source['thumbnail'] as Uint8List;
+      }
+      next[id] = s;
     }
     _sources
       ..clear()
