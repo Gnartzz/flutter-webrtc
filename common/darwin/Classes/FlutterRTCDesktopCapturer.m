@@ -885,7 +885,13 @@ static NSData* HCJpegFromCGImage(CGImageRef img) {
   if (captureScreen) {
     if (!_screen)
       _screen = [[RTCDesktopMediaList alloc] initWithType:RTCDesktopSourceTypeScreen delegate:self];
-    [_screen UpdateSourceList:forceReload updateAllThumbnails:YES];
+    // updateAllThumbnails:NO — die Legacy-Thumbnails (Vollbild-Screenshot JEDES
+    // Displays ueber die deprecated CG-APIs) werden fuer Screens gar nicht mehr
+    // benutzt (statische SCK-Vorschau via SCScreenshotManager, s. buildSckSources).
+    // Auf macOS 26 laufen die CG-Calls durch den Screen-Capture-XPC-Gate und
+    // blockierten den MAIN-THREAD bis ~30 s (Beachball beim Picker-Oeffnen,
+    // User-Report 2026-07-05). Hier zaehlt nur die Display-Enumeration (schnell).
+    [_screen UpdateSourceList:forceReload updateAllThumbnails:NO];
     NSArray<RTCDesktopSource*>* sources = [_screen getSources];
     _captureSources = [_captureSources arrayByAddingObjectsFromArray:sources];
   }
@@ -899,7 +905,14 @@ static NSData* HCJpegFromCGImage(CGImageRef img) {
 - (void)didDesktopSourceAdded:(RTC_OBJC_TYPE(RTCDesktopSource) *)source {
   // NSLog(@"didDesktopSourceAdded: %@, id %@", source.name, source.sourceId);
   if (self.eventSink) {
-    NSImage* image = [source UpdateThumbnail];
+    // Screens ab 12.3: KEIN Legacy-UpdateThumbnail (Vollbild-CG-Screenshot,
+    // blockiert auf macOS 26 den Main-Thread via XPC-Gate; Vorschau kommt
+    // ohnehin statisch via SCK) — gleiche Logik wie didDesktopSourceThumbnailChanged.
+    BOOL skipLegacyThumb = NO;
+    if (@available(macOS 12.3, *)) {
+      skipLegacyThumb = (source.sourceType == RTCDesktopSourceTypeScreen);
+    }
+    NSImage* image = skipLegacyThumb ? nil : [source UpdateThumbnail];
     NSData* data = [[NSData alloc] init];
     if (image != nil) {
       NSImage* resizedImg = [self resizeImage:image forSize:NSMakeSize(320, 180)];
