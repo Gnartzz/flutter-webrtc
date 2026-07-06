@@ -322,11 +322,25 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
       return possibleValue;
     }
   } else if ([constraint isKindOfClass:[NSDictionary class]]) {
-    id idealConstraint = constraint[@"ideal"];
-    if ([idealConstraint isKindOfClass:[NSString class]]) {
-      int possibleValue = [idealConstraint intValue];
-      if (possibleValue != 0) {
-        return possibleValue;
+    // Constraint-Objekt {ideal|exact|max|min: <Zahl|String>}. livekit_client
+    // schickt die Kamera-fps als {'max': 60.0} (NSNumber-Double); frueher las
+    // dieser Zweig NUR {'ideal': <String>} -> ein {max:...} fiel auf 0 durch ->
+    // targetFps=0 -> die Kamera blieb beim Default ihres 720p-Formats (z.B. Brio
+    // 720p30 statt 60; Home-Cams mit 720p60-Default liefen zufaellig richtig).
+    // Jetzt Prioritaet ideal > exact > max > min, Zahl (int/double, gerundet) UND
+    // String — analog zum Windows-C++-Parser (common/cpp/src/flutter_media_stream.cc).
+    for (NSString* subKey in @[ @"ideal", @"exact", @"max", @"min" ]) {
+      id sub = constraint[subKey];
+      if ([sub isKindOfClass:[NSNumber class]]) {
+        int possibleValue = (int) ([sub doubleValue] + 0.5);
+        if (possibleValue != 0) {
+          return possibleValue;
+        }
+      } else if ([sub isKindOfClass:[NSString class]]) {
+        int possibleValue = [sub intValue];
+        if (possibleValue != 0) {
+          return possibleValue;
+        }
       }
     }
   }
@@ -491,7 +505,8 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
       
     AVCaptureDeviceFormat* selectedFormat = [self selectFormatForDevice:videoDevice
                                                             targetWidth:targetWidth
-                                                           targetHeight:targetHeight];
+                                                           targetHeight:targetHeight
+                                                              targetFps:targetFps];
 
     CMVideoDimensions selectedDimension = CMVideoFormatDescriptionGetDimensions(selectedFormat.formatDescription);
     NSInteger selectedWidth = (NSInteger) selectedDimension.width;
@@ -951,11 +966,13 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
 
 - (AVCaptureDeviceFormat*)selectFormatForDevice:(AVCaptureDevice*)device
                                     targetWidth:(NSInteger)targetWidth
-                                   targetHeight:(NSInteger)targetHeight {
+                                   targetHeight:(NSInteger)targetHeight
+                                      targetFps:(NSInteger)targetFps {
   NSArray<AVCaptureDeviceFormat*>* formats =
       [RTCCameraVideoCapturer supportedFormatsForDevice:device];
   AVCaptureDeviceFormat* selectedFormat = nil;
   long currentDiff = INT_MAX;
+  BOOL selectedMeetsFps = NO;
   for (AVCaptureDeviceFormat* format in formats) {
     CMVideoDimensions dimension = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
     FourCharCode pixelFormat = CMFormatDescriptionGetMediaSubType(format.formatDescription);
@@ -968,12 +985,35 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
 #endif
     //NSLog(@"AVCaptureDeviceFormats,fps %d, dimension: %dx%d", format.videoSupportedFrameRateRanges, dimension.width, dimension.height);
     long diff = labs(targetWidth - dimension.width) + labs(targetHeight - dimension.height);
+    // Erfuellt dieses Format die gewuenschte fps? (nur relevant, wenn targetFps>0)
+    // Cameras wie die Brio bieten 720p in MEHREREN Formaten (z.B. 720p30 UND
+    // 720p60) mit identischer Aufloesung an — die Auswahl nach reiner Aufloesung
+    // (currentDiff) traf sonst zufaellig das 30er-Format und selectFpsForFormat
+    // kappte via fmin(30, Ziel) auf 30. Bei gleicher Aufloesung deshalb fps-faehige
+    // Formate bevorzugen, DANN das bevorzugte Pixelformat (altes Kriterium).
+    BOOL meetsFps = NO;
+    if (targetFps > 0) {
+      for (AVFrameRateRange* fpsRange in format.videoSupportedFrameRateRanges) {
+        if (fpsRange.maxFrameRate + 0.5 >= (Float64)targetFps) {
+          meetsFps = YES;
+          break;
+        }
+      }
+    }
     if (diff < currentDiff) {
       selectedFormat = format;
       currentDiff = diff;
-    } else if (diff == currentDiff &&
-               pixelFormat == [self.videoCapturer preferredOutputPixelFormat]) {
-      selectedFormat = format;
+      selectedMeetsFps = meetsFps;
+    } else if (diff == currentDiff) {
+      if (targetFps > 0 && meetsFps && !selectedMeetsFps) {
+        // fps-faehiges Format schlaegt ein bisher gewaehltes ohne die Ziel-fps.
+        selectedFormat = format;
+        selectedMeetsFps = meetsFps;
+      } else if (meetsFps == selectedMeetsFps &&
+                 pixelFormat == [self.videoCapturer preferredOutputPixelFormat]) {
+        // gleiche fps-Klasse -> unveraendertes Pixelformat-Kriterium.
+        selectedFormat = format;
+      }
     }
   }
   return selectedFormat;
