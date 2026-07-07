@@ -521,6 +521,12 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
 
     if ([videoDevice lockForConfiguration:NULL]) {
       @try {
+        // HoneyCord: activeFormat ZUERST auf das gewaehlte Format setzen. AVFoundation
+        // validiert activeVideoMax/MinFrameDuration gegen das AKTUELL aktive Format;
+        // ohne das lag hier noch das Kamera-Default-Format (max 30) an -> 1/60 warf
+        // NSInvalidArgumentException ("Failed to set active frame rate!") -> fps blieb
+        // 30 (Brio 720p60-Setting wirkungslos, gemessen last.log 2026-07-07).
+        videoDevice.activeFormat = selectedFormat;
         videoDevice.activeVideoMaxFrameDuration = CMTimeMake(1, (int32_t)selectedFps);
         videoDevice.activeVideoMinFrameDuration = CMTimeMake(1, (int32_t)selectedFps);
       } @catch (NSException* exception) {
