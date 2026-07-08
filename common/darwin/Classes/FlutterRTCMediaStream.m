@@ -519,29 +519,43 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
     
     NSLog(@"target format %ldx%ld, targetFps: %ld, selected format: %ldx%ld, selected fps %ld", targetWidth, targetHeight, targetFps, selectedWidth, selectedHeight, selectedFps);
 
-    if ([videoDevice lockForConfiguration:NULL]) {
-      @try {
-        // HoneyCord: activeFormat ZUERST auf das gewaehlte Format setzen. AVFoundation
-        // validiert activeVideoMax/MinFrameDuration gegen das AKTUELL aktive Format;
-        // ohne das lag hier noch das Kamera-Default-Format (max 30) an -> 1/60 warf
-        // NSInvalidArgumentException ("Failed to set active frame rate!") -> fps blieb
-        // 30 (Brio 720p60-Setting wirkungslos, gemessen last.log 2026-07-07).
-        videoDevice.activeFormat = selectedFormat;
-        videoDevice.activeVideoMaxFrameDuration = CMTimeMake(1, (int32_t)selectedFps);
-        videoDevice.activeVideoMinFrameDuration = CMTimeMake(1, (int32_t)selectedFps);
-      } @catch (NSException* exception) {
-        NSLog(@"Failed to set active frame rate!\n User info:%@", exception.userInfo);
-      }
-      [videoDevice unlockForConfiguration];
-    }
-
+    // HoneyCord: Kamera-fps NACH startCaptureWithDevice pinnen (im completionHandler).
+    // Warum nicht davor (webrtc-sdk RTCCameraVideoCapturer::updateDeviceCaptureFormat):
+    //  (a) startCapture setzt activeFormat NEU -> das RESETTET jede vorher gesetzte
+    //      FrameDuration auf den Format-Default; ein Setzen DAVOR ist wirkungslos
+    //      (darum brachte der activeFormat-vor-Duration-Versuch ea4f5dd nichts).
+    //  (b) fuer AVCaptureDALDevice (viele USB/UVC-Cams, u.a. Logitech Brio)
+    //      UEBERSPRINGT der Capturer das fps-Setzen KOMPLETT -> Cam bleibt auf 30,
+    //      waehrend Nicht-DAL-Cams (Home-Cam) korrekt auf 60 gehen.
+    // Hier ist activeFormat bereits == selectedFormat und wird nicht mehr ueberschrieben,
+    // also 1/fps gueltig und dauerhaft. Geraeteklasse wird geloggt (Beweis DAL?).
+    AVCaptureDevice* fpsDevice = videoDevice;
+    NSInteger pinFps = selectedFps;
     [self.videoCapturer startCaptureWithDevice:videoDevice
                                         format:selectedFormat
                                            fps:selectedFps
                              completionHandler:^(NSError* error) {
                                if (error) {
                                  NSLog(@"Start capture error: %@", [error localizedDescription]);
+                                 return;
                                }
+                               if (![fpsDevice lockForConfiguration:NULL]) return;
+                               NSString* cls = NSStringFromClass([fpsDevice class]);
+                               @try {
+                                 fpsDevice.activeVideoMinFrameDuration = CMTimeMake(1, (int32_t)pinFps);
+                                 fpsDevice.activeVideoMaxFrameDuration = CMTimeMake(1, (int32_t)pinFps);
+                                 NSLog(@"[hc-fps] pinned %ld fps OK (device %@)", (long)pinFps, cls);
+                               } @catch (NSException* e1) {
+                                 // Manche (DAL-)Geraete lehnen die MAX-Duration ab -> nur MIN
+                                 // setzen (= Deckel bei fps, Cam laeuft bis dahin frei).
+                                 @try {
+                                   fpsDevice.activeVideoMinFrameDuration = CMTimeMake(1, (int32_t)pinFps);
+                                   NSLog(@"[hc-fps] pinned %ld fps MIN-only, max threw (device %@)", (long)pinFps, cls);
+                                 } @catch (NSException* e2) {
+                                   NSLog(@"[hc-fps] FAILED to pin %ld fps (device %@): %@", (long)pinFps, cls, e2.userInfo);
+                                 }
+                               }
+                               [fpsDevice unlockForConfiguration];
                              }];
 
     NSString* trackUUID = [[NSUUID UUID] UUIDString];
