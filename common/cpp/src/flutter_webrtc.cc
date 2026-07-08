@@ -4,6 +4,7 @@
 #include "flutter_webrtc/flutter_web_r_t_c_plugin.h"
 
 #if defined(_WIN32)
+#include <windows.h>  // id34: SetEnvironmentVariableA (Framerate-Halten-Schalter)
 #include "../../../windows/honeycord_mem_telemetry.h"
 #include "../../../windows/honeycord_audio_ducking.h"
 #endif
@@ -140,6 +141,23 @@ void FlutterWebRTC::HandleMethodCall(
         GetValue<EncodableMap>(*method_call.arguments());
     const std::string deviceId = findString(params, "deviceId");
     SelectAudioOutput(deviceId, std::move(result));
+  } else if (method_call.method_name().compare("setCameraHoldFramerate") == 0) {
+    // id34 „Framerate <-> Helligkeit" (Windows): setzt eine prozessweite
+    // Umgebungsvariable, die vcm_capturer (libwebrtc) beim naechsten
+    // Kamera-Start liest und daraufhin die Belichtung auf <=1/32s deckelt.
+    // Win32-Env-Block ist DLL-/CRT-unabhaengig im selben Prozess sichtbar.
+    // Auf anderen Plattformen No-op (Mac pinnt die fps direkt am Device).
+    bool enabled = false;
+    if (method_call.arguments()) {
+      const EncodableMap params =
+          GetValue<EncodableMap>(*method_call.arguments());
+      const EncodableValue v = findEncodableValue(params, "enabled");
+      if (!v.IsNull()) enabled = GetValue<bool>(v);
+    }
+#if defined(_WIN32)
+    SetEnvironmentVariableA("HONEYCORD_HOLD_FRAMERATE", enabled ? "1" : "0");
+#endif
+    result->Success(EncodableValue(enabled));
   } else if (method_call.method_name().compare("mediaStreamGetTracks") == 0) {
     if (!method_call.arguments()) {
       result->Error("Bad Arguments", "Null constraints arguments received");

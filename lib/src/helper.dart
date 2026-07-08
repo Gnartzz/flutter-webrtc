@@ -192,4 +192,13 @@ class Helper {
           'requestCapturePermission only support for Android/macOS');
     }
   }
+
+  /// id34 „Framerate ↔ Helligkeit" (nur Windows wirksam): Wenn [enabled], deckelt
+  /// libwebrtc beim nächsten Kamera-Start die Belichtung auf ≤ 1/32 s, damit die
+  /// Auto-Belichtung bei wenig Licht keine Frames droppen kann (hält 30 fps,
+  /// dunkleres Bild). Setzt eine prozessweite Umgebungsvariable; die Kamera muss
+  /// danach neu gestartet werden, damit der Cap greift. Auf anderen Plattformen
+  /// No-op (Mac pinnt die fps direkt am Gerät).
+  static Future<void> setCameraHoldFramerate(bool enabled) =>
+      WebRTC.invokeMethod('setCameraHoldFramerate', {'enabled': enabled});
 }
