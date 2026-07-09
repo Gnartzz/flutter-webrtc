@@ -811,6 +811,13 @@ scoped_refptr<RTCRtpParameters> FlutterPeerConnection::updateRtpParameters(
     } else if (degradationPreference == "disabled") {
       parameters->SetDegradationPreference(
           libwebrtc::RTCDegradationPreference::DISABLED);
+    } else if (degradationPreference == "maintain-framerate-and-resolution") {
+      // HoneyCord: fehlte bisher -> die Vorgabe wurde still verworfen und die
+      // Kamera fiel unter Co-Sharing-Last auf den libwebrtc-Default (Aufloesung
+      // sank, z.B. 720p->540p). Der Enum-Wert existiert bereits (GET-Pfad oben),
+      // nur dieser SET-Zweig fehlte. Haelt jetzt Aufloesung UND fps, senkt nur QP.
+      parameters->SetDegradationPreference(
+          libwebrtc::RTCDegradationPreference::MAINTAIN_FRAMERATE_AND_RESOLUTION);
     }
   }
 
