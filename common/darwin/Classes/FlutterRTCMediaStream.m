@@ -8,6 +8,93 @@
 #import "LocalVideoTrack.h"
 #import "LocalAudioTrack.h"
 
+#if TARGET_OS_OSX
+#import <CoreMediaIO/CMIOHardware.h>
+
+// HoneyCord: Framerate eines CoreMediaIO/DAL-Geraets (z.B. Logitech Brio) DIREKT via
+// CMIO setzen, wenn die AVFoundation-Frame-Duration-API sie ablehnt. DAL-Geraete
+// (macOS-Legacy-CoreMediaIO-Pfad) werfen bei activeVideoMin/MaxFrameDuration -> genau
+// dann greift dieser Fallback. Windows (DirectShow/MF) hat das Problem nicht.
+// Gibt YES zurueck, wenn das Set ohne Fehler durchlief.
+static BOOL HCSetCMIOFrameRate(NSString* deviceUID, double fps) {
+  if (deviceUID.length == 0 || fps <= 0) return NO;
+  // 1) Alle CMIO-Geraete holen
+  CMIOObjectPropertyAddress devsAddr = {
+      kCMIOHardwarePropertyDevices, kCMIOObjectPropertyScopeGlobal, kCMIOObjectPropertyElementMaster};
+  UInt32 dataSize = 0;
+  if (CMIOObjectGetPropertyDataSize(kCMIOObjectSystemObject, &devsAddr, 0, NULL, &dataSize) !=
+          kCMIOHardwareNoError ||
+      dataSize == 0)
+    return NO;
+  UInt32 devCount = dataSize / sizeof(CMIOObjectID);
+  CMIOObjectID* devs = (CMIOObjectID*)malloc(dataSize);
+  UInt32 used = 0;
+  if (CMIOObjectGetPropertyData(kCMIOObjectSystemObject, &devsAddr, 0, NULL, dataSize, &used, devs) !=
+      kCMIOHardwareNoError) {
+    free(devs);
+    return NO;
+  }
+  // 2) Geraet per UID (== AVCaptureDevice.uniqueID) finden
+  CMIODeviceID target = 0;
+  for (UInt32 i = 0; i < devCount; i++) {
+    CMIOObjectPropertyAddress uidAddr = {
+        kCMIODevicePropertyDeviceUID, kCMIOObjectPropertyScopeGlobal, kCMIOObjectPropertyElementMaster};
+    CFStringRef uid = NULL;
+    UInt32 sz = sizeof(uid);
+    if (CMIOObjectGetPropertyData(devs[i], &uidAddr, 0, NULL, sz, &sz, &uid) == kCMIOHardwareNoError &&
+        uid) {
+      BOOL match = [deviceUID isEqualToString:(__bridge NSString*)uid];
+      CFRelease(uid);
+      if (match) {
+        target = devs[i];
+        break;
+      }
+    }
+  }
+  free(devs);
+  if (target == 0) {
+    NSLog(@"[hc-fps] CMIO: kein Geraet fuer UID %@", deviceUID);
+    return NO;
+  }
+  // 3) Streams des Geraets holen und FrameRate setzen
+  CMIOObjectPropertyAddress streamsAddr = {
+      kCMIODevicePropertyStreams, kCMIOObjectPropertyScopeGlobal, kCMIOObjectPropertyElementMaster};
+  dataSize = 0;
+  if (CMIOObjectGetPropertyDataSize(target, &streamsAddr, 0, NULL, &dataSize) != kCMIOHardwareNoError ||
+      dataSize == 0)
+    return NO;
+  UInt32 streamCount = dataSize / sizeof(CMIOStreamID);
+  CMIOStreamID* streams = (CMIOStreamID*)malloc(dataSize);
+  if (CMIOObjectGetPropertyData(target, &streamsAddr, 0, NULL, dataSize, &used, streams) !=
+      kCMIOHardwareNoError) {
+    free(streams);
+    return NO;
+  }
+  BOOL ok = NO;
+  for (UInt32 i = 0; i < streamCount; i++) {
+    CMIOObjectPropertyAddress rateAddr = {
+        kCMIOStreamPropertyFrameRate, kCMIOObjectPropertyScopeGlobal, kCMIOObjectPropertyElementMaster};
+    if (!CMIOObjectHasProperty(streams[i], &rateAddr)) continue;
+    Boolean settable = false;
+    if (CMIOObjectIsPropertySettable(streams[i], &rateAddr, &settable) != kCMIOHardwareNoError ||
+        !settable) {
+      NSLog(@"[hc-fps] CMIO stream %u: FrameRate nicht settable", (unsigned)streams[i]);
+      continue;
+    }
+    Float64 rate = (Float64)fps;
+    OSStatus st = CMIOObjectSetPropertyData(streams[i], &rateAddr, 0, NULL, (UInt32)sizeof(rate), &rate);
+    Float64 readBack = 0;
+    UInt32 rbSize = sizeof(readBack);
+    CMIOObjectGetPropertyData(streams[i], &rateAddr, 0, NULL, rbSize, &rbSize, &readBack);
+    NSLog(@"[hc-fps] CMIO set %.0f fps on stream %u -> status %d, readback %.1f", fps,
+          (unsigned)streams[i], (int)st, readBack);
+    if (st == kCMIOHardwareNoError) ok = YES;
+  }
+  free(streams);
+  return ok;
+}
+#endif
+
 @implementation RTCMediaStreamTrack (Flutter)
 
 - (id)settings {
@@ -552,7 +639,16 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
                                    fpsDevice.activeVideoMinFrameDuration = CMTimeMake(1, (int32_t)pinFps);
                                    NSLog(@"[hc-fps] pinned %ld fps MIN-only, max threw (device %@)", (long)pinFps, cls);
                                  } @catch (NSException* e2) {
-                                   NSLog(@"[hc-fps] FAILED to pin %ld fps (device %@): %@", (long)pinFps, cls, e2.userInfo);
+                                   BOOL cmioOK = NO;
+#if TARGET_OS_OSX
+                                   // AVFoundation-Frame-Duration abgelehnt (DAL-Geraet,
+                                   // z.B. Logitech Brio) -> Framerate direkt via CoreMediaIO.
+                                   cmioOK = HCSetCMIOFrameRate(fpsDevice.uniqueID, (double)pinFps);
+                                   if (cmioOK)
+                                     NSLog(@"[hc-fps] pinned %ld fps via CMIO (device %@)", (long)pinFps, cls);
+#endif
+                                   if (!cmioOK)
+                                     NSLog(@"[hc-fps] FAILED to pin %ld fps (device %@): %@", (long)pinFps, cls, e2.userInfo);
                                  }
                                }
                                [fpsDevice unlockForConfiguration];
