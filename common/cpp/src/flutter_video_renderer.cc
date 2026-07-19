@@ -73,7 +73,15 @@ void RenderLog(int64_t tex, int throttled, const char* what, double fps, int w, 
 }  // namespace
 #endif
 
-FlutterVideoRenderer::~FlutterVideoRenderer() {}
+FlutterVideoRenderer::~FlutterVideoRenderer() {
+  // Sicherheitsnetz fuer jeden Zerstoerungspfad ohne vorheriges Dispose
+  // (z. B. Plugin-Teardown beim App-Ende): aus dem Sink des Tracks austragen.
+  // RemoveRenderer blockiert auf dem Adapter-Mutex, bis ein laufendes
+  // OnFrame fertig ist -> danach kann kein Frame mehr hierher gelangen.
+  // Ohne das ruft der Capture-Thread in ein halb-zerstoertes Objekt
+  // (purecall -> abort).
+  SetVideoTrack(nullptr);
+}
 
 void FlutterVideoRenderer::initialize(
     TextureRegistrar* registrar,
@@ -389,13 +397,20 @@ void FlutterVideoRendererManager::VideoRendererDispose(
     std::unique_ptr<MethodResultProxy> result) {
   auto it = renderers_.find(texture_id);
   if (it != renderers_.end()) {
-    it->second->SetVideoTrack(nullptr);
+    scoped_refptr<FlutterVideoRenderer> renderer = it->second;
+    renderer->SetVideoTrack(nullptr);
+    // Sofort aus der Map: ein spaetes setSrcObject (Attach-Race beim
+    // Kachel-Umbau, z. B. wenn die Share-Kachel erscheint) darf den Renderer
+    // nicht wiederfinden und erneut an einen Track haengen — sonst wird er
+    // spaeter registriert zerstoert (purecall im Capture-Thread). Nebenbei:
+    // Doppel-Dispose kann so nicht mehr zweimal denselben Iterator erasen.
+    renderers_.erase(it);
 #if defined(_WINDOWS)
-    base_->textures_->UnregisterTexture(texture_id,
-                                        [&, it] { renderers_.erase(it); });
+    // Renderer lebt weiter, bis die Engine die Textur wirklich freigegeben
+    // hat (der Callback haelt die letzte Referenz).
+    base_->textures_->UnregisterTexture(texture_id, [renderer] {});
 #else
     base_->textures_->UnregisterTexture(texture_id);
-    renderers_.erase(it);
 #endif
     result->Success();
     return;
