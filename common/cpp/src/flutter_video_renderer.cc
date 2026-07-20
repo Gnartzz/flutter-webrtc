@@ -5,6 +5,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <dxgi.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "d3d11.lib")
+#endif
 #endif
 
 namespace flutter_webrtc_plugin {
@@ -159,6 +164,106 @@ bool FlutterVideoRenderer::EnsureFallbackTexture(int w, int h) const {
   return true;
 }
 
+// Self-View-Zero-Copy: das per (rotierendem) Capturer-Handle referenzierte Bild
+// auf DEMSELBEN Adapter in eine eigene Textur kopieren und deren STATISCHEN Handle
+// zurueckgeben -> ANGLE bindet einmalig (Bind-once) statt pro Frame -> Compositor
+// ~62 statt ~20 fps, 0 CPU. copy_dev_ liegt explizit auf dem Capturer-Adapter
+// (NVIDIA); nur wenn dessen LUID == Default-Adapter (= ANGLE) ist copy_handle_ fuer
+// ANGLE oeffenbar. Sonst copy_ready_=0 -> false -> Aufrufer nutzt den Direkt-Handle
+// (heutiges Verhalten, immer korrekt). Einmal geprueft, dann gecacht.
+bool FlutterVideoRenderer::CopySelfViewToOwn(int w, int h, void* handle) const {
+  using Microsoft::WRL::ComPtr;
+  if (copy_ready_ == 0) return false;  // Adapter passt nicht -> Direkt-Handle
+  if (!copy_dev_) {
+    ComPtr<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(
+            __uuidof(IDXGIFactory1),
+            reinterpret_cast<void**>(factory.GetAddressOf())))) {
+      copy_ready_ = 0;
+      return false;
+    }
+    ComPtr<IDXGIAdapter1> nvidia;
+    for (UINT i = 0;; ++i) {
+      ComPtr<IDXGIAdapter1> a;
+      if (factory->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND) break;
+      DXGI_ADAPTER_DESC1 ad{};
+      if (SUCCEEDED(a->GetDesc1(&ad)) && ad.VendorId == 0x10DE) {
+        nvidia = a;
+        break;
+      }
+    }
+    D3D_FEATURE_LEVEL fl;
+    if (FAILED(D3D11CreateDevice(
+            nvidia.Get(),
+            nvidia ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, nullptr,
+            0, nullptr, 0, D3D11_SDK_VERSION, &copy_dev_, &fl, &copy_ctx_))) {
+      copy_dev_.Reset();
+      copy_ctx_.Reset();
+      copy_ready_ = 0;
+      return false;
+    }
+    // LUID(copy_dev_) muss == Default-Adapter (= ANGLE) sein, sonst ist der
+    // Legacy-Shared-Handle fuer ANGLE nicht oeffenbar (cross-adapter) -> Fallback.
+    LUID cl{}, dl{};
+    ComPtr<IDXGIDevice> dxdev;
+    ComPtr<IDXGIAdapter> ad;
+    DXGI_ADAPTER_DESC de{};
+    if (SUCCEEDED(copy_dev_.As(&dxdev)) && SUCCEEDED(dxdev->GetAdapter(&ad)) &&
+        SUCCEEDED(ad->GetDesc(&de)))
+      cl = de.AdapterLuid;
+    ComPtr<IDXGIAdapter1> a0;
+    DXGI_ADAPTER_DESC1 d0{};
+    if (factory->EnumAdapters1(0, &a0) != DXGI_ERROR_NOT_FOUND &&
+        SUCCEEDED(a0->GetDesc1(&d0)))
+      dl = d0.AdapterLuid;
+    if (cl.LowPart != dl.LowPart || cl.HighPart != dl.HighPart) {
+      copy_dev_.Reset();
+      copy_ctx_.Reset();
+      copy_ready_ = 0;
+      return false;
+    }
+    copy_ready_ = 1;
+  }
+  if (!copy_tex_ || copy_w_ != w || copy_h_ != h) {
+    copy_tex_.Reset();
+    copy_handle_ = nullptr;
+    D3D11_TEXTURE2D_DESC d = {};
+    d.Width = w; d.Height = h; d.MipLevels = 1; d.ArraySize = 1;
+    d.Format = DXGI_FORMAT_B8G8R8A8_UNORM; d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_DEFAULT;
+    d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    d.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+    if (FAILED(copy_dev_->CreateTexture2D(&d, nullptr, &copy_tex_))) {
+      copy_tex_.Reset();
+      return false;
+    }
+    ComPtr<IDXGIResource> res;
+    if (FAILED(copy_tex_.As(&res)) ||
+        FAILED(res->GetSharedHandle(&copy_handle_)) || !copy_handle_) {
+      copy_tex_.Reset();
+      copy_handle_ = nullptr;
+      return false;
+    }
+    copy_w_ = w;
+    copy_h_ = h;
+    copy_last_handle_ = nullptr;  // Ziel neu -> Quell-Open erzwingen
+  }
+  // Rotierendes Capturer-Handle auf copy_dev_ (gleicher Adapter -> gueltig) oeffnen.
+  if (handle != copy_last_handle_ || !copy_src_tex_) {
+    copy_src_tex_.Reset();
+    if (FAILED(copy_dev_->OpenSharedResource(
+            reinterpret_cast<HANDLE>(handle), __uuidof(ID3D11Texture2D),
+            reinterpret_cast<void**>(copy_src_tex_.GetAddressOf())))) {
+      copy_last_handle_ = nullptr;
+      return false;  // Open fehlgeschlagen -> Direkt-Handle
+    }
+    copy_last_handle_ = handle;
+  }
+  copy_ctx_->CopyResource(copy_tex_.Get(), copy_src_tex_.Get());
+  copy_ctx_->Flush();
+  return true;
+}
+
 const FlutterDesktopGpuSurfaceDescriptor* FlutterVideoRenderer::ObtainGpuSurface(
     size_t width, size_t height) const {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -169,6 +274,14 @@ const FlutterDesktopGpuSurfaceDescriptor* FlutterVideoRenderer::ObtainGpuSurface
 
   void* handle = frame_->native_shared_handle();
   dbg_native_ = handle ? 1 : 0;
+  // Self-View (is_throttle_) mit nativem Handle: statt des rotierenden Capturer-
+  // Handles (ANGLE re-bindet pro Frame -> Fenster-Compositor ~20 fps, zieht auch
+  // Remote-Kacheln + Responsivitaet runter) das Bild auf demselben Adapter in eine
+  // eigene Textur kopieren und deren STATISCHEN Handle geben (Bind-once, ~62 fps,
+  // 0 CPU, korrekte Farben). Bei Adapter-Mismatch/Fehler -> Direkt-Handle (heute).
+  if (handle && is_throttle_ && CopySelfViewToOwn(w, h, handle)) {
+    handle = copy_handle_;
+  }
   if (!handle) {
     // Nicht-nativer Frame (Kamera/Remote, I420): nach BGRA konvertieren und in
     // die eigene Shared-Textur hochladen. Producer (Upload) + Consumer (ANGLE)
