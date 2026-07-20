@@ -87,27 +87,26 @@ class FlutterVideoRenderer
   mutable std::shared_ptr<uint8_t> fb_cpu_;
   bool EnsureFallbackTexture(int w, int h) const;
 
-  // Self-View-Zero-Copy-Fix (2026-07-20, auf RTX 2070S gemessen): den nativen
+  // Self-View-Vorschau-Fix (2026-07-20, auf RTX 2070S gemessen): den nativen
   // Capturer-Handle NICHT direkt an ANGLE geben — der Capturer rotiert pro Frame
   // durch einen 3er-Ring, ANGLE re-bindet dadurch JEDES Bild (eglBindTexImage) und
   // Flutters Fenster-Compositor bricht auf ~20 fps ein (zieht Vorschau, App-
-  // Responsivitaet UND Remote-Kacheln mit runter). Stattdessen das Bild per
-  // OpenSharedResource+CopyResource in copy_tex_ (eigene Textur auf demselben
-  // Adapter) kopieren und deren STATISCHEN Handle an ANGLE geben -> Bind-once,
-  // Compositor ~62 fps, 0 CPU (kein Readback), gemessen korrekte Farben. copy_dev_
-  // liegt explizit auf dem Capturer-Adapter (NVIDIA); copy_ready_ cacht, ob dessen
-  // LUID == Default-Adapter (= ANGLE) ist — nur dann ist copy_handle_ fuer ANGLE
-  // oeffenbar, sonst Fallback auf den Direkt-Handle (heutiges Verhalten, korrekt).
-  // Nur Self-View (is_throttle_); Sende-/Remote-Pfad unberuehrt.
-  mutable Microsoft::WRL::ComPtr<ID3D11Device> copy_dev_;
-  mutable Microsoft::WRL::ComPtr<ID3D11DeviceContext> copy_ctx_;
-  mutable Microsoft::WRL::ComPtr<ID3D11Texture2D> copy_tex_;
-  mutable void* copy_handle_ = nullptr;
-  mutable Microsoft::WRL::ComPtr<ID3D11Texture2D> copy_src_tex_;
-  mutable void* copy_last_handle_ = nullptr;
-  mutable int copy_w_ = 0, copy_h_ = 0;
-  mutable int copy_ready_ = -1;  // -1 ungeprueft, 0 nicht nutzbar (Fallback), 1 nutzbar
-  bool CopySelfViewToOwn(int w, int h, void* handle) const;
+  // Responsivitaet UND Remote-Kacheln mit runter). Fix: das Capturer-Bild per
+  // Readback auf fb_dev_ (Default = ANGLE-Adapter) ROH (BGRA, KEINE Farb-
+  // konvertierung -> kein R/B-Swap) nach fb_cpu_ holen und per UpdateSubresource in
+  // fb_tex_ schreiben; ANGLE bekommt deren STATISCHEN Handle (Bind-once, ~72 fps).
+  // WICHTIG: der CPU-Write (UpdateSubresource) ist der EINZIGE Weg, den ANGLE bei
+  // statischem Handle wirklich neu abtastet (wie der Remote-Pfad) — ein GPU-Copy-
+  // Resource in eine fremd-beschriebene Textur friert bei ANGLE ein (schwarz -> das
+  // war 2.6.7 UND der GPU-Copy-Versuch 2.6.9). Scheitert der Open (Hybrid-GPU:
+  // Default-Adapter != Capturer-NVIDIA) -> Direkt-Handle (heutiges 20-fps-Verhalten,
+  // sichtbar). Kosten: 1 Readback/Bild, nur Self-View (is_throttle_, gedrosselt);
+  // Sende-/Remote-Pfad unberuehrt.
+  mutable Microsoft::WRL::ComPtr<ID3D11Texture2D> raw_src_tex_;
+  mutable void* raw_last_handle_ = nullptr;
+  mutable Microsoft::WRL::ComPtr<ID3D11Texture2D> raw_staging_;
+  mutable int raw_w_ = 0, raw_h_ = 0;
+  bool CopySelfViewRawCpu(int w, int h, void* handle) const;
 
   // Self-View-Drossel: die EIGENE Bildschirm-Selbstansicht zeigt den Schirm, den
   // man eh sieht -> auf ~25 fps drosseln, damit nicht jeder 60-fps-Frame ein
