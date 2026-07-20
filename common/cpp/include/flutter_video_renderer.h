@@ -125,6 +125,46 @@ class FlutterVideoRenderer
   // Backpressure) -> WebRTCs Render-Pacing wirft die restlichen Frames weg.
   double dbg_mark_ms_ = 0.0;
   unsigned dbg_mark_n_ = 0;
+
+  // === Self-View-DIAGNOSE (temporaer, 2026-07-20): 3 Modi mess-vergleichen und
+  // BILDKORREKTHEIT verifizieren (Lehre aus 2.6.7 = 63 fps SCHWARZ; damals nur
+  // fps gemessen). Modus 0 = Direkt-Handle (heutige Baseline), 1 = GPU-Zero-Copy
+  // auf dem NVIDIA-Adapter des Capturers, 2 = CPU-Weg (ConvertToARGB->fb_tex_,
+  // = bewaehrter Remote-Pfad). Auto-Wechsel alle ~15 s. GREIFT NUR fuer die
+  // Self-View (is_throttle_ && nativer Handle); Remote/Sende-Pfad unberuehrt.
+  static constexpr int64_t kDiagDwellMs = 15000;
+  mutable int     diag_mode_ = 0;
+  mutable int64_t diag_mode_since_ = 0;
+  mutable int64_t diag_lum_last_ = 0;
+  mutable double  diag_lum_ = -1.0;       // 0..255 Durchschnitts-Luminanz
+  mutable double  diag_nonblack_ = -1.0;  // % Pixel ueber Schwarz-Schwelle
+  mutable bool    diag_dumped_[3] = {false, false, false};
+  mutable int     diag_mode1_state_ = -1; // 0=ok 1=adapter-mismatch 2=open-fail 3=create-fail
+
+  // Modus 1: Kopiergeraet auf dem NVIDIA-Adapter des Capturers (NICHT Default),
+  // damit OpenSharedResource des Capturer-Legacy-Handles gueltig ist. Ziel-Textur
+  // copy_tex_ (legacy-SHARED) wird von ANGLE geoeffnet.
+  mutable Microsoft::WRL::ComPtr<ID3D11Device>        copy_dev_;
+  mutable Microsoft::WRL::ComPtr<ID3D11DeviceContext> copy_ctx_;
+  mutable Microsoft::WRL::ComPtr<ID3D11Texture2D>     copy_tex_;
+  mutable void*                                       copy_handle_ = nullptr;
+  mutable Microsoft::WRL::ComPtr<ID3D11Texture2D>     copy_src_tex_;
+  mutable void*                                       copy_last_handle_ = nullptr;
+  mutable int  copy_w_ = 0, copy_h_ = 0;
+  mutable bool copy_adapter_ok_ = false;  // LUID(copy_dev_) == LUID(Default/ANGLE)
+  bool EnsureCopyDevice() const;
+  bool CopyNativeSameAdapter(void* handle, int w, int h) const;
+  bool ConvertNativeCpu(int w, int h) const;  // Modus 2 + regulaerer Fallback
+
+  // DIAGNOSE-ONLY-Readback (nie im Produktionspfad): den Handle, den ANGLE bekaeme,
+  // auf fb_dev_ (= ANGLEs Adapter) oeffnen -> Staging -> CPU -> Luminanz + BMP.
+  // Scheitert das Open, ist es das ehrliche Adapter-Schwarz (ANGLE koennte es auch
+  // nicht) -> lum=0.
+  mutable Microsoft::WRL::ComPtr<ID3D11Texture2D> diag_staging_;
+  mutable int  diag_w_ = 0, diag_h_ = 0;
+  mutable std::shared_ptr<uint8_t> diag_cpu_;
+  bool ReadbackAngleView(void* handle, int w, int h) const;
+  void MaybeDiagnose(int w, int h, void* angle_handle, bool have_cpu) const;
 #endif
 };
 

@@ -2,9 +2,16 @@
 
 #ifdef _WINDOWS
 #include <chrono>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
+#include <dxgi.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "d3d11.lib")
+#endif
 #endif
 
 namespace flutter_webrtc_plugin {
@@ -51,7 +58,8 @@ void RotateLogIfNeededA(const char* path) {
 #pragma warning(push)
 #pragma warning(disable : 4996)
 void RenderLog(int64_t tex, int throttled, const char* what, double fps, int w, int h,
-               int native, double fb_ms, double mark_ms) {
+               int native, double fb_ms, double mark_ms, int mode, double lum,
+               double nonblack) {
   if (const char* base = std::getenv("LOCALAPPDATA")) {
     std::string path = std::string(base) + "\\HoneyCord\\render.log";
     static const bool rotated = [&path] {
@@ -62,11 +70,90 @@ void RenderLog(int64_t tex, int throttled, const char* what, double fps, int w, 
     if (FILE* f = std::fopen(path.c_str(), "a")) {
       std::fprintf(f,
                    "[render] tex=%lld throttled=%d %s=%.1f fps %dx%d native=%d "
-                   "fbconv=%.2f ms mark=%.1f ms\n",
+                   "fbconv=%.2f ms mark=%.1f ms mode=%d lum=%.1f nonblack=%.1f%%\n",
                    static_cast<long long>(tex), throttled, what, fps, w, h, native,
-                   fb_ms, mark_ms);
+                   fb_ms, mark_ms, mode, lum, nonblack);
       std::fclose(f);
     }
+  }
+}
+
+// DIAGNOSE: freie Textzeile nach render.log (MODE1-Adapter/Sync-Verdikte).
+void DiagLogA(const char* fmt, ...) {
+  if (const char* base = std::getenv("LOCALAPPDATA")) {
+    std::string path = std::string(base) + "\\HoneyCord\\render.log";
+    if (FILE* f = std::fopen(path.c_str(), "a")) {
+      va_list ap;
+      va_start(ap, fmt);
+      std::vfprintf(f, fmt, ap);
+      va_end(ap);
+      std::fputc('\n', f);
+      std::fclose(f);
+    }
+  }
+}
+
+// DIAGNOSE: kleines Grid abtasten -> Durchschnitts-Luminanz (0..255) +
+// Nicht-Schwarz-Anteil (%). O(4096) unabhaengig von der Aufloesung. BGRA-Order.
+void SampleLuminance(const uint8_t* bgra, int w, int h, double* lum,
+                     double* nonblack) {
+  const int N = 64;
+  double sum = 0.0;
+  int nb = 0, cnt = 0;
+  for (int gy = 0; gy < N; ++gy) {
+    int y = (h * gy) / N;
+    if (y >= h) y = h - 1;
+    for (int gx = 0; gx < N; ++gx) {
+      int x = (w * gx) / N;
+      if (x >= w) x = w - 1;
+      const uint8_t* p = bgra + (static_cast<size_t>(y) * w + x) * 4;
+      double L = 0.114 * p[0] + 0.587 * p[1] + 0.299 * p[2];
+      sum += L;
+      if (L > 8.0) ++nb;
+      ++cnt;
+    }
+  }
+  *lum = cnt ? sum / cnt : 0.0;
+  *nonblack = cnt ? 100.0 * nb / cnt : 0.0;
+}
+
+// DIAGNOSE: 32-bit top-down BI_RGB BMP (DXGI-BGRA == BMP-Byte-Order -> memcpy).
+void DumpBmp(const char* path, const uint8_t* bgra, int w, int h) {
+#pragma pack(push, 1)
+  struct FileHdr {
+    uint16_t bfType;
+    uint32_t bfSize;
+    uint16_t r1, r2;
+    uint32_t bfOffBits;
+  } fh;
+  struct InfoHdr {
+    uint32_t biSize;
+    int32_t biW, biH;
+    uint16_t biPlanes, biBpp;
+    uint32_t biComp, biImg;
+    int32_t biX, biY;
+    uint32_t biClr, biImp;
+  } ih;
+#pragma pack(pop)
+  const uint32_t data = static_cast<uint32_t>(w) * static_cast<uint32_t>(h) * 4u;
+  fh.bfType = 0x4D42;  // 'BM'
+  fh.bfSize = 54u + data;
+  fh.r1 = fh.r2 = 0;
+  fh.bfOffBits = 54u;
+  ih.biSize = 40u;
+  ih.biW = w;
+  ih.biH = -h;  // top-down
+  ih.biPlanes = 1;
+  ih.biBpp = 32;
+  ih.biComp = 0;  // BI_RGB
+  ih.biImg = data;
+  ih.biX = ih.biY = 0;
+  ih.biClr = ih.biImp = 0;
+  if (FILE* f = std::fopen(path, "wb")) {
+    std::fwrite(&fh, 1, 14, f);
+    std::fwrite(&ih, 1, 40, f);
+    std::fwrite(bgra, 1, data, f);
+    std::fclose(f);
   }
 }
 #pragma warning(pop)
@@ -180,6 +267,201 @@ bool FlutterVideoRenderer::CopyNativeToOwn(void* handle, int w, int h) const {
   return true;
 }
 
+// Modus 2 / regulaerer Fallback: nativen (oder I420-) Frame per Capturer-eigenem
+// Readback nach BGRA holen und in fb_tex_ (ANGLEs Adapter) hochladen. Der Readback
+// (ConvertToARGB->ToI420) laeuft auf dem Capturer-Device g_dev_ = kohaerent,
+// adapter-unabhaengig, immer korrekt (= bewaehrter Remote-Pfad).
+bool FlutterVideoRenderer::ConvertNativeCpu(int w, int h) const {
+  if (!EnsureFallbackTexture(w, h)) return false;
+  auto _t_fb = std::chrono::steady_clock::now();
+  frame_->ConvertToARGB(RTCVideoFrame::Type::kBGRA, fb_cpu_.get(), 0, w, h);
+  fb_ctx_->UpdateSubresource(fb_tex_.Get(), 0, nullptr, fb_cpu_.get(),
+                             static_cast<UINT>(w) * 4, 0);
+  fb_ctx_->Flush();
+  dbg_fb_ms_ += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - _t_fb)
+                    .count();
+  dbg_fb_n_++;
+  return true;
+}
+
+// Modus 1: Kopiergeraet auf dem NVIDIA-Adapter des Capturers anlegen (dessen
+// Enumeration spiegeln), damit OpenSharedResource des Capturer-Legacy-Handles
+// same-adapter (= gueltig) ist. LUID gegen den Default-Adapter (= ANGLE) pruefen:
+// nur wenn gleich, kann ANGLE das Ziel-Handle spaeter oeffnen.
+bool FlutterVideoRenderer::EnsureCopyDevice() const {
+  using Microsoft::WRL::ComPtr;
+  if (copy_dev_) return true;
+  ComPtr<IDXGIFactory1> factory;
+  if (FAILED(CreateDXGIFactory1(
+          __uuidof(IDXGIFactory1),
+          reinterpret_cast<void**>(factory.GetAddressOf())))) {
+    diag_mode1_state_ = 3;
+    return false;
+  }
+  ComPtr<IDXGIAdapter1> nvidia;
+  for (UINT i = 0;; ++i) {
+    ComPtr<IDXGIAdapter1> a;
+    if (factory->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND) break;
+    DXGI_ADAPTER_DESC1 d{};
+    if (SUCCEEDED(a->GetDesc1(&d)) && d.VendorId == 0x10DE) {
+      nvidia = a;
+      break;
+    }
+  }
+  D3D_FEATURE_LEVEL fl;
+  HRESULT hr = D3D11CreateDevice(
+      nvidia.Get(), nvidia ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
+      nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &copy_dev_, &fl, &copy_ctx_);
+  if (FAILED(hr)) {
+    diag_mode1_state_ = 3;
+    copy_dev_.Reset();
+    copy_ctx_.Reset();
+    DiagLogA("MODE1 create_fail hr=0x%08lx", static_cast<unsigned long>(hr));
+    return false;
+  }
+  LUID copy_luid{}, def_luid{};
+  {
+    ComPtr<IDXGIDevice> dxdev;
+    ComPtr<IDXGIAdapter> ad;
+    DXGI_ADAPTER_DESC de{};
+    if (SUCCEEDED(copy_dev_.As(&dxdev)) &&
+        SUCCEEDED(dxdev->GetAdapter(&ad)) && SUCCEEDED(ad->GetDesc(&de)))
+      copy_luid = de.AdapterLuid;
+    ComPtr<IDXGIAdapter1> a0;
+    DXGI_ADAPTER_DESC1 d0{};
+    if (factory->EnumAdapters1(0, &a0) != DXGI_ERROR_NOT_FOUND &&
+        SUCCEEDED(a0->GetDesc1(&d0)))
+      def_luid = d0.AdapterLuid;
+  }
+  copy_adapter_ok_ = (copy_luid.LowPart == def_luid.LowPart &&
+                      copy_luid.HighPart == def_luid.HighPart);
+  diag_mode1_state_ = copy_adapter_ok_ ? 0 : 1;
+  DiagLogA("MODE1 copy_dev created nvidia=%d copy_luid=%08lx:%08lx "
+           "angle_luid=%08lx:%08lx adapter_ok=%d",
+           nvidia ? 1 : 0, static_cast<unsigned long>(copy_luid.HighPart),
+           copy_luid.LowPart, static_cast<unsigned long>(def_luid.HighPart),
+           def_luid.LowPart, copy_adapter_ok_ ? 1 : 0);
+  return true;
+}
+
+bool FlutterVideoRenderer::CopyNativeSameAdapter(void* handle, int w,
+                                                 int h) const {
+  using Microsoft::WRL::ComPtr;
+  if (!EnsureCopyDevice()) return false;
+  if (!copy_tex_ || copy_w_ != w || copy_h_ != h) {
+    copy_tex_.Reset();
+    copy_handle_ = nullptr;
+    D3D11_TEXTURE2D_DESC d = {};
+    d.Width = w; d.Height = h; d.MipLevels = 1; d.ArraySize = 1;
+    d.Format = DXGI_FORMAT_B8G8R8A8_UNORM; d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_DEFAULT;
+    d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    d.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+    if (FAILED(copy_dev_->CreateTexture2D(&d, nullptr, &copy_tex_))) {
+      diag_mode1_state_ = 3;
+      return false;
+    }
+    ComPtr<IDXGIResource> res;
+    if (FAILED(copy_tex_.As(&res)) ||
+        FAILED(res->GetSharedHandle(&copy_handle_)) || !copy_handle_) {
+      copy_tex_.Reset();
+      copy_handle_ = nullptr;
+      diag_mode1_state_ = 3;
+      return false;
+    }
+    copy_w_ = w;
+    copy_h_ = h;
+    copy_last_handle_ = nullptr;  // Ziel neu -> Quell-Open erzwingen
+  }
+  if (handle != copy_last_handle_ || !copy_src_tex_) {
+    copy_src_tex_.Reset();
+    if (FAILED(copy_dev_->OpenSharedResource(
+            reinterpret_cast<HANDLE>(handle), __uuidof(ID3D11Texture2D),
+            reinterpret_cast<void**>(copy_src_tex_.GetAddressOf())))) {
+      copy_last_handle_ = nullptr;
+      diag_mode1_state_ = 2;
+      DiagLogA("MODE1 open_fail");
+      return false;
+    }
+    copy_last_handle_ = handle;
+  }
+  copy_ctx_->CopyResource(copy_tex_.Get(), copy_src_tex_.Get());
+  copy_ctx_->Flush();
+  return true;
+}
+
+// DIAGNOSE-ONLY: den Handle, den ANGLE bekaeme, auf fb_dev_ (= ANGLEs Adapter)
+// oeffnen, per Staging nach CPU lesen -> diag_cpu_. Scheitert das Open, ist es das
+// ehrliche Adapter-Schwarz. NIE im Produktionspfad (nur alle ~2 s in MaybeDiagnose).
+bool FlutterVideoRenderer::ReadbackAngleView(void* handle, int w, int h) const {
+  using Microsoft::WRL::ComPtr;
+  if (!EnsureFallbackTexture(w, h)) return false;  // legt fb_dev_/fb_ctx_ an
+  ComPtr<ID3D11Texture2D> src;
+  if (FAILED(fb_dev_->OpenSharedResource(
+          reinterpret_cast<HANDLE>(handle), __uuidof(ID3D11Texture2D),
+          reinterpret_cast<void**>(src.GetAddressOf())))) {
+    DiagLogA("MODE%d angle_open_fail", diag_mode_);
+    return false;
+  }
+  if (!diag_staging_ || diag_w_ != w || diag_h_ != h) {
+    diag_staging_.Reset();
+    D3D11_TEXTURE2D_DESC d = {};
+    d.Width = w; d.Height = h; d.MipLevels = 1; d.ArraySize = 1;
+    d.Format = DXGI_FORMAT_B8G8R8A8_UNORM; d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_STAGING;
+    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (FAILED(fb_dev_->CreateTexture2D(&d, nullptr, &diag_staging_)))
+      return false;
+    diag_w_ = w;
+    diag_h_ = h;
+    diag_cpu_.reset(new uint8_t[static_cast<size_t>(w) * h * 4]);
+  }
+  fb_ctx_->CopyResource(diag_staging_.Get(), src.Get());
+  fb_ctx_->Flush();
+  D3D11_MAPPED_SUBRESOURCE ms{};
+  if (FAILED(fb_ctx_->Map(diag_staging_.Get(), 0, D3D11_MAP_READ, 0, &ms)))
+    return false;
+  const uint8_t* sp = static_cast<const uint8_t*>(ms.pData);
+  for (int y = 0; y < h; ++y)
+    std::memcpy(diag_cpu_.get() + static_cast<size_t>(y) * w * 4,
+                sp + static_cast<size_t>(y) * ms.RowPitch,
+                static_cast<size_t>(w) * 4);
+  fb_ctx_->Unmap(diag_staging_.Get(), 0);
+  return true;
+}
+
+// DIAGNOSE: alle ~2 s die Luminanz + den Nicht-Schwarz-Anteil des Bildes messen,
+// das ANGLE bekaeme, und einmalig je Modus ein BMP dumpen. Modus 2 nutzt fb_cpu_
+// direkt (gratis); Modus 0/1 lesen ueber ReadbackAngleView zurueck.
+void FlutterVideoRenderer::MaybeDiagnose(int w, int h, void* angle_handle,
+                                         bool have_cpu) const {
+  int64_t now = NowMs();
+  if (diag_lum_last_ == 0) diag_lum_last_ = now;
+  if (now - diag_lum_last_ < 2000) return;
+  diag_lum_last_ = now;
+  const uint8_t* px = nullptr;
+  if (have_cpu)
+    px = fb_cpu_.get();
+  else if (ReadbackAngleView(angle_handle, w, h))
+    px = diag_cpu_.get();
+  if (!px) {
+    diag_lum_ = 0.0;  // ehrliches Schwarz (Open/Readback fehlgeschlagen)
+    diag_nonblack_ = 0.0;
+    return;
+  }
+  SampleLuminance(px, w, h, &diag_lum_, &diag_nonblack_);
+  if (diag_mode_ >= 0 && diag_mode_ < 3 && !diag_dumped_[diag_mode_]) {
+    if (const char* base = std::getenv("LOCALAPPDATA")) {
+      char p[MAX_PATH];
+      std::snprintf(p, sizeof(p), "%s\\HoneyCord\\selfview_mode%d.bmp", base,
+                    diag_mode_);
+      DumpBmp(p, px, w, h);
+      diag_dumped_[diag_mode_] = true;
+    }
+  }
+}
+
 const FlutterDesktopGpuSurfaceDescriptor* FlutterVideoRenderer::ObtainGpuSurface(
     size_t width, size_t height) const {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -190,27 +472,42 @@ const FlutterDesktopGpuSurfaceDescriptor* FlutterVideoRenderer::ObtainGpuSurface
 
   void* handle = frame_->native_shared_handle();
   dbg_native_ = handle ? 1 : 0;
-  // Self-View (is_throttle_) mit nativem Handle: das Bild in die eigene ANGLE-
-  // Textur kopieren, statt den fremden Capturer-Handle direkt an ANGLE zu geben.
-  // Behebt den ~20-fps-Compositing-Engpass der Vorschau (gemessen 20->64 fps).
-  // Schlaegt die Kopie fehl, bleibt es beim bisherigen Direkt-Handle.
-  if (handle && is_throttle_ && CopyNativeToOwn(handle, w, h)) {
-    handle = fb_handle_;
+
+  // === Self-View-DIAGNOSE: 3 Modi mess-vergleichen, Auto-Wechsel ~15 s. Greift
+  // NUR fuer die Self-View (is_throttle_) mit nativem Handle; Remote/Sende-Pfad
+  // unberuehrt. Bildkorrektheit wird verifiziert (Luminanz + BMP), nicht nur fps
+  // (Lehre aus 2.6.7 = 63 fps SCHWARZ).
+  bool diag_have_cpu = false;        // Modus 2 -> fb_cpu_ direkt sampeln
+  void* diag_angle_handle = handle;  // was ANGLE letztlich bekaeme (Readback)
+  if (handle && is_throttle_) {
+    int64_t nowm = NowMs();
+    if (diag_mode_since_ == 0) diag_mode_since_ = nowm;
+    if (nowm - diag_mode_since_ >= kDiagDwellMs) {
+      diag_mode_ = (diag_mode_ + 1) % 3;
+      diag_mode_since_ = nowm;
+    }
+    switch (diag_mode_) {
+      case 0:  // Baseline: rotierender Capturer-Handle direkt an ANGLE (= heute)
+        break;
+      case 1:  // GPU-Zero-Copy auf dem NVIDIA-Adapter des Capturers
+        if (CopyNativeSameAdapter(handle, w, h)) {
+          handle = copy_handle_;
+          diag_angle_handle = copy_handle_;
+        }  // sonst: Direkt-Handle (Fallback), Zustand in render.log geloggt
+        break;
+      case 2:  // CPU-Weg (bewaehrter Remote-Pfad)
+        if (ConvertNativeCpu(w, h)) {
+          handle = fb_handle_;
+          diag_have_cpu = true;
+        }
+        break;
+    }
+    MaybeDiagnose(w, h, diag_angle_handle, diag_have_cpu);
   }
+
   if (!handle) {
-    // Nicht-nativer Frame (Kamera/Remote, I420): nach BGRA konvertieren und in
-    // die eigene Shared-Textur hochladen. Producer (Upload) + Consumer (ANGLE)
-    // laufen beide sequenziell auf dem Raster-Thread -> kein Keyed-Mutex noetig.
-    if (!EnsureFallbackTexture(w, h)) return nullptr;
-    auto _t_fb = std::chrono::steady_clock::now();
-    frame_->ConvertToARGB(RTCVideoFrame::Type::kBGRA, fb_cpu_.get(), 0, w, h);
-    fb_ctx_->UpdateSubresource(fb_tex_.Get(), 0, nullptr, fb_cpu_.get(),
-                               static_cast<UINT>(w) * 4, 0);
-    fb_ctx_->Flush();
-    dbg_fb_ms_ += std::chrono::duration<double, std::milli>(
-                      std::chrono::steady_clock::now() - _t_fb)
-                      .count();
-    dbg_fb_n_++;
+    // Nicht-nativer Frame (Kamera/Remote, I420) -> bewaehrter CPU-Fallback.
+    if (!ConvertNativeCpu(w, h)) return nullptr;
     handle = fb_handle_;
   }
 
@@ -229,7 +526,7 @@ const FlutterDesktopGpuSurfaceDescriptor* FlutterVideoRenderer::ObtainGpuSurface
       double fbavg = dbg_fb_n_ ? dbg_fb_ms_ / dbg_fb_n_ : 0.0;
       RenderLog(texture_id_, is_throttle_ ? 1 : 0, "COMPOSITE",
                 dbg_ob_calls_ * 1000.0 / (now - dbg_ob_last_ms_), w, h,
-                dbg_native_, fbavg, -1.0);
+                dbg_native_, fbavg, -1.0, diag_mode_, diag_lum_, diag_nonblack_);
       dbg_ob_calls_ = 0;
       dbg_ob_last_ms_ = now;
       dbg_fb_ms_ = 0.0;
@@ -251,7 +548,8 @@ void FlutterVideoRenderer::OnFrame(scoped_refptr<RTCVideoFrame> frame) {
       RenderLog(texture_id_, is_throttle_ ? 1 : 0, "ONFRAME",
                 dbg_of_calls_ * 1000.0 / (now - dbg_of_last_ms_),
                 frame->width(), frame->height(),
-                frame->native_shared_handle() ? 1 : 0, -1.0, markavg);
+                frame->native_shared_handle() ? 1 : 0, -1.0, markavg,
+                diag_mode_, diag_lum_, diag_nonblack_);
       dbg_of_calls_ = 0;
       dbg_of_last_ms_ = now;
       dbg_mark_ms_ = 0.0;
