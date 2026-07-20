@@ -87,6 +87,16 @@ class FlutterVideoRenderer
   mutable std::shared_ptr<uint8_t> fb_cpu_;
   bool EnsureFallbackTexture(int w, int h) const;
 
+  // Self-View-Compositing-Fix (2026-07-20, auf RTX2070 gemessen): den nativen
+  // Capturer-Shared-Handle (fremdes D3D-Geraet) NICHT direkt an ANGLE geben — das
+  // kostet pro Bild teures Interop (Vorschau haengt bei ~20 fps). Stattdessen das
+  // Bild per OpenSharedResource+CopyResource in fb_tex_ (ANGLEs Adapter) kopieren;
+  // ANGLE zeichnet die dann voll (gemessen 20->64 fps, ~0,2 ms Kopie, 0 CPU, keine
+  // Aufloesungssenkung). Handle wird gecacht (nur bei Wechsel neu geoeffnet).
+  mutable Microsoft::WRL::ComPtr<ID3D11Texture2D> own_src_tex_;
+  mutable void* own_last_handle_ = nullptr;
+  bool CopyNativeToOwn(void* handle, int w, int h) const;
+
   // Self-View-Drossel: die EIGENE Bildschirm-Selbstansicht zeigt den Schirm, den
   // man eh sieht -> auf ~25 fps drosseln, damit nicht jeder 60-fps-Frame ein
   // teures Flutter-Fenster-Composite (ANGLE) ausloest. Der Sende-Pfad (Encoder)

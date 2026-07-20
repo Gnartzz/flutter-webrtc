@@ -159,6 +159,27 @@ bool FlutterVideoRenderer::EnsureFallbackTexture(int w, int h) const {
   return true;
 }
 
+// Self-View-Fix: das per Handle referenzierte Capturer-Bild auf der GPU in
+// fb_tex_ (ANGLEs Adapter) kopieren, statt den fremden Handle direkt an ANGLE zu
+// geben. Handle gecacht (nur bei Wechsel neu oeffnen). Kein Keyed-Mutex -> in der
+// VORSCHAU minimales Tearing moeglich; der Sende-Pfad ist davon unberuehrt.
+bool FlutterVideoRenderer::CopyNativeToOwn(void* handle, int w, int h) const {
+  if (!EnsureFallbackTexture(w, h)) return false;
+  if (handle != own_last_handle_ || !own_src_tex_) {
+    own_src_tex_.Reset();
+    if (FAILED(fb_dev_->OpenSharedResource(
+            reinterpret_cast<HANDLE>(handle), __uuidof(ID3D11Texture2D),
+            reinterpret_cast<void**>(own_src_tex_.GetAddressOf())))) {
+      own_last_handle_ = nullptr;
+      return false;  // Open fehlgeschlagen -> Aufrufer nutzt den Direkt-Handle
+    }
+    own_last_handle_ = handle;
+  }
+  fb_ctx_->CopyResource(fb_tex_.Get(), own_src_tex_.Get());
+  fb_ctx_->Flush();
+  return true;
+}
+
 const FlutterDesktopGpuSurfaceDescriptor* FlutterVideoRenderer::ObtainGpuSurface(
     size_t width, size_t height) const {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -169,6 +190,13 @@ const FlutterDesktopGpuSurfaceDescriptor* FlutterVideoRenderer::ObtainGpuSurface
 
   void* handle = frame_->native_shared_handle();
   dbg_native_ = handle ? 1 : 0;
+  // Self-View (is_throttle_) mit nativem Handle: das Bild in die eigene ANGLE-
+  // Textur kopieren, statt den fremden Capturer-Handle direkt an ANGLE zu geben.
+  // Behebt den ~20-fps-Compositing-Engpass der Vorschau (gemessen 20->64 fps).
+  // Schlaegt die Kopie fehl, bleibt es beim bisherigen Direkt-Handle.
+  if (handle && is_throttle_ && CopyNativeToOwn(handle, w, h)) {
+    handle = fb_handle_;
+  }
   if (!handle) {
     // Nicht-nativer Frame (Kamera/Remote, I420): nach BGRA konvertieren und in
     // die eigene Shared-Textur hochladen. Producer (Upload) + Consumer (ANGLE)
