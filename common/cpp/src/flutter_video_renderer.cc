@@ -156,6 +156,16 @@ void DumpBmp(const char* path, const uint8_t* bgra, int w, int h) {
     std::fclose(f);
   }
 }
+
+// %LOCALAPPDATA%\HoneyCord\<leaf> zusammensetzen (getenv unter 4996-Schutz, damit
+// der Aufrufer nicht selbst suppressen muss). false, wenn LOCALAPPDATA fehlt.
+bool BuildLocalAppDataPath(const char* leaf, char* out, size_t n) {
+  if (const char* base = std::getenv("LOCALAPPDATA")) {
+    std::snprintf(out, n, "%s\\HoneyCord\\%s", base, leaf);
+    return true;
+  }
+  return false;
+}
 #pragma warning(pop)
 }  // namespace
 #endif
@@ -452,10 +462,10 @@ void FlutterVideoRenderer::MaybeDiagnose(int w, int h, void* angle_handle,
   }
   SampleLuminance(px, w, h, &diag_lum_, &diag_nonblack_);
   if (diag_mode_ >= 0 && diag_mode_ < 3 && !diag_dumped_[diag_mode_]) {
-    if (const char* base = std::getenv("LOCALAPPDATA")) {
-      char p[MAX_PATH];
-      std::snprintf(p, sizeof(p), "%s\\HoneyCord\\selfview_mode%d.bmp", base,
-                    diag_mode_);
+    char leaf[40];
+    std::snprintf(leaf, sizeof(leaf), "selfview_mode%d.bmp", diag_mode_);
+    char p[MAX_PATH];
+    if (BuildLocalAppDataPath(leaf, p, sizeof(p))) {
       DumpBmp(p, px, w, h);
       diag_dumped_[diag_mode_] = true;
     }
