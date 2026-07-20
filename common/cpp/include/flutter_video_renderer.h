@@ -87,6 +87,19 @@ class FlutterVideoRenderer
   mutable std::shared_ptr<uint8_t> fb_cpu_;
   bool EnsureFallbackTexture(int w, int h) const;
 
+  // ---- DIAGNOSE (Multi-Monitor-Self-View, 2026-07-20, temporaer) ------------
+  // Hypothese: der native Self-View gibt ANGLE den Capturer-Shared-Handle (fremdes
+  // D3D-Geraet) -> teures Interop pro Bild (~15 fps). Test: das Capturer-Bild per
+  // GPU in fb_tex_ (ANGLEs Adapter) kopieren -> sollte wie die Fallback-Textur
+  // 30 fps zeichnen. ObtainGpuSurface wechselt alle ~15 s Modus 0 (Baseline) /
+  // Modus 1 (GPU-Copy) und loggt COMPOSITE_BASE / COMPOSITE_COPY getrennt.
+  mutable Microsoft::WRL::ComPtr<ID3D11Texture2D> diag_src_tex_; // geoeffneter Capturer-Handle (gecacht)
+  mutable void* diag_last_handle_ = nullptr;
+  mutable double dbg_copy_ms_ = 0.0;   // Summe CopyResource-Zeit im 2s-Fenster
+  mutable unsigned dbg_copy_n_ = 0;
+  // Capturer-Handle nach fb_tex_ kopieren; true bei Erfolg (dann fb_handle_ nutzen).
+  bool DiagCopyNativeToOwn(void* handle, int w, int h) const;
+
   // Self-View-Drossel: die EIGENE Bildschirm-Selbstansicht zeigt den Schirm, den
   // man eh sieht -> auf ~25 fps drosseln, damit nicht jeder 60-fps-Frame ein
   // teures Flutter-Fenster-Composite (ANGLE) ausloest. Der Sende-Pfad (Encoder)

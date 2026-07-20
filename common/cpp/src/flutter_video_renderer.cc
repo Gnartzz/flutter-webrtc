@@ -159,6 +159,31 @@ bool FlutterVideoRenderer::EnsureFallbackTexture(int w, int h) const {
   return true;
 }
 
+// DIAGNOSE: das per Handle referenzierte Capturer-Bild auf der GPU in fb_tex_
+// (ANGLEs Adapter) kopieren, statt den fremden Handle direkt an ANGLE zu geben.
+// Handle wird gecacht (nur bei Wechsel neu geoeffnet). Kein Keyed-Mutex -> fuer
+// eine Vorschau-Messung akzeptabel (evtl. minimales Tearing).
+bool FlutterVideoRenderer::DiagCopyNativeToOwn(void* handle, int w, int h) const {
+  if (!EnsureFallbackTexture(w, h)) return false;  // legt fb_dev_/fb_tex_/fb_handle_ an
+  if (handle != diag_last_handle_ || !diag_src_tex_) {
+    diag_src_tex_.Reset();
+    if (FAILED(fb_dev_->OpenSharedResource(reinterpret_cast<HANDLE>(handle),
+                                           __uuidof(ID3D11Texture2D),
+                                           reinterpret_cast<void**>(diag_src_tex_.GetAddressOf())))) {
+      diag_last_handle_ = nullptr;
+      return false;  // Open fehlgeschlagen -> Aufrufer faellt auf Baseline zurueck
+    }
+    diag_last_handle_ = handle;
+  }
+  auto _t = std::chrono::steady_clock::now();
+  fb_ctx_->CopyResource(fb_tex_.Get(), diag_src_tex_.Get());
+  fb_ctx_->Flush();
+  dbg_copy_ms_ += std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - _t).count();
+  dbg_copy_n_++;
+  return true;
+}
+
 const FlutterDesktopGpuSurfaceDescriptor* FlutterVideoRenderer::ObtainGpuSurface(
     size_t width, size_t height) const {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -169,6 +194,17 @@ const FlutterDesktopGpuSurfaceDescriptor* FlutterVideoRenderer::ObtainGpuSurface
 
   void* handle = frame_->native_shared_handle();
   dbg_native_ = handle ? 1 : 0;
+  // DIAGNOSE-Modus: alle ~15 s zwischen Baseline (0) und GPU-Copy (1) wechseln.
+  // NUR fuer die gedrosselte eigene Self-View (is_throttle_) mit nativem Handle.
+  int diag_mode = 0;
+  if (handle && is_throttle_) {
+    diag_mode = static_cast<int>((NowMs() / 15000) % 2);
+    if (diag_mode == 1 && DiagCopyNativeToOwn(handle, w, h)) {
+      handle = fb_handle_;  // ANGLE bekommt die plugin-eigene Textur
+    } else {
+      diag_mode = 0;        // Copy nicht moeglich -> als Baseline werten
+    }
+  }
   if (!handle) {
     // Nicht-nativer Frame (Kamera/Remote, I420): nach BGRA konvertieren und in
     // die eigene Shared-Textur hochladen. Producer (Upload) + Consumer (ANGLE)
@@ -198,14 +234,20 @@ const FlutterDesktopGpuSurfaceDescriptor* FlutterVideoRenderer::ObtainGpuSurface
     if (dbg_ob_last_ms_ == 0) dbg_ob_last_ms_ = now;
     dbg_ob_calls_++;
     if (now - dbg_ob_last_ms_ >= 2000) {
+      // DIAGNOSE: getrennter Marker je Modus; im mark-Feld die CopyResource-
+      // Kosten (ms/Bild) fuer Modus 1, sonst die Fallback-Konvertierkosten.
       double fbavg = dbg_fb_n_ ? dbg_fb_ms_ / dbg_fb_n_ : 0.0;
-      RenderLog(texture_id_, is_throttle_ ? 1 : 0, "COMPOSITE",
+      double copyavg = dbg_copy_n_ ? dbg_copy_ms_ / dbg_copy_n_ : 0.0;
+      const char* what = (diag_mode == 1) ? "COMPOSITE_COPY" : "COMPOSITE_BASE";
+      RenderLog(texture_id_, is_throttle_ ? 1 : 0, what,
                 dbg_ob_calls_ * 1000.0 / (now - dbg_ob_last_ms_), w, h,
-                dbg_native_, fbavg, -1.0);
+                dbg_native_, fbavg, copyavg);
       dbg_ob_calls_ = 0;
       dbg_ob_last_ms_ = now;
       dbg_fb_ms_ = 0.0;
       dbg_fb_n_ = 0;
+      dbg_copy_ms_ = 0.0;
+      dbg_copy_n_ = 0;
     }
   }
   return &gpu_descriptor_;
