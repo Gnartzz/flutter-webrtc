@@ -134,22 +134,26 @@ class FlutterVideoRenderer
   bool UploadFrameCpuToFallback(int w, int h) const;  // kARGB (korrekte Farben)
 
 #ifdef HONEYCORD_SELFVIEW_PROBE
-  // Probe-Bau (nur Diagnose, CMake-Define): 4 Phasen je 20 s, 0->3->1->2.
+  // Probe #2 (Re-Bind-Drossel, 2026-07-21): NUR der bewaehrte Mode-0-Import
+  // (frisches eglBindTexImage pro Handle-WECHSEL) — schwarz ist damit
+  // konstruktionsbedingt unmoeglich. Gemessen wird, wie stark seltenere
+  // Re-Binds den Fenster-Compositor entlasten. 3 Phasen je 20 s:
+  //   Q0 Baseline (jeder neue Frame = neuer Handle = Re-Bind, wie heute)
+  //   Q1 HOLD 66 ms (Handle festhalten -> <=15 Re-Binds/s, Vorschau ~15 fps)
+  //   Q2 AGED+HOLD 40 ms (2.-neuesten Handle binden -> Import wartet nicht
+  //      auf frisch geschriebene Slots; <=25 Re-Binds/s, Vorschau ~25 fps)
+  // Im COMPOSITE-Log: phase=Qx, lum-Spalte = Re-Binds im 2-s-Fenster.
   static constexpr int64_t kProbeDwellMs = 20000;
   mutable int64_t probe_start_ms_ = 0;
   mutable int probe_phase_ = 0;
-  mutable void* probe_p3_last_handle_ = nullptr;
-  mutable int64_t probe_lum_last_ms_ = 0;
-  mutable double probe_lum_ = -1.0, probe_nonblack_ = -1.0;
-  mutable bool probe_dumped_[4] = {};
-  mutable Microsoft::WRL::ComPtr<ID3D11Texture2D> probe_staging_;  // ANGLE-Dev!
-  mutable int probe_stg_w_ = 0, probe_stg_h_ = 0;
-  mutable std::unique_ptr<uint8_t[]> probe_cpu_;
-  mutable size_t probe_cpu_size_ = 0;
-  mutable int64_t probe_p2_last_ms_ = 0;
-  bool ProbeFillP2Pattern(int w, int h) const;
-  bool ProbeReadbackAngle(ID3D11Texture2D* tex, int w, int h) const;
-  void ProbeMaybeSample(int phase, int w, int h, void* ring_handle) const;
+  struct HandleAge {
+    void* handle = nullptr;
+    int64_t ms = 0;
+  };
+  mutable HandleAge probe_hist_[3];      // neuester zuerst
+  mutable void* probe_held_ = nullptr;   // aktuell an ANGLE gegebener Handle
+  mutable int64_t probe_held_since_ = 0;
+  mutable unsigned probe_rebinds_win_ = 0;  // Re-Binds im 2-s-Logfenster
 #endif
 
   // Self-View-Drossel: die EIGENE Bildschirm-Selbstansicht zeigt den Schirm, den

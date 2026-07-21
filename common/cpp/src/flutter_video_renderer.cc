@@ -94,80 +94,6 @@ void DiagLogA(const char* fmt, ...) {
   }
 }
 
-// %LOCALAPPDATA%\HoneyCord\<leaf> zusammensetzen (getenv unter 4996-Schutz).
-bool BuildLocalAppDataPath(const char* leaf, char* out, size_t n) {
-  if (const char* base = std::getenv("LOCALAPPDATA")) {
-    std::snprintf(out, n, "%s\\HoneyCord\\%s", base, leaf);
-    return true;
-  }
-  return false;
-}
-
-#ifdef HONEYCORD_SELFVIEW_PROBE
-// Kleines Grid abtasten -> Durchschnitts-Luminanz (0..255) + Nicht-Schwarz-
-// Anteil (%). O(4096) unabhaengig von der Aufloesung. BGRA-Byte-Order.
-void SampleLuminance(const uint8_t* bgra, int w, int h, double* lum,
-                     double* nonblack) {
-  const int N = 64;
-  double sum = 0.0;
-  int nb = 0, cnt = 0;
-  for (int gy = 0; gy < N; ++gy) {
-    int y = (h * gy) / N;
-    if (y >= h) y = h - 1;
-    for (int gx = 0; gx < N; ++gx) {
-      int x = (w * gx) / N;
-      if (x >= w) x = w - 1;
-      const uint8_t* p = bgra + (static_cast<size_t>(y) * w + x) * 4;
-      double L = 0.114 * p[0] + 0.587 * p[1] + 0.299 * p[2];
-      sum += L;
-      if (L > 8.0) ++nb;
-      ++cnt;
-    }
-  }
-  *lum = cnt ? sum / cnt : 0.0;
-  *nonblack = cnt ? 100.0 * nb / cnt : 0.0;
-}
-
-// 32-bit top-down BI_RGB BMP (DXGI-BGRA == BMP-Byte-Order -> memcpy).
-void DumpBmp(const char* path, const uint8_t* bgra, int w, int h) {
-#pragma pack(push, 1)
-  struct FileHdr {
-    uint16_t bfType;
-    uint32_t bfSize;
-    uint16_t r1, r2;
-    uint32_t bfOffBits;
-  } fh;
-  struct InfoHdr {
-    uint32_t biSize;
-    int32_t biW, biH;
-    uint16_t biPlanes, biBpp;
-    uint32_t biComp, biImg;
-    int32_t biX, biY;
-    uint32_t biClr, biImp;
-  } ih;
-#pragma pack(pop)
-  const uint32_t data = static_cast<uint32_t>(w) * static_cast<uint32_t>(h) * 4u;
-  fh.bfType = 0x4D42;  // 'BM'
-  fh.bfSize = 54u + data;
-  fh.r1 = fh.r2 = 0;
-  fh.bfOffBits = 54u;
-  ih.biSize = 40u;
-  ih.biW = w;
-  ih.biH = -h;  // top-down
-  ih.biPlanes = 1;
-  ih.biBpp = 32;
-  ih.biComp = 0;  // BI_RGB
-  ih.biImg = data;
-  ih.biX = ih.biY = 0;
-  ih.biClr = ih.biImp = 0;
-  if (FILE* f = std::fopen(path, "wb")) {
-    std::fwrite(&fh, 1, 14, f);
-    std::fwrite(&ih, 1, 40, f);
-    std::fwrite(bgra, 1, data, f);
-    std::fclose(f);
-  }
-}
-#endif  // HONEYCORD_SELFVIEW_PROBE
 #pragma warning(pop)
 
 // ===== EGL/ANGLE-Bootstrap =====
@@ -504,134 +430,6 @@ bool FlutterVideoRenderer::CopySelfViewAngleDevice(int w, int h,
   return true;
 }
 
-#ifdef HONEYCORD_SELFVIEW_PROBE
-// P2: animierte Farbbalken per CPU-Write auf ANGLEs Geraet (max 10 Hz).
-// Isoliert "Same-Device-Write sichtbar?" von "Ring-Import lesbar?".
-bool FlutterVideoRenderer::ProbeFillP2Pattern(int w, int h) const {
-  int64_t now = NowMs();
-  if (probe_p2_last_ms_ && now - probe_p2_last_ms_ < 100)
-    return true;  // Muster steht schon
-  probe_p2_last_ms_ = now;
-  size_t need = static_cast<size_t>(w) * h * 4;
-  if (!probe_cpu_ || probe_cpu_size_ < need) {
-    probe_cpu_.reset(new uint8_t[need]);
-    probe_cpu_size_ = need;
-  }
-  static const uint8_t pal[8][4] = {  // B,G,R,A
-      {255, 255, 255, 255}, {0, 255, 255, 255}, {255, 255, 0, 255},
-      {0, 255, 0, 255},     {255, 0, 255, 255}, {0, 0, 255, 255},
-      {255, 0, 0, 255},     {0, 0, 0, 255}};
-  int shift = static_cast<int>((now / 250) % 8);
-  for (int y = 0; y < h; ++y) {
-    uint8_t* row = probe_cpu_.get() + static_cast<size_t>(y) * w * 4;
-    for (int x = 0; x < w; ++x) {
-      const uint8_t* c = pal[((x * 8 / (w > 0 ? w : 1)) + shift) % 8];
-      std::memcpy(row + static_cast<size_t>(x) * 4, c, 4);
-    }
-  }
-  angle_ctx_->UpdateSubresource(angle_dest_tex_.Get(), 0, nullptr,
-                                probe_cpu_.get(), static_cast<UINT>(w) * 4, 0);
-  angle_ctx_->Flush();
-  return true;
-}
-
-// Same-Device-Readback (ANGLEs Geraet) -> probe_cpu_. Vertrauenswuerdig, weil
-// DASSELBE Geraet liest, das auch sampelt (Lehre aus der Proxy-Falle: der
-// fb_dev_-Readback log gestern falsch-positiv). Nur im 2-s-Gate aufrufen.
-bool FlutterVideoRenderer::ProbeReadbackAngle(ID3D11Texture2D* tex, int w,
-                                              int h) const {
-  if (!tex) return false;
-  if (!probe_staging_ || probe_stg_w_ != w || probe_stg_h_ != h) {
-    probe_staging_.Reset();
-    D3D11_TEXTURE2D_DESC d = {};
-    d.Width = w;
-    d.Height = h;
-    d.MipLevels = 1;
-    d.ArraySize = 1;
-    d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    d.SampleDesc.Count = 1;
-    d.Usage = D3D11_USAGE_STAGING;
-    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    if (FAILED(angle_dev_->CreateTexture2D(&d, nullptr, &probe_staging_)))
-      return false;
-    probe_stg_w_ = w;
-    probe_stg_h_ = h;
-  }
-  size_t need = static_cast<size_t>(w) * h * 4;
-  if (!probe_cpu_ || probe_cpu_size_ < need) {
-    probe_cpu_.reset(new uint8_t[need]);
-    probe_cpu_size_ = need;
-  }
-  D3D11_TEXTURE2D_DESC sd{};
-  tex->GetDesc(&sd);
-  if (sd.Width == static_cast<UINT>(w) && sd.Height == static_cast<UINT>(h)) {
-    angle_ctx_->CopyResource(probe_staging_.Get(), tex);
-  } else {
-    D3D11_BOX box{0, 0, 0,
-                  sd.Width < static_cast<UINT>(w) ? sd.Width
-                                                  : static_cast<UINT>(w),
-                  sd.Height < static_cast<UINT>(h) ? sd.Height
-                                                   : static_cast<UINT>(h),
-                  1};
-    angle_ctx_->CopySubresourceRegion(probe_staging_.Get(), 0, 0, 0, 0, tex, 0,
-                                      &box);
-  }
-  angle_ctx_->Flush();
-  D3D11_MAPPED_SUBRESOURCE ms{};
-  if (FAILED(angle_ctx_->Map(probe_staging_.Get(), 0, D3D11_MAP_READ, 0, &ms)))
-    return false;
-  const uint8_t* sp = static_cast<const uint8_t*>(ms.pData);
-  for (int y = 0; y < h; ++y)
-    std::memcpy(probe_cpu_.get() + static_cast<size_t>(y) * w * 4,
-                sp + static_cast<size_t>(y) * ms.RowPitch,
-                static_cast<size_t>(w) * 4);
-  angle_ctx_->Unmap(probe_staging_.Get(), 0);
-  return true;
-}
-
-// Alle ~2 s: Luminanz + Nicht-Schwarz-Anteil des Bildes messen, das ANGLE
-// bekaeme, + einmalig je Phase ein BMP. lum=-2 = Sentinel "kein ANGLE-Geraet".
-void FlutterVideoRenderer::ProbeMaybeSample(int phase, int w, int h,
-                                            void* ring_handle) const {
-  int64_t now = NowMs();
-  if (probe_lum_last_ms_ == 0) probe_lum_last_ms_ = now;
-  if (now - probe_lum_last_ms_ < 2000) return;
-  probe_lum_last_ms_ = now;
-  const uint8_t* px = nullptr;
-  if (phase == 3) {
-    px = fb_cpu_.get();
-  } else if (phase == 1 || phase == 2) {
-    if (angle_dest_tex_ && ProbeReadbackAngle(angle_dest_tex_.Get(), w, h))
-      px = probe_cpu_.get();
-  } else {  // P0: Kernfrage schon in der Baseline beantworten — ist der Ring
-            // auf ANGLEs Geraet lesbar?
-    if (EnsureAngleDevice() && ring_handle) {
-      ID3D11Texture2D* src = AngleOpenSrc(ring_handle);
-      if (src && ProbeReadbackAngle(src, w, h)) px = probe_cpu_.get();
-    } else {
-      probe_lum_ = -2.0;
-      probe_nonblack_ = -2.0;
-      return;
-    }
-  }
-  if (!px) {
-    probe_lum_ = 0.0;  // ehrliches Schwarz (Open/Readback fehlgeschlagen)
-    probe_nonblack_ = 0.0;
-    return;
-  }
-  SampleLuminance(px, w, h, &probe_lum_, &probe_nonblack_);
-  if (phase >= 0 && phase < 4 && !probe_dumped_[phase]) {
-    char leaf[32];
-    std::snprintf(leaf, sizeof(leaf), "selfview_p%d.bmp", phase);
-    char p[MAX_PATH];
-    if (BuildLocalAppDataPath(leaf, p, sizeof(p))) {
-      DumpBmp(p, px, w, h);
-      probe_dumped_[phase] = true;
-    }
-  }
-}
-#endif  // HONEYCORD_SELFVIEW_PROBE
-
 const FlutterDesktopGpuSurfaceDescriptor* FlutterVideoRenderer::ObtainGpuSurface(
     size_t width, size_t height) const {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -644,43 +442,57 @@ const FlutterDesktopGpuSurfaceDescriptor* FlutterVideoRenderer::ObtainGpuSurface
   dbg_native_ = handle ? 1 : 0;
   if (handle && is_throttle_) {
 #ifdef HONEYCORD_SELFVIEW_PROBE
-    // === SELF-VIEW-PROBE: 4 Phasen je 20 s per Wanduhr, Endloszyklus 0->3->1->2.
-    // NUR Self-View (is_throttle_ + nativ); Remote/Sende-Pfad unberuehrt.
-    // Bildwahrheit via Same-Device-Luminanz + BMP je Phase (render.log).
+    // === PROBE #2 (Re-Bind-Drossel): 3 Phasen je 20 s, Endloszyklus 0->1->2.
+    // ALLE Phasen nutzen ausschliesslich den bewaehrten Mode-0-Import
+    // (frisches eglBindTexImage pro Handle-WECHSEL) -> schwarz ist
+    // konstruktionsbedingt unmoeglich; nur die Wechsel-RATE variiert.
+    // Gemessen wird die Compositor-Entlastung (COMPOSITE-fps; lum-Spalte =
+    // Re-Binds im 2-s-Fenster). Erkenntnis-Hintergrund: einmal gebundene
+    // Texturen werden durch KEINE Cross-Device-Aenderung aktualisiert
+    // (Gate-B-Schwarz + Capturer-Beige-Freeze 832b8f2) -> nur die Import-
+    // Frequenz ist verhandelbar, nicht der Mechanismus.
     const int64_t nowm = NowMs();
     if (!probe_start_ms_) probe_start_ms_ = nowm;
-    static constexpr int kSeq[4] = {0, 3, 1, 2};
     const int phase =
-        kSeq[((nowm - probe_start_ms_) / kProbeDwellMs) % 4];
+        static_cast<int>(((nowm - probe_start_ms_) / kProbeDwellMs) % 3);
     if (phase != probe_phase_) {
-      DiagLogA("[probe] phase %d -> %d (t=%llds)", probe_phase_, phase,
+      DiagLogA("[probe2] phase %d -> %d (t=%llds)", probe_phase_, phase,
                static_cast<long long>((nowm - probe_start_ms_) / 1000));
       probe_phase_ = phase;
-      probe_p3_last_handle_ = nullptr;  // P3-Neustart: sofort konvertieren
-      angle_copied_handle_ = nullptr;   // P1-Neustart: sofort kopieren
+      probe_held_ = nullptr;  // Phasenstart: sofort frisch binden
+    }
+    // Handle-Historie (neuester zuerst) pflegen — fuer den AGED-Pick.
+    if (handle != probe_hist_[0].handle) {
+      probe_hist_[2] = probe_hist_[1];
+      probe_hist_[1] = probe_hist_[0];
+      probe_hist_[0] = {handle, nowm};
     }
     switch (phase) {
-      case 0:  // Baseline: rotierender Ring-Handle direkt (heutiges Verhalten)
+      case 0:  // Baseline: jeder neue Frame = neuer Handle = Re-Bind (heute)
+        probe_rebinds_win_++;  // obere Schranke (zaehlt Composites mit
+                               // potenziellem Bind; Baseline-Vergleichswert)
         break;
-      case 3:  // CPU-Weg, kARGB (bewiesen sichtbarer Mechanismus + Farb-Check)
-        if (handle != probe_p3_last_handle_ && UploadFrameCpuToFallback(w, h))
-          probe_p3_last_handle_ = handle;
-        if (probe_p3_last_handle_ && fb_handle_) handle = fb_handle_;
+      case 1:  // HOLD 66 ms: Handle festhalten -> <=15 Re-Binds/s
+        if (!probe_held_ || nowm - probe_held_since_ >= 66) {
+          probe_held_ = handle;
+          probe_held_since_ = nowm;
+          probe_rebinds_win_++;
+        }
+        handle = probe_held_;
         break;
-      case 1:  // ANGLE-Geraet-Zero-Copy (Produktionskandidat)
-        if (CopySelfViewAngleDevice(w, h, handle))
-          handle = angle_dest_handle_;
-        break;  // sonst Direkt-Handle; Fehlerklasse steht in render.log
-      case 2:  // Synthese: animierte Farbbalken -> angle_dest_tex_
-        if (EnsureAngleDevice() && EnsureAngleDest(w, h) &&
-            ProbeFillP2Pattern(w, h))
-          handle = angle_dest_handle_;
+      case 2:  // AGED+HOLD 40 ms: 2.-neuesten Handle binden (Import wartet
+               // nicht auf den frisch beschriebenen Slot) -> <=25 Re-Binds/s
+        if (!probe_held_ || nowm - probe_held_since_ >= 40) {
+          probe_held_ =
+              probe_hist_[1].handle ? probe_hist_[1].handle : handle;
+          probe_held_since_ = nowm;
+          probe_rebinds_win_++;
+        }
+        handle = probe_held_;
         break;
     }
-    ProbeMaybeSample(phase, w, h, frame_->native_shared_handle());
 #else
-    // Produktion: Self-View-Zero-Copy auf ANGLEs eigenem Geraet (Bind-once
-    // statt Re-Bind pro Frame). Jeder Fehler -> Direkt-Handle (sichtbar).
+    // Produktion (nach Probe #2 festzuziehen): Re-Bind-Drossel.
     if (CopySelfViewAngleDevice(w, h, handle)) handle = angle_dest_handle_;
 #endif
   }
@@ -705,10 +517,12 @@ const FlutterDesktopGpuSurfaceDescriptor* FlutterVideoRenderer::ObtainGpuSurface
     if (now - dbg_ob_last_ms_ >= 2000) {
       double fbavg = dbg_fb_n_ ? dbg_fb_ms_ / dbg_fb_n_ : 0.0;
 #ifdef HONEYCORD_SELFVIEW_PROBE
+      // lum-Spalte = Re-Binds im 2-s-Fenster (Probe #2), nonblack ungenutzt.
       RenderLog(texture_id_, is_throttle_ ? 1 : 0, "COMPOSITE",
                 dbg_ob_calls_ * 1000.0 / (now - dbg_ob_last_ms_), w, h,
-                dbg_native_, fbavg, -1.0, probe_phase_, probe_lum_,
-                probe_nonblack_);
+                dbg_native_, fbavg, -1.0, probe_phase_,
+                static_cast<double>(probe_rebinds_win_), -1.0);
+      probe_rebinds_win_ = 0;
 #else
       RenderLog(texture_id_, is_throttle_ ? 1 : 0, "COMPOSITE",
                 dbg_ob_calls_ * 1000.0 / (now - dbg_ob_last_ms_), w, h,
