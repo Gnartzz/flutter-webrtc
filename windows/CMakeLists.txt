@@ -15,6 +15,9 @@ set(PLUGIN_NAME "flutter_webrtc_plugin")
 
 add_definitions(-DLIB_WEBRTC_API_DLL)
 add_definitions(-DRTC_DESKTOP_DEVICE)
+# NUR auf dem Probe-Branch: Self-View-Diagnose (4 Phasen, Luminanz+BMP).
+# Produktions-Commits tragen dieses Define NICHT.
+add_definitions(-DHONEYCORD_SELFVIEW_PROBE)
 
 add_library(${PLUGIN_NAME} SHARED
   "../common/cpp/src/flutter_common.cc"
