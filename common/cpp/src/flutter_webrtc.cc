@@ -525,6 +525,7 @@ void FlutterWebRTC::HandleMethodCall(
     // Renderer registriert eine GpuSurfaceTexture statt PixelBuffer.
     bool use_gpu_surface = false;
     bool throttle = false;
+    int throttle_ms = 40;  // Default Sparsam (~20 fps), s. User-Schalter
     if (method_call.arguments()) {
       const EncodableMap params =
           GetValue<EncodableMap>(*method_call.arguments());
@@ -537,8 +538,18 @@ void FlutterWebRTC::HandleMethodCall(
       if (it_t != params.end() && std::holds_alternative<bool>(it_t->second)) {
         throttle = std::get<bool>(it_t->second);
       }
+      // Drossel-Intervall in ms (User-Schalter Vorschau-Fluessigkeit): 40/25/0.
+      // Flutters Codec liefert kleine Ints als int32, groessere als int64 -> beide.
+      auto it_m = params.find(EncodableValue("gpuSurfaceThrottleMs"));
+      if (it_m != params.end()) {
+        if (std::holds_alternative<int32_t>(it_m->second))
+          throttle_ms = std::get<int32_t>(it_m->second);
+        else if (std::holds_alternative<int64_t>(it_m->second))
+          throttle_ms = static_cast<int>(std::get<int64_t>(it_m->second));
+      }
     }
-    CreateVideoRendererTexture(use_gpu_surface, throttle, std::move(result));
+    CreateVideoRendererTexture(use_gpu_surface, throttle, throttle_ms,
+                               std::move(result));
   } else if (method_call.method_name().compare("videoRendererDispose") == 0) {
     if (!method_call.arguments()) {
       result->Error("Bad Arguments", "Null constraints arguments received");

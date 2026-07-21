@@ -54,6 +54,10 @@ class FlutterVideoRenderer
       size_t width, size_t height) const;
   void set_gpu_surface(bool v) { is_gpu_surface_ = v; }
   void set_throttle(bool v) { is_throttle_ = v; }
+  // Drossel-Intervall der Self-View in ms (0 = ungedrosselt). User-Schalter
+  // „Vorschau-Flüssigkeit": 40 = Sparsam (~20 fps), 25 = Normal (~30 fps),
+  // 0 = Flüssig (volle fps, mehr GPU-/Compositor-Last).
+  void set_throttle_ms(int ms) { throttle_ms_ = ms; }
 #endif
 
  private:
@@ -95,6 +99,7 @@ class FlutterVideoRenderer
   bool is_gpu_surface_ = false;
   bool is_throttle_ = false;
   int64_t last_mark_ms_ = 0;
+  int throttle_ms_ = 40;  // Self-View-Drossel-Intervall (0 = aus), s. set_throttle_ms
   // Diagnose (2026-07-02): echte Render-fps messen. COMPOSITE = wie oft Flutter die
   // Kachel wirklich zeichnet (ObtainGpuSurface/s); ONFRAME = wie oft ein Frame an
   // den Sink geliefert wird. Selbst-Ansicht (throttled) sagt: schafft der Composite
@@ -123,6 +128,7 @@ class FlutterVideoRendererManager {
   FlutterVideoRendererManager(FlutterWebRTCBase* base);
 
   void CreateVideoRendererTexture(bool use_gpu_surface, bool throttle,
+                                  int throttle_ms,
                                   std::unique_ptr<MethodResultProxy> result);
 
   void VideoRendererSetSrcObject(int64_t texture_id,

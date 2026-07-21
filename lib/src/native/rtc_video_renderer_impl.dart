@@ -31,6 +31,12 @@ class RTCVideoRenderer extends ValueNotifier<RTCVideoValue>
   /// drosseln (false lassen) -> sie sollen mit voller Sender-FPS laufen.
   bool gpuSurfaceThrottle = false;
 
+  /// honeycord: Drossel-Intervall der Self-View in ms (nur mit gpuSurfaceThrottle).
+  /// User-Schalter „Vorschau-Fluessigkeit": 40 = Sparsam (~20 fps, Default),
+  /// 25 = Normal (~30 fps), 0 = Fluessig (ungedrosselt, mehr GPU-Last). VOR
+  /// initialize() setzen.
+  int gpuSurfaceThrottleMs = 40;
+
   @override
   Future<void> initialize() async {
     if (_initializing != null) {
@@ -38,8 +44,11 @@ class RTCVideoRenderer extends ValueNotifier<RTCVideoValue>
       return;
     }
     _initializing = Completer();
-    final response = await WebRTC.invokeMethod('createVideoRenderer',
-        {'gpuSurface': gpuSurface, 'gpuSurfaceThrottle': gpuSurfaceThrottle});
+    final response = await WebRTC.invokeMethod('createVideoRenderer', {
+      'gpuSurface': gpuSurface,
+      'gpuSurfaceThrottle': gpuSurfaceThrottle,
+      'gpuSurfaceThrottleMs': gpuSurfaceThrottleMs,
+    });
     _textureId = response['textureId'];
     _eventSubscription = EventChannel('FlutterWebRTC/Texture$textureId')
         .receiveBroadcastStream()

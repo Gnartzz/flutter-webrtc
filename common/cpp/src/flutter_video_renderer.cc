@@ -265,17 +265,18 @@ void FlutterVideoRenderer::OnFrame(scoped_refptr<RTCVideoFrame> frame) {
   frame_ = frame;
   mutex_.unlock();
 #ifdef _WINDOWS
-  // Self-View-Drossel auf ~25 fps (40 ms): jeder MarkTextureFrameAvailable
-  // triggert ein Flutter-Fenster-Composite (ANGLE, teuer bei grossen Fenstern).
-  // NUR fuer die eigene Bildschirm-Selbstansicht (is_throttle_); Remote-Kacheln
-  // nutzen denselben GpuSurface-Pfad, sollen aber mit voller FPS laufen ->
-  // nicht drosseln. frame_ ist bereits aktualisiert -> der naechste Mark zeigt
-  // das neueste Bild (max. 40 ms Verzug, unmerklich). Sende-Pfad unberuehrt.
-  if (is_gpu_surface_ && is_throttle_) {
+  // Self-View-Drossel: jeder MarkTextureFrameAvailable triggert ein Flutter-
+  // Fenster-Composite (ANGLE, teuer bei grossen Fenstern). NUR fuer die eigene
+  // Bildschirm-Selbstansicht (is_throttle_); Remote-Kacheln laufen mit voller
+  // FPS. Intervall per User-Schalter „Vorschau-Fluessigkeit" (throttle_ms_):
+  // 40 = Sparsam (~20 fps), 25 = Normal (~30 fps), 0 = Fluessig (ungedrosselt,
+  // mehr GPU/Compositor-Last). frame_ ist bereits aktualisiert -> der naechste
+  // Mark zeigt das neueste Bild. Sende-Pfad unberuehrt.
+  if (is_gpu_surface_ && is_throttle_ && throttle_ms_ > 0) {
     int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
                       std::chrono::steady_clock::now().time_since_epoch())
                       .count();
-    if (now - last_mark_ms_ < 40) return;
+    if (now - last_mark_ms_ < throttle_ms_) return;
     last_mark_ms_ = now;
   }
   auto _t_mark = std::chrono::steady_clock::now();
@@ -320,7 +321,7 @@ FlutterVideoRendererManager::FlutterVideoRendererManager(
     : base_(base) {}
 
 void FlutterVideoRendererManager::CreateVideoRendererTexture(
-    bool use_gpu_surface, bool throttle,
+    bool use_gpu_surface, bool throttle, int throttle_ms,
     std::unique_ptr<MethodResultProxy> result) {
   auto texture = new RefCountedObject<FlutterVideoRenderer>();
   // Default: PixelBuffer (Kamera/Remote) -- bewaehrt, fasst nichts an. NUR wenn
@@ -333,6 +334,7 @@ void FlutterVideoRendererManager::CreateVideoRendererTexture(
   if (use_gpu_surface) {
     texture->set_gpu_surface(true);
     texture->set_throttle(throttle);  // nur Self-View drosselt (OnFrame)
+    texture->set_throttle_ms(throttle_ms);  // Intervall (0=aus, s. User-Schalter)
     textureVariant = std::make_unique<flutter::TextureVariant>(
         flutter::GpuSurfaceTexture(
             kFlutterDesktopGpuSurfaceTypeDxgiSharedHandle,
