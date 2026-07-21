@@ -2,6 +2,7 @@
 
 #ifdef _WINDOWS
 #include <chrono>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -71,6 +72,21 @@ void RenderLog(int64_t tex, int throttled, const char* what, double fps, int w, 
                    "fbconv=%.2f ms mark=%.1f ms\n",
                    static_cast<long long>(tex), throttled, what, fps, w, h, native,
                    fb_ms, mark_ms);
+      std::fclose(f);
+    }
+  }
+}
+
+// Freie Textzeile nach render.log (einmalige Selfview-Fallback-Diagnose).
+void DiagLogA(const char* fmt, ...) {
+  if (const char* base = std::getenv("LOCALAPPDATA")) {
+    std::string path = std::string(base) + "\\HoneyCord\\render.log";
+    if (FILE* f = std::fopen(path.c_str(), "a")) {
+      va_list ap;
+      va_start(ap, fmt);
+      std::vfprintf(f, fmt, ap);
+      va_end(ap);
+      std::fputc('\n', f);
       std::fclose(f);
     }
   }
@@ -165,57 +181,23 @@ bool FlutterVideoRenderer::EnsureFallbackTexture(int w, int h) const {
   return true;
 }
 
-// Self-View-Vorschau: das per (rotierendem) Capturer-Handle referenzierte Bild ROH
-// (BGRA, KEINE Farbkonvertierung -> kein R/B-Swap) per Readback auf fb_dev_
-// (Default = ANGLE-Adapter) nach fb_cpu_ holen und per UpdateSubresource in fb_tex_
-// schreiben; ANGLE bekommt deren STATISCHEN Handle. Der CPU-Write ist der EINZIGE
-// Weg, den ANGLE bei statischem Handle wirklich neu abtastet (identisch zum
-// bewaehrten Remote-Pfad) -> Bind-once, Compositor ~72 statt ~20 fps. Ein
-// GPU-CopyResource in eine fremd-beschriebene Textur friert bei ANGLE ein (schwarz
-// -> das war 2.6.7 UND der GPU-Copy-Versuch 2.6.9). Scheitert der Open (Hybrid-GPU:
-// Default-Adapter != Capturer-NVIDIA) -> false -> Aufrufer nutzt den Direkt-Handle
-// (heutiges 20-fps-Verhalten, immer sichtbar). Kosten: ein Readback pro Bild, nur
-// die Self-View (gedrosselt); Sende-Pfad (NVENC) bleibt Zero-Copy.
-bool FlutterVideoRenderer::CopySelfViewRawCpu(int w, int h, void* handle) const {
-  using Microsoft::WRL::ComPtr;
-  if (!EnsureFallbackTexture(w, h)) return false;  // fb_dev_/fb_ctx_/fb_tex_/fb_handle_/fb_cpu_
-  // Rotierendes Capturer-Handle auf fb_dev_ (Default = ANGLE-Adapter) oeffnen.
-  if (handle != raw_last_handle_ || !raw_src_tex_) {
-    raw_src_tex_.Reset();
-    if (FAILED(fb_dev_->OpenSharedResource(
-            reinterpret_cast<HANDLE>(handle), __uuidof(ID3D11Texture2D),
-            reinterpret_cast<void**>(raw_src_tex_.GetAddressOf())))) {
-      raw_last_handle_ = nullptr;
-      return false;  // (Hybrid-GPU / cross-adapter) -> Direkt-Handle
-    }
-    raw_last_handle_ = handle;
-  }
-  if (!raw_staging_ || raw_w_ != w || raw_h_ != h) {
-    raw_staging_.Reset();
-    D3D11_TEXTURE2D_DESC d = {};
-    d.Width = w; d.Height = h; d.MipLevels = 1; d.ArraySize = 1;
-    d.Format = DXGI_FORMAT_B8G8R8A8_UNORM; d.SampleDesc.Count = 1;
-    d.Usage = D3D11_USAGE_STAGING;
-    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    if (FAILED(fb_dev_->CreateTexture2D(&d, nullptr, &raw_staging_))) return false;
-    raw_w_ = w;
-    raw_h_ = h;
-  }
-  fb_ctx_->CopyResource(raw_staging_.Get(), raw_src_tex_.Get());
-  fb_ctx_->Flush();
-  D3D11_MAPPED_SUBRESOURCE ms{};
-  if (FAILED(fb_ctx_->Map(raw_staging_.Get(), 0, D3D11_MAP_READ, 0, &ms)))
-    return false;
-  const uint8_t* sp = static_cast<const uint8_t*>(ms.pData);
-  for (int y = 0; y < h; ++y)
-    std::memcpy(fb_cpu_.get() + static_cast<size_t>(y) * w * 4,
-                sp + static_cast<size_t>(y) * ms.RowPitch,
-                static_cast<size_t>(w) * 4);
-  fb_ctx_->Unmap(raw_staging_.Get(), 0);
-  // CPU-Write in fb_tex_ (macht die Aenderung fuer ANGLEs gebundene View sichtbar).
+// Frame KOHAERENT lesen (ConvertToARGB -> ToI420-Readback auf dem Capturer-/
+// Decoder-eigenen Geraet) und per CPU-Write in die statische fb_tex_ laden.
+// Genutzt vom nicht-nativen Fallback (Kamera/SW-Remote) UND von der Self-View.
+// kARGB ist der korrekte Typ: libyuv I420ToARGB schreibt Speicher-Bytes
+// B,G,R,A = DXGI B8G8R8A8. (Das fruehere kBGRA = I420ToBGRA = Speicher A,R,G,B
+// legte Alpha in den Blaukanal = Blaustich; Probe 2026-07-21 BMP-verifiziert.)
+bool FlutterVideoRenderer::UploadFrameCpuToFallback(int w, int h) const {
+  if (!EnsureFallbackTexture(w, h)) return false;
+  auto _t_fb = std::chrono::steady_clock::now();
+  frame_->ConvertToARGB(RTCVideoFrame::Type::kARGB, fb_cpu_.get(), 0, w, h);
   fb_ctx_->UpdateSubresource(fb_tex_.Get(), 0, nullptr, fb_cpu_.get(),
                              static_cast<UINT>(w) * 4, 0);
   fb_ctx_->Flush();
+  dbg_fb_ms_ += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - _t_fb)
+                    .count();
+  dbg_fb_n_++;
   return true;
 }
 
@@ -229,28 +211,41 @@ const FlutterDesktopGpuSurfaceDescriptor* FlutterVideoRenderer::ObtainGpuSurface
 
   void* handle = frame_->native_shared_handle();
   dbg_native_ = handle ? 1 : 0;
-  // Self-View (is_throttle_) mit nativem Handle: statt des rotierenden Capturer-
-  // Handles (ANGLE re-bindet pro Frame -> Fenster-Compositor ~20 fps, zieht auch
-  // Remote-Kacheln + Responsivitaet runter) das Bild roh (BGRA) per Readback in
-  // fb_tex_ (ANGLE-Adapter) schreiben und deren STATISCHEN Handle geben (Bind-once,
-  // ~72 fps, korrekte Farben). Bei Adapter-Mismatch/Fehler -> Direkt-Handle (heute).
-  if (handle && is_throttle_ && CopySelfViewRawCpu(w, h, handle)) {
-    handle = fb_handle_;
+  // Self-View (is_throttle_) mit nativem Handle: NICHT den rotierenden
+  // Capturer-Handle an ANGLE geben — ANGLE re-bindet bei jedem Handle-Wechsel
+  // (eglBindTexImage) und Flutters Fenster-Compositor bricht auf ~20 fps ein
+  // (zieht Vorschau, App-Responsivitaet UND Remote-Kacheln runter). Stattdessen
+  // das Bild kohaerent auf dem Capturer-Geraet lesen (ConvertToARGB/ToI420) und
+  // per CPU-Write in die STATISCHE fb_tex_ laden (Bind-once; ANGLE sampelt
+  // CPU-Writes live — derselbe Mechanismus wie Kamera/SW-Remote). Probe-
+  // verifiziert 2026-07-21 auf AIX1: 18,7 -> 31 fps Compositor, korrekte
+  // Farben (BMP + on-screen). Konvertiert wird nur bei NEUEM Frame (Ring-
+  // Handle-Wechsel) und hoechstens alle 40 ms (~25/s = Drossel-Takt);
+  // dazwischen bleibt der letzte Stand (<= 40 ms alt, unmerklich). Jeder
+  // Fehler -> Direkt-Handle (sichtbar, heutiges Verhalten) + 1 Log-Zeile.
+  // GPU-Zero-Copy ist NICHT machbar: die Ring-Texturen sind nur auf dem
+  // Capturer-Geraet oder via ANGLEs eigenen EGL-Import lesbar (3 Schwarz-
+  // Fehlschlaege 2.6.7/9/10 = Lesen auf fremden Geraeten), und ANGLEs
+  // D3D-Geraet ist aus dem Plugin unerreichbar (flutter_windows.dll
+  // exportiert keine egl*-Symbole; 2026-07-21 gemessen).
+  if (handle && is_throttle_) {
+    int64_t nowc = NowMs();
+    if (handle != sv_last_handle_ && nowc - sv_last_conv_ms_ >= 40) {
+      if (UploadFrameCpuToFallback(w, h)) {
+        sv_last_handle_ = handle;
+        sv_last_conv_ms_ = nowc;
+        sv_ready_ = true;
+      } else if (!sv_fail_logged_) {
+        sv_fail_logged_ = true;
+        DiagLogA("[selfview] cpu_upload_fail -> Direkt-Handle (Modus 0)");
+      }
+    }
+    if (sv_ready_ && fb_handle_) handle = fb_handle_;
   }
   if (!handle) {
-    // Nicht-nativer Frame (Kamera/Remote, I420): nach BGRA konvertieren und in
-    // die eigene Shared-Textur hochladen. Producer (Upload) + Consumer (ANGLE)
-    // laufen beide sequenziell auf dem Raster-Thread -> kein Keyed-Mutex noetig.
-    if (!EnsureFallbackTexture(w, h)) return nullptr;
-    auto _t_fb = std::chrono::steady_clock::now();
-    frame_->ConvertToARGB(RTCVideoFrame::Type::kBGRA, fb_cpu_.get(), 0, w, h);
-    fb_ctx_->UpdateSubresource(fb_tex_.Get(), 0, nullptr, fb_cpu_.get(),
-                               static_cast<UINT>(w) * 4, 0);
-    fb_ctx_->Flush();
-    dbg_fb_ms_ += std::chrono::duration<double, std::milli>(
-                      std::chrono::steady_clock::now() - _t_fb)
-                      .count();
-    dbg_fb_n_++;
+    // Nicht-nativer Frame (Kamera/SW-Remote, I420) -> kohaerenter CPU-Weg
+    // (kARGB, korrekte Farben) in die statische fb_tex_.
+    if (!UploadFrameCpuToFallback(w, h)) return nullptr;
     handle = fb_handle_;
   }
 

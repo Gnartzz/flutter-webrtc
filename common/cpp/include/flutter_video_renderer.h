@@ -46,10 +46,11 @@ class FlutterVideoRenderer
   std::string media_stream_id;
 
 #ifdef _WINDOWS
-  // GPU-Zero-Copy-Vorschau: Callback fuer Flutters GpuSurfaceTexture. Native
-  // (GPU) Frames -> DXGI-Shared-Handle des Capturers direkt an ANGLE (kein
-  // Readback). Nicht-native Frames (Kamera/Remote, I420) -> in eine eigene
-  // plain-SHARED-BGRA-Textur konvertieren+hochladen (Fallback, Layer 3b).
+  // GpuSurface-Vorschau: Callback fuer Flutters GpuSurfaceTexture.
+  // Remote-Kacheln (unthrottled, native HW-Decode) -> Handle direkt an ANGLE.
+  // Self-View (is_throttle_, nativ) -> kohaerenter CPU-Weg in die statische
+  // fb_tex_ (Bind-once; s. Self-View-Fix unten). Nicht-native Frames
+  // (Kamera/SW-Remote, I420) -> derselbe CPU-Weg (Fallback).
   const FlutterDesktopGpuSurfaceDescriptor* ObtainGpuSurface(
       size_t width, size_t height) const;
   void set_gpu_surface(bool v) { is_gpu_surface_ = v; }
@@ -75,9 +76,11 @@ class FlutterVideoRenderer
   RTCVideoFrame::VideoRotation rotation_ = RTCVideoFrame::kVideoRotation_0;
 #ifdef _WINDOWS
   mutable FlutterDesktopGpuSurfaceDescriptor gpu_descriptor_ = {};
-  // Fallback fuer nicht-native Frames (Kamera/Remote): eigene plain-SHARED
-  // BGRA-Textur (kein Keyed-Mutex), in die per ConvertToARGB(kBGRA)+Upload
-  // geschrieben wird; ihr Legacy-Handle geht an ANGLE.
+  // Fallback-Textur (statischer Handle an ANGLE): fuer nicht-native Frames
+  // (Kamera/SW-Remote) UND die Self-View. Befuellt per ConvertToARGB(kARGB)+
+  // CPU-Upload — kARGB, weil libyuv I420ToARGB Speicher-Bytes B,G,R,A schreibt
+  // (= DXGI B8G8R8A8); das fruehere kBGRA (I420ToBGRA = A,R,G,B) legte Alpha
+  // in den Blaukanal = Blaustich. Kein Keyed-Mutex.
   mutable Microsoft::WRL::ComPtr<ID3D11Device> fb_dev_;
   mutable Microsoft::WRL::ComPtr<ID3D11DeviceContext> fb_ctx_;
   mutable Microsoft::WRL::ComPtr<ID3D11Texture2D> fb_tex_;
@@ -86,27 +89,22 @@ class FlutterVideoRenderer
   mutable int fb_h_ = 0;
   mutable std::shared_ptr<uint8_t> fb_cpu_;
   bool EnsureFallbackTexture(int w, int h) const;
+  bool UploadFrameCpuToFallback(int w, int h) const;
 
-  // Self-View-Vorschau-Fix (2026-07-20, auf RTX 2070S gemessen): den nativen
-  // Capturer-Handle NICHT direkt an ANGLE geben — der Capturer rotiert pro Frame
-  // durch einen 3er-Ring, ANGLE re-bindet dadurch JEDES Bild (eglBindTexImage) und
-  // Flutters Fenster-Compositor bricht auf ~20 fps ein (zieht Vorschau, App-
-  // Responsivitaet UND Remote-Kacheln mit runter). Fix: das Capturer-Bild per
-  // Readback auf fb_dev_ (Default = ANGLE-Adapter) ROH (BGRA, KEINE Farb-
-  // konvertierung -> kein R/B-Swap) nach fb_cpu_ holen und per UpdateSubresource in
-  // fb_tex_ schreiben; ANGLE bekommt deren STATISCHEN Handle (Bind-once, ~72 fps).
-  // WICHTIG: der CPU-Write (UpdateSubresource) ist der EINZIGE Weg, den ANGLE bei
-  // statischem Handle wirklich neu abtastet (wie der Remote-Pfad) — ein GPU-Copy-
-  // Resource in eine fremd-beschriebene Textur friert bei ANGLE ein (schwarz -> das
-  // war 2.6.7 UND der GPU-Copy-Versuch 2.6.9). Scheitert der Open (Hybrid-GPU:
-  // Default-Adapter != Capturer-NVIDIA) -> Direkt-Handle (heutiges 20-fps-Verhalten,
-  // sichtbar). Kosten: 1 Readback/Bild, nur Self-View (is_throttle_, gedrosselt);
-  // Sende-/Remote-Pfad unberuehrt.
-  mutable Microsoft::WRL::ComPtr<ID3D11Texture2D> raw_src_tex_;
-  mutable void* raw_last_handle_ = nullptr;
-  mutable Microsoft::WRL::ComPtr<ID3D11Texture2D> raw_staging_;
-  mutable int raw_w_ = 0, raw_h_ = 0;
-  bool CopySelfViewRawCpu(int w, int h, void* handle) const;
+  // Self-View-Fix (2026-07-21, Probe-verifiziert auf AIX1/RTX 2070S): der
+  // rotierende Capturer-Handle zwingt ANGLE zu einem Re-Bind PRO FRAME
+  // (eglBindTexImage) -> Fenster-Compositor ~20 fps (zieht Vorschau, App UND
+  // Remote-Kacheln runter). Fix: Frame kohaerent auf dem Capturer-Geraet lesen
+  // (ConvertToARGB/ToI420) und per CPU-Write in die STATISCHE fb_tex_ (Bind-
+  // once; gemessen 18,7 -> 31 fps, korrekte Farben). Nur bei neuem Frame +
+  // >= 40 ms (~25 Konv./s). GPU-Zero-Copy unmoeglich: Ring-Texturen sind nur
+  // auf dem Capturer-Geraet / via ANGLEs EGL-Import lesbar (Cross-Device =
+  // schwarz, 2.6.7/9/10), und ANGLEs D3D-Geraet ist aus dem Plugin
+  // unerreichbar (flutter_windows.dll exportiert keine egl*-Symbole).
+  mutable void* sv_last_handle_ = nullptr;
+  mutable int64_t sv_last_conv_ms_ = 0;
+  mutable bool sv_ready_ = false;
+  mutable bool sv_fail_logged_ = false;
 
   // Self-View-Drossel: die EIGENE Bildschirm-Selbstansicht zeigt den Schirm, den
   // man eh sieht -> auf ~25 fps drosseln, damit nicht jeder 60-fps-Frame ein
