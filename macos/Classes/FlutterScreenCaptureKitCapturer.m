@@ -10,12 +10,17 @@
 
 @interface FlutterScreenCaptureKitCapturer ()
 #if __has_include(<ScreenCaptureKit/ScreenCaptureKit.h>)
-<SCStreamOutput>
+<SCStreamOutput, SCStreamDelegate>
 #endif
 @property(nonatomic, strong) RTCVideoCapturer *capturer;
 @property(nonatomic, weak) id<RTCVideoCapturerDelegate> delegate;
 @property(nonatomic, strong) dispatch_queue_t captureQueue;
 @property(nonatomic, strong) dispatch_queue_t audioQueue;
+// App-Nap-Sperre waehrend einer aktiven Freigabe: macOS suspendiert sonst den
+// SCStream, sobald HoneyCord minimiert/versteckt ist (App Nap) -> der Capture
+// endet und die Freigabe bricht ab. Belegt: diag.log „hidden -> unpublish nach ~5s",
+// nur beim Streamen (dynacast zieht den Capture erst dann aktiv). 2026-07-23.
+@property(nonatomic, strong) id<NSObject> napActivityToken;
 #if __has_include(<ScreenCaptureKit/ScreenCaptureKit.h>)
 @property(nonatomic, strong) SCStream *stream;
 #endif
@@ -245,7 +250,9 @@ static NSDate* _hcCaptureStartingSince = nil; // Zeitpunkt des Capture-Starts (n
 
       NSLog(@"[hc-cap] T4 filter+config ready (srcW=%ld srcH=%ld out=%ldx%ld) -> SCStream alloc",
             (long)srcW, (long)srcH, (long)config.width, (long)config.height);
-      self.stream = [[SCStream alloc] initWithFilter:filter configuration:config delegate:nil];
+      // delegate:self -> wir erfahren via stream:didStopWithError: WARUM der Capture
+      // stoppt (vorher nil -> stiller Abbruch, Ursache nur erratbar).
+      self.stream = [[SCStream alloc] initWithFilter:filter configuration:config delegate:self];
       NSError *addOutputError = nil;
       [self.stream addStreamOutput:self
                               type:SCStreamOutputTypeScreen
@@ -276,12 +283,28 @@ static NSDate* _hcCaptureStartingSince = nil; // Zeitpunkt des Capture-Starts (n
       [self.stream startCaptureWithCompletionHandler:^(NSError * _Nullable startError) {
         NSLog(@"[hc-cap] T6 SCStream startCapture RESPONSE err=%@", startError);
         [FlutterScreenCaptureKitCapturer setCaptureStarting:NO];
+        // App Nap sperren, solange die Freigabe laeuft — verhindert, dass macOS
+        // den Capture beim Minimieren/Verstecken suspendiert (Bug 2026-07-23).
+        // NSActivityUserInitiatedAllowingIdleSystemSleep: verhindert App Nap, laesst
+        // aber den normalen Ruhezustand des Rechners zu (kein „haelt Mac wach").
+        if (startError == nil && self.napActivityToken == nil) {
+          self.napActivityToken = [[NSProcessInfo processInfo]
+              beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep
+                                reason:@"HoneyCord Bildschirmfreigabe"];
+          NSLog(@"[hc-cap] App-Nap-Sperre aktiv (Bildschirmfreigabe)");
+        }
         onStarted(startError);
       }];
 }
 #endif
 
 - (void)stopCaptureWithCompletion:(void (^)(void))completion {
+  // App-Nap-Sperre immer freigeben (auch wenn kein SCK) — sonst bliebe sie haengen.
+  if (self.napActivityToken != nil) {
+    [[NSProcessInfo processInfo] endActivity:self.napActivityToken];
+    self.napActivityToken = nil;
+    NSLog(@"[hc-cap] App-Nap-Sperre freigegeben");
+  }
 #if __has_include(<ScreenCaptureKit/ScreenCaptureKit.h>)
   if (@available(macOS 12.3, *)) {
     if (self.stream == nil) {
@@ -298,6 +321,16 @@ static NSDate* _hcCaptureStartingSince = nil; // Zeitpunkt des Capture-Starts (n
 #endif
   completion();
 }
+
+#if __has_include(<ScreenCaptureKit/ScreenCaptureKit.h>)
+// SCStreamDelegate: macOS stoppt den Stream (App Nap, Fenster weg, Fehler). Bislang
+// still (delegate war nil) -> Ursache nur erratbar. Jetzt protokolliert, damit ein
+// erneuter Abbruch trotz App-Nap-Sperre den EXAKTEN Grund im native.log/diag zeigt.
+- (void)stream:(SCStream *)stream didStopWithError:(NSError *)error API_AVAILABLE(macos(12.3)) {
+  NSLog(@"[hc-cap] ⚠️ SCStream didStopWithError code=%ld domain=%@ msg=%@",
+        (long)error.code, error.domain, error.localizedDescription);
+}
+#endif
 
 #if __has_include(<ScreenCaptureKit/ScreenCaptureKit.h>)
 - (SCDisplay *)selectDisplayFromContent:(SCShareableContent *)content
