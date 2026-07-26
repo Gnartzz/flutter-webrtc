@@ -450,6 +450,9 @@ void FlutterWebRTC::HandleMethodCall(
 #if defined(_WIN32)
     // Screen-Share-Ende: zugehoerigen WASAPI-Loopback stoppen (id10-Leak-Fix).
     StopLoopbackForStream(stream_id);
+#elif defined(__linux__)
+    // Dasselbe unter Linux (PipeWire-Mitschnitt).
+    StopLoopbackForStream(stream_id);
 #endif
     MediaStreamDispose(stream_id, std::move(result));
   } else if (method_call.method_name().compare("mediaStreamTrackSetEnable") ==

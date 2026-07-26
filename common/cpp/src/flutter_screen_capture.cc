@@ -4,6 +4,8 @@
 #include <windows.h>
 #include <cstdlib>
 #include "../../../windows/honeycord_wasapi_loopback.h"
+#elif defined(__linux__)
+#include "../../../linux/honeycord_pipewire_loopback.h"
 #endif
 
 namespace flutter_webrtc_plugin {
@@ -194,6 +196,15 @@ void FlutterScreenCapture::StopLoopbackForStream(const std::string& stream_id) {
   it->second->Stop();
   wasapi_loopbacks_.erase(it);
 }
+#elif defined(__linux__)
+void FlutterScreenCapture::StopLoopbackForStream(const std::string& stream_id) {
+  auto it = pipewire_loopbacks_.find(stream_id);
+  if (it == pipewire_loopbacks_.end()) return;
+  honeycord::PwLogFromPlugin("streamDispose: stoppe Bildschirmton fuer stream=%s",
+                             stream_id.c_str());
+  it->second->Stop();
+  pipewire_loopbacks_.erase(it);
+}
 #endif
 
 void FlutterScreenCapture::GetDisplayMedia(
@@ -320,6 +331,46 @@ void FlutterScreenCapture::GetDisplayMedia(
     }
   } else {
     honeycord::WasapiLogFromPlugin("getDisplayMedia: capture_audio=false");
+  }
+#elif defined(__linux__)
+  // LINUX-Systemton (Wayland/X11 gleichermassen): PipeWire sammelt die
+  // Wiedergabe aller FREMDEN Anwendungen ein — die eigene bleibt draussen,
+  // sonst kaeme die Stimme der Zuhoerer zu ihnen zurueck (siehe id13).
+  // Der Bildschirm-Portal-Dienst liefert selbst keinen Ton (gemessen: seine
+  // ScreenCast-Schnittstelle kennt nur Video), deshalb ein eigener Weg.
+  if (capture_audio) {
+    honeycord::PwLogFromPlugin("getDisplayMedia: Ton gewuenscht, uuid=%s",
+                               uuid.c_str());
+    scoped_refptr<RTCAudioSource> audio_source =
+        base_->factory_->CreateAudioSource(
+            "screen-share-audio", RTCAudioSource::SourceType::kCustom);
+    if (audio_source.get()) {
+      auto audio_uuid = base_->GenerateUUID();
+      scoped_refptr<RTCAudioTrack> audio_track =
+          base_->factory_->CreateAudioTrack(audio_source, audio_uuid.c_str());
+      if (audio_track.get()) {
+        auto loopback =
+            std::make_unique<honeycord::PipewireLoopback>(audio_source);
+        if (loopback->Start()) {
+          EncodableMap a_info;
+          a_info[EncodableValue("id")] = EncodableValue(audio_track->id().std_string());
+          a_info[EncodableValue("label")] = EncodableValue(audio_track->id().std_string());
+          a_info[EncodableValue("kind")] = EncodableValue(audio_track->kind().std_string());
+          a_info[EncodableValue("enabled")] = EncodableValue(audio_track->enabled());
+          audio_tracks.push_back(EncodableValue(a_info));
+          stream->AddTrack(audio_track);
+          base_->local_tracks_[audio_track->id().std_string()] = audio_track;
+          pipewire_loopbacks_[uuid] = std::move(loopback);
+          honeycord::PwLogFromPlugin("  Ton-Spur an Stream gehaengt: track_id=%s",
+                                     audio_track->id().std_string().c_str());
+        } else {
+          // Kein PipeWire erreichbar -> Freigabe laeuft ohne Ton weiter.
+          honeycord::PwLogFromPlugin("  Mitschnitt startete nicht — Freigabe bleibt stumm");
+        }
+      }
+    }
+  } else {
+    honeycord::PwLogFromPlugin("getDisplayMedia: kein Ton gewuenscht");
   }
 #else
   (void)capture_audio;

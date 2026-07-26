@@ -9,6 +9,8 @@
 
 #if defined(_WIN32)
 namespace honeycord { class WasapiLoopback; }
+#elif defined(__linux__)
+namespace honeycord { class PipewireLoopback; }
 #endif
 
 namespace flutter_webrtc_plugin {
@@ -41,6 +43,9 @@ class FlutterScreenCapture : public MediaListObserver,
   // aus dem streamDispose-Handler gerufen (LiveKits LocalTrack.stop() ->
   // mediaStream.dispose()). Ohne das lief der Capture-Thread nach Share-Ende
   // fuer immer weiter (ein Thread pro beendetem Share).
+  void StopLoopbackForStream(const std::string& stream_id);
+#elif defined(__linux__)
+  // Linux-Pendant (PipeWire): gleiche Aufgabe, gleicher Aufrufer.
   void StopLoopbackForStream(const std::string& stream_id);
 #endif
 
@@ -75,6 +80,10 @@ class FlutterScreenCapture : public MediaListObserver,
   // schließen können.
   std::map<std::string, std::unique_ptr<honeycord::WasapiLoopback>>
       wasapi_loopbacks_;
+#elif defined(__linux__)
+  // Dasselbe fuer Linux (PipeWire). Gleiche Lebensdauer-Regel wie oben.
+  std::map<std::string, std::unique_ptr<honeycord::PipewireLoopback>>
+      pipewire_loopbacks_;
 #endif
 };
 
