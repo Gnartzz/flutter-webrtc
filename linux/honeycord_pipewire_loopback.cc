@@ -61,13 +61,55 @@ void PwLogFromPlugin(const char* fmt, ...) {
 struct PipewireLoopback::Hooks {
   spa_hook registry;
   spa_hook stream;
+  spa_hook core;
 };
+
+namespace {
+// Ohne diesen Beobachter scheitert das Anlegen einer Verknuepfung STILL: das
+// Werk antwortet asynchron, und der Fehler landet sonst nirgends. Genau daran
+// war der erste Versuch nicht zu erkennen (2026-07-26).
+void OnCoreError(void* /*data*/, uint32_t id, int seq, int res,
+                 const char* message) {
+  PwLogFromPlugin("PipeWire meldet Fehler: objekt=%u seq=%d res=%d (%s) — %s", id,
+                  seq, res, spa_strerror(res), message ? message : "");
+}
+const pw_core_events kCoreEvents = {
+    PW_VERSION_CORE_EVENTS,
+    /*info=*/nullptr,
+    /*done=*/nullptr,
+    /*ping=*/nullptr,
+    OnCoreError,
+    /*remove_id=*/nullptr,
+    /*bound_id=*/nullptr,
+    /*add_mem=*/nullptr,
+    /*remove_mem=*/nullptr,
+    /*bound_props=*/nullptr,
+};
+}  // namespace
 
 PipewireLoopback::PipewireLoopback(
     libwebrtc::scoped_refptr<libwebrtc::RTCAudioSource> source)
     : source_(source) {
   chunk_.resize(static_cast<size_t>(kChunkFrames) * kChannels, 0);
   own_pid_ = static_cast<int>(getpid());
+
+  // GEMESSEN 2026-07-26 im Flatpak: getpid() liefert dort 2 (eigener
+  // Prozess-Namensraum), waehrend PipeWire die Nummer von AUSSEN meldet. Der
+  // Selbst-Ausschluss ueber die Prozess-ID allein greift im Sandkasten also
+  // NICHT — unsere eigene Wiedergabe wurde als "fremd" eingestuft und
+  // mitgeschnitten. Deshalb zusaetzlich ueber Namen erkennen.
+  if (const char* fid = getenv("FLATPAK_ID")) own_app_id_ = fid;
+  if (FILE* f = fopen("/proc/self/comm", "r")) {
+    char name[128] = {0};
+    if (fgets(name, sizeof(name), f)) {
+      std::string s(name);
+      while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+      own_binary_ = s;
+    }
+    fclose(f);
+  }
+  PwLogFromPlugin("Selbst-Kennzeichen: pid=%d app-id='%s' programm='%s'",
+                  own_pid_, own_app_id_.c_str(), own_binary_.c_str());
 }
 
 PipewireLoopback::~PipewireLoopback() {
@@ -81,17 +123,26 @@ void PipewireLoopback::OnRegistryGlobal(void* data, uint32_t id,
                                         const char* type, uint32_t /*version*/,
                                         const struct spa_dict* props) {
   auto* self = static_cast<PipewireLoopback*>(data);
-  if (!type || strcmp(type, PW_TYPE_INTERFACE_Node) != 0 || !props) return;
-  self->HandleNode(id, props);
+  if (!type || !props) return;
+  if (strcmp(type, PW_TYPE_INTERFACE_Node) == 0) {
+    self->HandleNode(id, props);
+  } else if (strcmp(type, PW_TYPE_INTERFACE_Port) == 0) {
+    self->HandlePort(id, props);
+  }
 }
 
 void PipewireLoopback::OnRegistryGlobalRemove(void* data, uint32_t id) {
   auto* self = static_cast<PipewireLoopback*>(data);
-  auto it = self->links_.find(id);
-  if (it != self->links_.end()) {
-    if (it->second) pw_proxy_destroy(it->second);
-    self->links_.erase(it);
-    PwLogFromPlugin("Knoten %u verschwunden -> Verknuepfung entfernt", id);
+
+  // Verknuepfungen dieses Knotens (oder dieses Anschlusses) abbauen.
+  for (auto it = self->links_.begin(); it != self->links_.end();) {
+    if (it->node_id == id || it->out_port == id || it->in_port == id) {
+      if (it->proxy) pw_proxy_destroy(it->proxy);
+      it = self->links_.erase(it);
+      PwLogFromPlugin("Objekt %u verschwunden -> Verknuepfung entfernt", id);
+    } else {
+      ++it;
+    }
   }
   for (auto a = self->apps_.begin(); a != self->apps_.end(); ++a) {
     if (*a == id) {
@@ -99,6 +150,37 @@ void PipewireLoopback::OnRegistryGlobalRemove(void* data, uint32_t id) {
       break;
     }
   }
+  auto raus = [id](std::vector<Anschluss>& v) {
+    for (auto it = v.begin(); it != v.end(); ++it) {
+      if (it->id == id || it->node_id == id) {
+        v.erase(it);
+        return;
+      }
+    }
+  };
+  raus(self->fremde_ausgaenge_);
+  raus(self->eigene_eingaenge_);
+}
+
+bool PipewireLoopback::IstEigenerKnoten(const struct spa_dict* props) const {
+  // Drei Kriterien, weil KEINES allein reicht:
+  //  - Prozess-ID: greift ausserhalb des Sandkastens (Archiv-Fassung).
+  //  - Anwendungs-Kennung: im Flatpak ist getpid() == 2, aber der Knoten heisst
+  //    "de.honeycord.honeycord" (= FLATPAK_ID). GEMESSEN 2026-07-26.
+  //  - Programmname: falls die Anwendung sich anders meldet.
+  const char* pid = spa_dict_lookup(props, PW_KEY_APP_PROCESS_ID);
+  if (pid && atoi(pid) == own_pid_) return true;
+
+  auto passt = [](const char* wert, const std::string& eigen) {
+    return wert && !eigen.empty() && eigen == wert;
+  };
+  const char* app = spa_dict_lookup(props, PW_KEY_APP_NAME);
+  const char* bin = spa_dict_lookup(props, PW_KEY_APP_PROCESS_BINARY);
+  const char* node = spa_dict_lookup(props, PW_KEY_NODE_NAME);
+  if (passt(app, own_app_id_) || passt(app, own_binary_)) return true;
+  if (passt(bin, own_binary_)) return true;
+  if (passt(node, own_app_id_) || passt(node, own_binary_)) return true;
+  return false;
 }
 
 void PipewireLoopback::HandleNode(uint32_t id, const struct spa_dict* props) {
@@ -107,46 +189,104 @@ void PipewireLoopback::HandleNode(uint32_t id, const struct spa_dict* props) {
 
   // SELBST-AUSSCHLUSS (der eigentliche Zweck der ganzen Konstruktion):
   // Unsere eigene Wiedergabe — also die Stimmen der Zuhoerer — darf NICHT
-  // eingesammelt werden, sonst kommt sie bei ihnen zurueck. Auf Windows macht
-  // das EXCLUDE_TARGET_PROCESS_TREE, auf dem Mac excludesCurrentProcessAudio.
-  const char* pid = spa_dict_lookup(props, PW_KEY_APP_PROCESS_ID);
-  if (pid && atoi(pid) == own_pid_) {
-    PwLogFromPlugin("Knoten %u ist unsere eigene Wiedergabe (pid %s) -> uebersprungen",
-                    id, pid);
+  // eingesammelt werden, sonst kommt sie bei ihnen zurueck (Fehler id13).
+  // Windows: EXCLUDE_TARGET_PROCESS_TREE, macOS: excludesCurrentProcessAudio.
+  const char* name = spa_dict_lookup(props, PW_KEY_APP_NAME);
+  if (IstEigenerKnoten(props)) {
+    PwLogFromPlugin("Knoten %u (%s) ist unsere eigene Wiedergabe -> uebersprungen",
+                    id, name ? name : "ohne Namen");
     return;
   }
 
-  const char* name = spa_dict_lookup(props, PW_KEY_APP_NAME);
-  PwLogFromPlugin("Fremder Wiedergabe-Knoten %u (%s) gefunden", id,
-                  name ? name : "ohne Namen");
   for (uint32_t known : apps_) {
     if (known == id) return;
   }
+  PwLogFromPlugin("Fremder Wiedergabe-Knoten %u (%s) gefunden", id,
+                  name ? name : "ohne Namen");
   apps_.push_back(id);
-  LinkNode(id);
+  VerknuepfeOffene();
 }
 
-void PipewireLoopback::LinkNode(uint32_t node_id) {
-  // Der eigene Aufnehmer hat erst nach dem Verbinden eine Knoten-ID. Kommt ein
-  // fremder Knoten frueher, wird er in apps_ gemerkt und spaeter verknuepft.
-  if (own_node_id_ == 0 || !core_) return;
-  if (links_.find(node_id) != links_.end()) return;
+void PipewireLoopback::HandlePort(uint32_t id, const struct spa_dict* props) {
+  const char* richtung = spa_dict_lookup(props, PW_KEY_PORT_DIRECTION);
+  const char* knoten = spa_dict_lookup(props, PW_KEY_NODE_ID);
+  if (!richtung || !knoten) return;
+  const uint32_t node_id = static_cast<uint32_t>(strtoul(knoten, nullptr, 10));
+  const char* kanal = spa_dict_lookup(props, "audio.channel");
 
-  // GEMESSEN: Verknuepfen auf KNOTEN-Ebene genuegt — die Anschluesse ordnet
-  // PipeWire selbst zu, und mehrere Quellen mischt es am Eingang zusammen.
-  // Deshalb keine Anschluss-Buchfuehrung (spart ~150 Zeilen und Fehlerquellen).
-  pw_properties* p = pw_properties_new(nullptr, nullptr);
-  pw_properties_setf(p, PW_KEY_LINK_OUTPUT_NODE, "%u", node_id);
-  pw_properties_setf(p, PW_KEY_LINK_INPUT_NODE, "%u", own_node_id_);
-  auto* link = static_cast<pw_proxy*>(
-      pw_core_create_object(core_, "link-factory", PW_TYPE_INTERFACE_Link,
-                            PW_VERSION_LINK, &p->dict, 0));
-  pw_properties_free(p);
-  if (link) {
-    links_[node_id] = link;
-    PwLogFromPlugin("Knoten %u -> Aufnehmer %u verknuepft", node_id, own_node_id_);
+  Anschluss a;
+  a.id = id;
+  a.node_id = node_id;
+  a.kanal = kanal ? kanal : "";
+
+  // ALLE Anschluesse merken und erst beim Verknuepfen filtern. Die Registratur
+  // garantiert keine Reihenfolge: ein Anschluss kann gemeldet werden, bevor
+  // sein Knoten eingeordnet ist — und unsere eigenen Eingaenge erscheinen unter
+  // Umstaenden, bevor wir die eigene Knoten-ID kennen. Wer hier frueh filtert,
+  // verliert sie still.
+  if (strcmp(richtung, "out") == 0) {
+    fremde_ausgaenge_.push_back(a);
+  } else if (strcmp(richtung, "in") == 0) {
+    eigene_eingaenge_.push_back(a);
   } else {
-    PwLogFromPlugin("Knoten %u konnte NICHT verknuepft werden", node_id);
+    return;
+  }
+  VerknuepfeOffene();
+}
+
+void PipewireLoopback::VerknuepfeOffene() {
+  if (own_node_id_ == 0 || !core_) return;
+
+  // ANSCHLUSS-genau verknuepfen. Der erste Versuch gab dem Verknuepfungs-Werk
+  // nur die KNOTEN-Nummern mit — dabei floss nichts (gemessen 2026-07-26: der
+  // Aufnehmer blieb auf "paused"). `pw-link`, das im Vorversuch nachweislich
+  // funktionierte, verbindet intern Anschluss fuer Anschluss; genau das machen
+  // wir jetzt auch. Mehrere Quellen auf denselben Eingang mischt PipeWire.
+  for (const Anschluss& aus : fremde_ausgaenge_) {
+    // Gehoert dieser Ausgang zu einer fremden Wiedergabe? (Filter hier statt
+    // beim Melden — siehe HandlePort.)
+    bool ist_app = false;
+    for (uint32_t app : apps_) {
+      if (app == aus.node_id) {
+        ist_app = true;
+        break;
+      }
+    }
+    if (!ist_app) continue;
+
+    for (const Anschluss& ein : eigene_eingaenge_) {
+      if (ein.node_id != own_node_id_) continue;  // nur unsere eigenen Eingaenge
+      // Kanaltreue, wo bekannt; Mono (oder unbenannt) geht auf beide Seiten.
+      const bool mono = aus.kanal.empty() || aus.kanal == "MONO";
+      if (!mono && !ein.kanal.empty() && aus.kanal != ein.kanal) continue;
+
+      bool schon_da = false;
+      for (const Verknuepfung& v : links_) {
+        if (v.out_port == aus.id && v.in_port == ein.id) {
+          schon_da = true;
+          break;
+        }
+      }
+      if (schon_da) continue;
+
+      pw_properties* p = pw_properties_new(nullptr, nullptr);
+      pw_properties_setf(p, PW_KEY_LINK_OUTPUT_NODE, "%u", aus.node_id);
+      pw_properties_setf(p, PW_KEY_LINK_OUTPUT_PORT, "%u", aus.id);
+      pw_properties_setf(p, PW_KEY_LINK_INPUT_NODE, "%u", own_node_id_);
+      pw_properties_setf(p, PW_KEY_LINK_INPUT_PORT, "%u", ein.id);
+      auto* link = static_cast<pw_proxy*>(
+          pw_core_create_object(core_, "link-factory", PW_TYPE_INTERFACE_Link,
+                                PW_VERSION_LINK, &p->dict, 0));
+      pw_properties_free(p);
+      if (link) {
+        links_.push_back({aus.node_id, aus.id, ein.id, link});
+        PwLogFromPlugin("verknuepft: Knoten %u Anschluss %u (%s) -> unser Anschluss %u (%s)",
+                        aus.node_id, aus.id, aus.kanal.c_str(), ein.id,
+                        ein.kanal.c_str());
+      } else {
+        PwLogFromPlugin("Verknuepfung %u -> %u fehlgeschlagen", aus.id, ein.id);
+      }
+    }
   }
 }
 
@@ -166,7 +306,7 @@ void PipewireLoopback::OnStreamStateChanged(void* data, int /*old_state*/,
       PwLogFromPlugin("Eigener Aufnehmer hat Knoten-ID %u — hole Rueckstand nach",
                       id);
       // Alles, was vor unserer eigenen Knoten-ID gemeldet wurde, jetzt binden.
-      for (uint32_t app : self->apps_) self->LinkNode(app);
+      self->VerknuepfeOffene();
     }
   }
 }
@@ -269,6 +409,8 @@ bool PipewireLoopback::Start() {
     return false;
   }
 
+  pw_core_add_listener(core_, &hooks_->core, &kCoreEvents, this);
+
   registry_ = pw_core_get_registry(core_, PW_VERSION_REGISTRY, 0);
   if (registry_) {
     pw_registry_add_listener(registry_, &hooks_->registry, &registry_events, this);
@@ -332,11 +474,13 @@ void PipewireLoopback::Stop() {
   started_ = false;
 
   if (loop_) pw_thread_loop_lock(loop_);
-  for (auto& kv : links_) {
-    if (kv.second) pw_proxy_destroy(kv.second);
+  for (auto& v : links_) {
+    if (v.proxy) pw_proxy_destroy(v.proxy);
   }
   links_.clear();
   apps_.clear();
+  fremde_ausgaenge_.clear();
+  eigene_eingaenge_.clear();
   if (stream_) {
     pw_stream_destroy(stream_);
     stream_ = nullptr;

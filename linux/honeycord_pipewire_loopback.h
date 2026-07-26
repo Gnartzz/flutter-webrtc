@@ -84,7 +84,12 @@ class PipewireLoopback {
                                    const char* error);
 
   void HandleNode(uint32_t id, const struct spa_dict* props);
-  void LinkNode(uint32_t node_id);
+  void HandlePort(uint32_t id, const struct spa_dict* props);
+  // True, wenn dieser Knoten zu UNS gehoert und deshalb nicht mitgeschnitten
+  // werden darf. Siehe Kommentar in der .cc — die Prozess-ID allein reicht im
+  // Flatpak-Sandkasten nicht.
+  bool IstEigenerKnoten(const struct spa_dict* props) const;
+  void VerknuepfeOffene();
   void PushPcm(const int16_t* frames, uint32_t frame_count);
 
   libwebrtc::scoped_refptr<libwebrtc::RTCAudioSource> source_;
@@ -101,18 +106,31 @@ class PipewireLoopback {
   pw_registry* registry_ = nullptr;
   pw_stream* stream_ = nullptr;
 
-  // Verknüpfungen, die wir selbst angelegt haben — Schlüssel ist die Knoten-ID
-  // der fremden Anwendung, damit wir doppelte Verknüpfungen vermeiden und beim
-  // Verschwinden aufräumen können.
-  std::map<uint32_t, pw_proxy*> links_;
+  // Ein Anschluss (Port) in PipeWires Registratur.
+  struct Anschluss {
+    uint32_t id = 0;
+    uint32_t node_id = 0;
+    std::string kanal;  // "FL", "FR", "MONO", …
+  };
 
-  // Fremde Wiedergabe-Knoten, die wir gesehen haben. Nötig, weil die
-  // Registratur uns Knoten melden kann, BEVOR unser eigener Aufnehmer eine
-  // Knoten-ID hat — die werden dann nachträglich verknüpft.
-  std::vector<uint32_t> apps_;
+  // Eine von uns angelegte Verknüpfung — mit der Knoten-ID der fremden
+  // Anwendung, damit wir beim Verschwinden gezielt aufräumen können.
+  struct Verknuepfung {
+    uint32_t node_id = 0;
+    uint32_t out_port = 0;
+    uint32_t in_port = 0;
+    pw_proxy* proxy = nullptr;
+  };
+
+  std::vector<Anschluss> fremde_ausgaenge_;  // Ausgänge fremder Anwendungen
+  std::vector<Anschluss> eigene_eingaenge_;  // Eingänge unseres Aufnehmers
+  std::vector<uint32_t> apps_;               // fremde Wiedergabe-Knoten
+  std::vector<Verknuepfung> links_;
 
   uint32_t own_node_id_ = 0;  // unser Aufnehmer (nie mit sich selbst verknüpfen)
   int own_pid_ = 0;
+  std::string own_app_id_;    // FLATPAK_ID, falls im Sandkasten
+  std::string own_binary_;    // /proc/self/comm
 
   // Sammelpuffer für die 10-ms-Abgabe.
   std::vector<int16_t> chunk_;
