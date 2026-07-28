@@ -150,7 +150,27 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
       rtcConstraints = [self parseMediaConstraints:[self defaultAudioConstraints]];
   }
 
-#if !defined(TARGET_OS_IPHONE)
+// ★ GEMESSEN 2026-07-28 (HoneyCord #70): Hier stand `#if !defined(TARGET_OS_IPHONE)`
+// — und damit wurde dieser Block auf macOS NIE uebersetzt.
+//
+// `TARGET_OS_IPHONE` ist auf jeder Apple-Plattform DEFINIERT; auf dem Mac
+// schlicht mit dem Wert 0. `defined(...)` fragt aber nur nach der Existenz, nicht
+// nach dem Wert — also war `!defined(...)` dort immer falsch. Nachgemessen mit
+// einem eigenen clang-Lauf:
+//     TARGET_OS_IPHONE definiert : JA (Wert 0)
+//     #if !defined(...)          : WIRD WEGGELASSEN
+//     #if TARGET_OS_OSX          : wird kompiliert
+//
+// Folge: Das in der App gewaehlte Mikrofon wurde nie angewandt. Die Geraete-ID
+// reiste durch bis in `audioTrack.settings`, aber niemand rief
+// `setInputDevice:` — das Audio-Geraetemodul oeffnete weiter den
+// System-Standard-Eingang. Bei Bluetooth-Kopfhoerern hiess das obendrein
+// Telefonqualitaet, weil der Standard-Eingang das Headset war.
+//
+// Der Rest dieser Datei prueft ueberall `#if TARGET_OS_IPHONE` (den WERT). Nur
+// diese eine Stelle fragte nach der Existenz. `TARGET_OS_OSX` passt genau zu
+// dem Guard, den `selectAudioInput:` in seinem eigenen Rumpf schon benutzt.
+#if TARGET_OS_OSX
   if (audioDeviceId != nil) {
     [self selectAudioInput:audioDeviceId result:nil];
   }
