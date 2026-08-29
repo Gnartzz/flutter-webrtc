@@ -33,10 +33,94 @@
 - (void)setSize:(CGSize)size {
 }
 
+#if TARGET_OS_OSX
+// HoneyCord (#107, 2026-08-29): Auf dem Mac ohne CoreImage — I420 -> BGRA ->
+// CGImage direkt aus dem Speicher. Der CIImage/CIContext-Weg unten lieferte fuer
+// die Kamera (AVCaptureDALDevice, 1280x720) "Failed to write image data to
+// file", ohne zu sagen, welcher Schritt leer blieb. Dieser Weg braucht keinen
+// GPU-Kontext auf dem Capture-Thread und meldet jeden Schritt einzeln.
+// Rotation gibt es bei Desktop-Kameras nicht; sie wird hier nicht angewandt.
+- (NSData*)hcImageDataFromFrame:(RTCVideoFrame*)frame {
+  id<RTCI420Buffer> i420 = [frame.buffer toI420];
+  if (!i420) {
+    NSLog(@"[hc-capture] toI420 lieferte nil");
+    return nil;
+  }
+  int w = i420.width, h = i420.height;
+  if (w <= 0 || h <= 0) {
+    NSLog(@"[hc-capture] Frame ohne Masse (%dx%d)", w, h);
+    return nil;
+  }
+  size_t stride = (size_t)w * 4;
+  NSMutableData* bgra = [NSMutableData dataWithLength:stride * (size_t)h];
+  // libyuv-"ARGB" = Speicherfolge B,G,R,A (kleines Endian).
+  [RTCYUVHelper I420ToARGB:i420.dataY
+                srcStrideY:i420.strideY
+                      srcU:i420.dataU
+                srcStrideU:i420.strideU
+                      srcV:i420.dataV
+                srcStrideV:i420.strideV
+                   dstARGB:bgra.mutableBytes
+             dstStrideARGB:(int)stride
+                     width:w
+                    height:h];
+  CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+  CGContextRef ctx = CGBitmapContextCreate(bgra.mutableBytes, (size_t)w, (size_t)h, 8, stride, cs,
+                                           kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst);
+  CGColorSpaceRelease(cs);
+  if (!ctx) {
+    NSLog(@"[hc-capture] CGBitmapContextCreate schlug fehl (%dx%d)", w, h);
+    return nil;
+  }
+  CGImageRef cg = CGBitmapContextCreateImage(ctx);
+  CGContextRelease(ctx);
+  if (!cg) {
+    NSLog(@"[hc-capture] CGBitmapContextCreateImage lieferte NULL");
+    return nil;
+  }
+  NSBitmapImageRep* rep = [[NSBitmapImageRep alloc] initWithCGImage:cg];
+  CGImageRelease(cg);
+  if (!rep) {
+    NSLog(@"[hc-capture] NSBitmapImageRep lieferte nil");
+    return nil;
+  }
+  NSDictionary<NSBitmapImageRepPropertyKey, id>* props = @{NSImageCompressionFactor : @1.0f};
+  NSData* data = [[_path pathExtension] isEqualToString:@"jpg"]
+                     ? [rep representationUsingType:NSBitmapImageFileTypeJPEG properties:props]
+                     : [rep representationUsingType:NSBitmapImageFileTypePNG properties:props];
+  if (!data)
+    NSLog(@"[hc-capture] representationUsingType lieferte nil (%dx%d)", w, h);
+  return data;
+}
+#endif
+
 - (void)renderFrame:(nullable RTCVideoFrame*)frame {
   if (_gotFrame || frame == nil)
     return;
   _gotFrame = true;
+#if TARGET_OS_OSX
+  {
+    NSData* hcData = [self hcImageDataFromFrame:frame];
+    NSError* hcErr = nil;
+    BOOL hcOk = hcData != nil && [hcData writeToFile:_path options:NSDataWritingAtomic error:&hcErr];
+    if (!hcOk)
+      NSLog(@"[hc-capture] Schreiben nach %@ fehlgeschlagen: %@", _path, hcErr);
+    // Ergebnis und Abmelden auf dem Hauptthread — wir stehen hier auf dem
+    // Capture-Thread, und Flutter erwartet Antworten auf dem Plattform-Thread.
+    dispatch_async(dispatch_get_main_queue(), ^{
+      if (hcOk) {
+        self->_result(nil);
+      } else {
+        self->_result([FlutterError errorWithCode:@"CaptureFrameFailed"
+                                          message:@"Failed to write image data to file"
+                                          details:hcErr ? hcErr.localizedDescription : nil]);
+      }
+      [self->_track removeRenderer:self];
+      self->_track = nil;
+    });
+    return;
+  }
+#endif
   id<RTCVideoFrameBuffer> buffer = frame.buffer;
   CVPixelBufferRef pixelBufferRef;
   bool shouldRelease;
