@@ -102,6 +102,13 @@
   {
     NSData* hcData = [self hcImageDataFromFrame:frame];
     NSError* hcErr = nil;
+    // Gemessen 29.08.: path_provider nennt auf dem Mac ~/Library/Caches/<bundle>/
+    // als Temp-Ordner -- und der existiert nicht, bis ihn jemand anlegt
+    // ("The folder captureFrame.png doesn't exist", errno 2). Also anlegen.
+    [[NSFileManager defaultManager] createDirectoryAtPath:[_path stringByDeletingLastPathComponent]
+                              withIntermediateDirectories:YES
+                                               attributes:nil
+                                                    error:nil];
     BOOL hcOk = hcData != nil && [hcData writeToFile:_path options:NSDataWritingAtomic error:&hcErr];
     if (!hcOk)
       NSLog(@"[hc-capture] Schreiben nach %@ fehlgeschlagen: %@", _path, hcErr);
