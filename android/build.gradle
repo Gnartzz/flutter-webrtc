@@ -23,7 +23,17 @@ rootProject.allprojects {
 }
 
 apply plugin: 'com.android.library'
-apply plugin: 'kotlin-android'
+// Built-in Kotlin: AGP >= 9 kompiliert Kotlin selbst und lehnt das Kotlin Gradle
+// Plugin dann ab. KGP nur anwenden, wenn Built-in Kotlin NICHT aktiv ist: AGP < 9
+// oder AGP 9 mit android.builtInKotlin=false (Flutters Vorlage fuer 3.47).
+// Rueckportiert aus flutter_webrtc 1.6.0 (HoneyCord, 2026-08-29).
+def agpMajor = com.android.Version.ANDROID_GRADLE_PLUGIN_VERSION.tokenize('.')[0] as int
+def builtInKotlinActive = agpMajor >= 9 &&
+    (!project.hasProperty('android.builtInKotlin') ||
+        Boolean.parseBoolean(project.property('android.builtInKotlin').toString()))
+if (!builtInKotlinActive) {
+    apply plugin: 'kotlin-android'
+}
 
 android {
     if (project.android.hasProperty("namespace")) {
