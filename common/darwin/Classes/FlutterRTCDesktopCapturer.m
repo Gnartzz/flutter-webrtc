@@ -625,7 +625,19 @@ static NSData* HCThumbJpegFromCGImage(CGImageRef img, CGFloat maxW) {
             if (!keep) continue;
             NSString* bid = w.owningApplication.bundleIdentifier;
             if (bid == nil || ![regular containsObject:bid]) continue;
-            if (ownBundleId != nil && [bid isEqualToString:ownBundleId]) continue;
+            // ★ HoneyCord 31.08.2026: Das EIGENE Fenster bleibt in der Liste.
+            //
+            // Hier stand `if (bid == ownBundleId) continue;` — gut gemeint gegen
+            // das Spiegelkabinett (wer sein eigenes Fenster teilt, sieht darin
+            // die Vorschau davon). Der Nutzer wollte aber genau das: das
+            // HoneyCord-Fenster freigeben, etwa um jemandem etwas darin zu
+            // zeigen. Discord und Teams erlauben es ebenfalls; die Entscheidung
+            // gehoert dem Nutzer, nicht dem Filter.
+            //
+            // Die uebrigen Filter bleiben unangetastet (Nutzer-Entscheid:
+            // „Nur HoneyCord, Rest so lassen") — minimierte Fenster und Apps
+            // ohne Dock-Symbol fehlen weiterhin, dafuer bleibt die Liste kurz.
+            (void)ownBundleId;
             NSString* appName = w.owningApplication.applicationName ?: @"";
             if (appName.length == 0) continue;
             NSString* sid = [NSString stringWithFormat:@"%u", (unsigned)w.windowID];
