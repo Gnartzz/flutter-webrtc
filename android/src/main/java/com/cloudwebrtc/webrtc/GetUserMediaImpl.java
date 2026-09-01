@@ -481,6 +481,46 @@ public class GetUserMediaImpl {
                 });
     }
 
+    /**
+     * Haken zwischen der Zustimmung des Nutzers und dem Start der Aufnahme.
+     *
+     * ★ WARUM ES IHN BRAUCHT (HoneyCord, 01.09.2026 — #112):
+     * Seit Android 14 verlangt das System einen laufenden Vordergrunddienst vom
+     * Typ `mediaProjection`, bevor die Aufnahme beginnt. Diesen Typ nimmt es
+     * aber erst an, NACHDEM der Nutzer bewilligt hat — GEMESSEN auf Android 15:
+     *
+     *   Starting FGS with type mediaProjection requires permissions:
+     *     all of: [FOREGROUND_SERVICE_MEDIA_PROJECTION]
+     *     any of: [CAPTURE_VIDEO_OUTPUT, android:project_media]
+     *
+     * `android:project_media` ist der Vermerk, den die Zustimmung setzt. Es gibt
+     * also genau ein Zeitfenster, in dem der Dienst hochkommen darf: zwischen
+     * `onReceiveResult` und dem Erzeugen des Capturers. Beides liegt in dieser
+     * Methode, weshalb die App von aussen nicht dazwischenkommt.
+     *
+     * Die App setzt den Haken beim Start; ist keiner gesetzt, aendert sich
+     * nichts am bisherigen Verhalten.
+     */
+    public interface ProjektionBereit {
+        void aufnahmeBeginnt();
+    }
+
+    /** Von der App gesetzt (HoneyCord: MainActivity). `null` = altes Verhalten. */
+    public static ProjektionBereit projektionBereit = null;
+
+    private static void projektionAnkuendigen() {
+        final ProjektionBereit haken = projektionBereit;
+        if (haken == null) return;
+        try {
+            haken.aufnahmeBeginnt();
+        } catch (Exception e) {
+            // Ein fehlgeschlagener Dienststart darf die Freigabe nicht
+            // verhindern — Android beschwert sich danach selbst, und zwar
+            // deutlicher als wir es hier koennten.
+            Log.w(TAG, "projektionBereit-Haken fehlgeschlagen: " + e);
+        }
+    }
+
     void getDisplayMedia(
             final ConstraintsMap constraints, final Result result, final MediaStream mediaStream) {
         if (mediaProjectionData == null) {
@@ -495,10 +535,16 @@ public class GetUserMediaImpl {
                                 resultError("screenRequestPermissions", "User didn't give permission to capture the screen.", result);
                                 return;
                             }
+                            // ★ JETZT — die Zustimmung liegt vor, der Capturer
+                            // ist noch nicht erzeugt. Siehe `ProjektionBereit`.
+                            projektionAnkuendigen();
                             getDisplayMedia(result, mediaStream, mediaProjectionData);
                         }
                     });
         } else {
+            // Zweite und weitere Freigabe derselben Sitzung: die Erlaubnis liegt
+            // schon vor, der Dienst muss den Typ aber trotzdem tragen.
+            projektionAnkuendigen();
             getDisplayMedia(result, mediaStream, mediaProjectionData);
         }
     }
