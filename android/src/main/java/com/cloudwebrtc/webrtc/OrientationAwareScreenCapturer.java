@@ -129,6 +129,14 @@ public class OrientationAwareScreenCapturer implements VideoCapturer, VideoSink 
         // Let MediaProjection callback use the SurfaceTextureHelper thread.
         mediaProjection.registerCallback(mediaProjectionCallback, surfaceTextureHelper.getHandler());
 
+        // ★ HoneyCord: Der System-Ton haengt an DERSELBEN Projection.
+        //
+        // Ab Android 14 laesst sich das Ergebnis-Intent nicht zweimal in eine
+        // MediaProjection verwandeln („Reusing token"). Ein zweiter Aufruf von
+        // `getMediaProjection` waere also kein Umweg, sondern ein Fehler —
+        // deshalb wird die eine hier weitergereicht.
+        com.cloudwebrtc.webrtc.honeycord.ScreenAudio.projectionBereit(mediaProjection);
+
         createVirtualDisplay();
         capturerObserver.onCapturerStarted(true);
         surfaceTextureHelper.startListening(this);
@@ -152,6 +160,8 @@ public class OrientationAwareScreenCapturer implements VideoCapturer, VideoSink 
                     mediaProjection.unregisterCallback(mediaProjectionCallback);
                     mediaProjection.stop();
                     mediaProjection = null;
+                    // ★ HoneyCord: Ohne Projection gibt es keinen System-Ton.
+                    com.cloudwebrtc.webrtc.honeycord.ScreenAudio.projectionWeg();
                 }
             }
         });

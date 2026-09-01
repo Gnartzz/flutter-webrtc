@@ -193,6 +193,37 @@ class Helper {
     }
   }
 
+  /// HoneyCord: Ton der Bildschirmfreigabe auf Android an- oder abschalten.
+  ///
+  /// Auf Android gibt es keinen eigenen Screen-Share-Audio-Track — die
+  /// WebRTC-Java-API kennt nur ein Audio-Device-Modul, und das nimmt das
+  /// Mikrofon auf. Der System-Ton (`AudioPlaybackCapture`, ab Android 10) wird
+  /// deshalb in den Aufnahme-Puffer eingesetzt, bevor WebRTC ihn bekommt.
+  ///
+  /// Folge fuer den Aufrufer: Der Ton laeuft ueber den MIKROFON-Track. Ist der
+  /// nicht veroeffentlicht, hoert niemand etwas — auch wenn hier `true` steht.
+  ///
+  /// [mix] `false` ersetzt das Mikrofonsignal (Spielton statt Stimme),
+  /// `true` mischt beides.
+  ///
+  /// Gibt zurueck, ob die Aufnahme tatsaechlich laeuft. `false` heisst: noch
+  /// keine Freigabe aktiv, Android aelter als 10, oder das Geraet gibt den Ton
+  /// nicht heraus.
+  static Future<bool> setScreenAudio(bool enabled, {bool mix = false}) async {
+    if (!WebRTC.platformIsAndroid) return false;
+    final r = await WebRTC.invokeMethod(
+        'honeycordScreenAudio', {'enabled': enabled, 'mix': mix});
+    return (r is Map && r['running'] == true);
+  }
+
+  /// HoneyCord: Laeuft der Ton der Bildschirmfreigabe gerade?
+  static Future<Map<String, bool>> screenAudioState() async {
+    if (!WebRTC.platformIsAndroid) return {'wanted': false, 'running': false};
+    final r = await WebRTC.invokeMethod('honeycordScreenAudioState');
+    if (r is! Map) return {'wanted': false, 'running': false};
+    return {'wanted': r['wanted'] == true, 'running': r['running'] == true};
+  }
+
   /// id34 „Framerate ↔ Helligkeit" (nur Windows wirksam): Wenn [enabled], deckelt
   /// libwebrtc beim nächsten Kamera-Start die Belichtung auf ≤ 1/32 s, damit die
   /// Auto-Belichtung bei wenig Licht keine Frames droppen kann (hält 30 fps,

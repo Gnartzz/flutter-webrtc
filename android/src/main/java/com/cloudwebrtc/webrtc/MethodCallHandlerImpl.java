@@ -301,6 +301,19 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
       audioDeviceModuleBuilder.setAudioAttributes(audioAttributes);
     }
 
+    // ★ HoneyCord: System-Ton der Bildschirmfreigabe.
+    //
+    // Der einzige offene Zugang zum Aufnahme-Puffer. Laeuft keine Freigabe,
+    // tut der Haken nichts und das Mikrofon geht unveraendert durch — die
+    // Kosten sind dann ein Funktionsaufruf je 10-ms-Puffer.
+    audioDeviceModuleBuilder.setAudioBufferCallback(
+        (java.nio.ByteBuffer puffer, int audioFormat, int channelCount,
+         int sampleRate, int bytesRead, long captureTimestampNs) -> {
+          com.cloudwebrtc.webrtc.honeycord.ScreenAudio.pufferHaken(
+              puffer, channelCount, sampleRate, bytesRead);
+          return captureTimestampNs;
+        });
+
     audioDeviceModule = audioDeviceModuleBuilder.createAudioDeviceModule();
 
     if(!bypassVoiceProcessing) {
@@ -827,7 +840,38 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
       case "getDisplayMedia": {
         Map<String, Object> constraints = call.argument("constraints");
         ConstraintsMap constraintsMap = new ConstraintsMap(constraints);
+        // ★ HoneyCord: `audio: true` heisst auf Android „System-Ton der
+        // Freigabe mitnehmen". Der Ton wird NICHT als eigener Track geliefert
+        // (das gibt die WebRTC-Java-API nicht her, s. `PlaybackCapture`),
+        // sondern in den Aufnahme-Puffer eingesetzt. Der Aufrufer bekommt
+        // deshalb weiterhin nur einen Video-Track — und muss sein Mikrofon
+        // veroeffentlicht lassen, damit der Ton einen Weg hat.
+        {
+          Object a = constraints != null ? constraints.get("audio") : null;
+          final boolean tonGewuenscht = (a instanceof Boolean) ? (Boolean) a
+              : (a instanceof Map);          // eine Constraint-Map heisst auch „ja"
+          com.cloudwebrtc.webrtc.honeycord.ScreenAudio.setGewuenscht(tonGewuenscht, false);
+        }
         getDisplayMedia(constraintsMap, result);
+        break;
+      }
+      // ★ HoneyCord: Ton der Bildschirmfreigabe zur Laufzeit umschalten, ohne
+      // die Freigabe neu zu starten.
+      case "honeycordScreenAudio": {
+        final Boolean an = call.argument("enabled");
+        final Boolean mix = call.argument("mix");
+        com.cloudwebrtc.webrtc.honeycord.ScreenAudio.setGewuenscht(
+            an != null && an, mix != null && mix);
+        Map<String, Object> antwort = new HashMap<>();
+        antwort.put("running", com.cloudwebrtc.webrtc.honeycord.ScreenAudio.laeuft());
+        result.success(antwort);
+        break;
+      }
+      case "honeycordScreenAudioState": {
+        Map<String, Object> antwort = new HashMap<>();
+        antwort.put("wanted", com.cloudwebrtc.webrtc.honeycord.ScreenAudio.istGewuenscht());
+        antwort.put("running", com.cloudwebrtc.webrtc.honeycord.ScreenAudio.laeuft());
+        result.success(antwort);
         break;
       }
       case "startRecordToFile":
