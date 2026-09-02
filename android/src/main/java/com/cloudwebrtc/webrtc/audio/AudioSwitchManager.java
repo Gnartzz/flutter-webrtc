@@ -326,6 +326,20 @@ public class AudioSwitchManager {
             forceHandleAudioRouting = (Boolean) configuration.get("forceHandleAudioRouting");
         }
         setForceHandleAudioRouting(forceHandleAudioRouting);
+
+        // HoneyCord (02.09.2026): Die audioswitch-Setter schreiben nur Felder —
+        // Modus, Fokus und Audio-Attribute wendet erst activate() an. Ist die
+        // Sitzung schon aktiv (der erste Remote-Track hat mit den ALTEN Werten
+        // aktiviert), griffe eine Konfigurationsaenderung sonst nie. Deshalb
+        // einmal ab- und wieder anschalten; ohne aktive Sitzung passiert nichts.
+        if (audioSwitch != null) {
+            handler.post(() -> {
+                if (isActive) {
+                    Objects.requireNonNull(audioSwitch).deactivate();
+                    Objects.requireNonNull(audioSwitch).activate();
+                }
+            });
+        }
     }
 
     public void setManageAudioFocus(@Nullable Boolean manage) {

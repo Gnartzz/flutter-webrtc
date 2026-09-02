@@ -112,7 +112,16 @@ public class FlutterWebRTCPlugin implements FlutterPlugin, ActivityAware, EventC
 
     private void startListening(final Context context, BinaryMessenger messenger,
                                 TextureRegistry textureRegistry) {
-        AudioSwitchManager.instance = new AudioSwitchManager(context);
+        // HoneyCord (02.09.2026): Der FCM-Hintergrund-Isolate registriert alle
+        // Plugins erneut und ersetzte damit mitten in einer Sprachsitzung den
+        // Manager samt Zustand (isActive, konfiguriertes Audio-Profil) — der
+        // alte, noch aktive AudioSwitch wurde dann beim Auflegen nie mehr
+        // deaktiviert (Audio-Fokus blieb bis zum Prozessende haengen). Der
+        // erste Manager bleibt; er haengt nur am Application-Context und ist
+        // im Prozess derselbe.
+        if (AudioSwitchManager.instance == null) {
+            AudioSwitchManager.instance = new AudioSwitchManager(context);
+        }
         methodCallHandler = new MethodCallHandlerImpl(context, messenger, textureRegistry);
         methodChannel = new MethodChannel(messenger, "FlutterWebRTC.Method");
         methodChannel.setMethodCallHandler(methodCallHandler);
