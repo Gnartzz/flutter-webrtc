@@ -201,6 +201,7 @@ static FlutterWebRTCPlugin *sharedSingleton;
   self.dataCryptors = [NSMutableDictionary new];
   self.keyProviders = [NSMutableDictionary new];
   self.videoCapturerStopHandlers = [NSMutableDictionary new];
+  self.videoCapturers = [NSMutableDictionary new];
   self.recorders = [NSMutableDictionary new];
 #if TARGET_OS_IPHONE
   self.focusMode = @"locked";
@@ -699,7 +700,7 @@ static FlutterWebRTCPlugin *sharedSingleton;
           shouldCallResult = NO;
           stopHandler(^{
             NSLog(@"video capturer stopped, trackID = %@", videoTrack.trackId);
-            self.videoCapturer = nil;
+            [self capturerFreigebenFuerTrack:videoTrack.trackId];
             result(nil);
           });
           [self.videoCapturerStopHandlers removeObjectForKey:videoTrack.trackId];
@@ -798,6 +799,7 @@ static FlutterWebRTCPlugin *sharedSingleton;
           if (stopHandler) {
             stopHandler(^{
               NSLog(@"video capturer stopped, trackID = %@", track.trackId);
+              [self capturerFreigebenFuerTrack:track.trackId];
             });
             [self.videoCapturerStopHandlers removeObjectForKey:track.trackId];
           }
@@ -2616,6 +2618,19 @@ static FlutterWebRTCPlugin *sharedSingleton;
     if (self.eventSink) {
       postEvent( self.eventSink, @{@"event" : @"onDeviceChange"});
     }
+}
+
+
+// ★ HoneyCord: Aufnehmer einer beendeten Spur loslassen. Zeigte `videoCapturer`
+// auf genau diesen, ruecken wir auf einen noch laufenden nach — sonst
+// arbeiteten Torch/Zoom/switchCamera ins Leere.
+- (void)capturerFreigebenFuerTrack:(NSString*)trackId {
+  RTCCameraVideoCapturer* c = self.videoCapturers[trackId];
+  [self.videoCapturers removeObjectForKey:trackId];
+  if (c == nil) return;
+  if (self.videoCapturer == c) {
+    self.videoCapturer = self.videoCapturers.allValues.firstObject;
+  }
 }
 
 @end

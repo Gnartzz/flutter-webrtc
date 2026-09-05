@@ -57,6 +57,14 @@ typedef void (^CapturerStopHandler)(CompletionHandler _Nonnull handler);
 @property(nonatomic, strong) FlutterEventSink _Nullable eventSink;
 @property(nonatomic, strong) NSObject<FlutterBinaryMessenger>* _Nonnull messenger;
 @property(nonatomic, strong) RTCCameraVideoCapturer* _Nullable videoCapturer;
+// ★ HoneyCord (05.09.2026, „Vier Stroeme" Block 4): EIN Aufnehmer JE SPUR.
+// `videoCapturer` zeigt weiter auf den zuletzt gestarteten (Torch/Zoom/
+// switchCamera arbeiten auf der aktuellen Kamera); dieses Woerterbuch haelt
+// jeden Aufnehmer STARK, bis seine Spur endet — vorher ersetzte jede neue
+// Kamera den Zeiger, der alte Aufnehmer verlor seine letzte Referenz (bzw.
+// wurde unter macOS ausdruecklich gestoppt): Kamera + Capture-Karte
+// gleichzeitig war damit unmoeglich, die alte Spur fror ein.
+@property(nonatomic, strong) NSMutableDictionary<NSString*, RTCCameraVideoCapturer*>* _Nullable videoCapturers;
 @property(nonatomic, strong) FlutterRTCFrameCapturer* _Nullable frameCapturer;
 @property(nonatomic, strong) AVAudioSessionPort _Nullable preferredInput;
 

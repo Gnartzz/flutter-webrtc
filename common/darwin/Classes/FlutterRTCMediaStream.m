@@ -514,11 +514,11 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
 
   if (videoDevice) {
     RTCVideoSource* videoSource = [self.peerConnectionFactory videoSource];
-#if TARGET_OS_OSX
-    if (self.videoCapturer) {
-      [self.videoCapturer stopCapture];
-    }
-#endif
+    // ★ HoneyCord (Block 4): der alte Aufnehmer wird NICHT mehr gestoppt —
+    // jede Spur behaelt ihren eigenen (siehe `videoCapturers`). Kamera und
+    // Capture-Karte laufen so gleichzeitig, wie auf Windows und im nativen
+    // Mac-Client. Gestoppt wird ausschliesslich ueber den Stop-Handler der
+    // eigenen Spur.
       
     VideoProcessingAdapter *videoProcessingAdapter = [[VideoProcessingAdapter alloc] initWithRTCVideoSource:videoSource];
     self.videoCapturer = [[RTCCameraVideoCapturer alloc] initWithDelegate:videoProcessingAdapter];
@@ -588,6 +588,10 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
       NSLog(@"Stop video capturer, trackID %@", videoTrack.trackId);
       [capturer stopCaptureWithCompletionHandler:handler];
     };
+    // STARK halten, bis die Spur endet — die schwache Referenz im Handler
+    // allein wuerde den Aufnehmer freigeben, sobald `videoCapturer` auf die
+    // naechste Kamera zeigt.
+    self.videoCapturers[videoTrack.trackId] = self.videoCapturer;
 
     if (!videoDeviceId) {
       videoDeviceId = videoDevice.uniqueID;
