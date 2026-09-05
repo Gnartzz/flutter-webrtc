@@ -561,19 +561,64 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
                                }
                                if (![fpsDevice lockForConfiguration:NULL]) return;
                                NSString* cls = NSStringFromClass([fpsDevice class]);
-                               @try {
-                                 fpsDevice.activeVideoMinFrameDuration = CMTimeMake(1, (int32_t)pinFps);
-                                 fpsDevice.activeVideoMaxFrameDuration = CMTimeMake(1, (int32_t)pinFps);
-                                 NSLog(@"[hc-fps] pinned %ld fps OK (device %@)", (long)pinFps, cls);
-                               } @catch (NSException* e1) {
-                                 // Manche (DAL-)Geraete lehnen die MAX-Duration ab -> nur MIN
-                                 // setzen (= Deckel bei fps, Cam laeuft bis dahin frei).
+                               // HoneyCord 05.09.2026 (GEMESSEN auf einem Mac mit UGREEN 35871 und
+                               // Insta360 Link 2, beide ueber Apples UVC-Erweiterung =
+                               // AVCaptureDevice_Tundra): UVC-Bildraten sind KRUMM — der Bereich
+                               // heisst 60,00024 fps (Dauer 1000000/60000240), nicht 1/60. Die
+                               // Tundra-Klasse vergleicht exakt und wirft fuer CMTimeMake(1, 60)
+                               // "Not supported", obwohl 60 in der Liste steht. Folge bisher: das
+                               // Pinnen scheiterte auf JEDER UVC-Kamera lautlos, und die Karte lief
+                               // in ihrer Format-Vorgabe — bei der UGREEN 1080p = 120 fps MJPEG,
+                               // doppelte USB-Last, neben einer zweiten Kamera "device not responding".
+                               // Deshalb: die Dauer AUS DEM BEREICH nehmen (so macht es OBS), 1/fps
+                               // bleibt nur als Rueckfall fuer Kameras ohne passenden Bereich.
+                               AVFrameRateRange* bereich = nil;
+                               double bestDiff = 1e9;
+                               for (AVFrameRateRange* r in fpsDevice.activeFormat.videoSupportedFrameRateRanges) {
+                                 double diff = fabs(r.maxFrameRate - (double)pinFps);
+                                 if (diff < bestDiff && diff < 0.75) { bestDiff = diff; bereich = r; }
+                               }
+                               if (bereich == nil) {
+                                 // kein Bereich bei pinFps: den groessten UNTER dem Ziel nehmen
+                                 // (lieber 30 als die 120er-Vorgabe), sonst den kleinsten.
+                                 AVFrameRateRange* unter = nil; AVFrameRateRange* kleinster = nil;
+                                 for (AVFrameRateRange* r in fpsDevice.activeFormat.videoSupportedFrameRateRanges) {
+                                   if (kleinster == nil || r.maxFrameRate < kleinster.maxFrameRate) kleinster = r;
+                                   if (r.maxFrameRate <= (double)pinFps + 0.75 && (unter == nil || r.maxFrameRate > unter.maxFrameRate)) unter = r;
+                                 }
+                                 bereich = unter ?: kleinster;
+                               }
+                               BOOL gepinnt = NO;
+                               if (bereich != nil) {
+                                 @try {
+                                   fpsDevice.activeVideoMinFrameDuration = bereich.minFrameDuration;
+                                   fpsDevice.activeVideoMaxFrameDuration = bereich.maxFrameDuration;
+                                   gepinnt = YES;
+                                   NSLog(@"[hc-fps] pinned %.3f fps via range (Ziel %ld, device %@)", bereich.maxFrameRate, (long)pinFps, cls);
+                                 } @catch (NSException* e0) {
+                                   NSLog(@"[hc-fps] range-pin %.3f fps threw (device %@): %@", bereich.maxFrameRate, cls, e0.reason);
+                                 }
+                               }
+                               if (!gepinnt) {
                                  @try {
                                    fpsDevice.activeVideoMinFrameDuration = CMTimeMake(1, (int32_t)pinFps);
-                                   NSLog(@"[hc-fps] pinned %ld fps MIN-only, max threw (device %@)", (long)pinFps, cls);
-                                 } @catch (NSException* e2) {
-                                   NSLog(@"[hc-fps] FAILED to pin %ld fps (device %@): %@", (long)pinFps, cls, e2.userInfo);
+                                   fpsDevice.activeVideoMaxFrameDuration = CMTimeMake(1, (int32_t)pinFps);
+                                   NSLog(@"[hc-fps] pinned %ld fps OK (device %@)", (long)pinFps, cls);
+                                 } @catch (NSException* e1) {
+                                   // Manche (DAL-)Geraete lehnen die MAX-Duration ab -> nur MIN
+                                   // setzen (= Deckel bei fps, Cam laeuft bis dahin frei).
+                                   @try {
+                                     fpsDevice.activeVideoMinFrameDuration = CMTimeMake(1, (int32_t)pinFps);
+                                     NSLog(@"[hc-fps] pinned %ld fps MIN-only, max threw (device %@)", (long)pinFps, cls);
+                                   } @catch (NSException* e2) {
+                                     NSLog(@"[hc-fps] FAILED to pin %ld fps (device %@): %@", (long)pinFps, cls, e2.userInfo);
+                                   }
                                  }
+                               }
+                               {
+                                 CMTime akt = fpsDevice.activeVideoMinFrameDuration;
+                                 double aktFps = (akt.value > 0) ? ((double)akt.timescale / (double)akt.value) : 0.0;
+                                 NSLog(@"[hc-fps] aktiv jetzt %.3f fps (device %@)", aktFps, cls);
                                }
                                [fpsDevice unlockForConfiguration];
                              }];
