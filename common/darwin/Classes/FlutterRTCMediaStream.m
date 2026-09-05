@@ -559,6 +559,10 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
                                  NSLog(@"Start capture error: %@", [error localizedDescription]);
                                  return;
                                }
+                               // Ohne Ziel (keine frameRate in den Constraints liefert selectFpsForFormat 0)
+                               // bleibt die Format-Vorgabe — sonst pinnte die Bereichssuche auf die
+                               // LANGSAMSTE Stufe einer UVC-Karte (Pruefbefund 2).
+                               if (pinFps <= 0) { NSLog(@"[hc-fps] kein Ziel (pinFps %ld), Format-Vorgabe bleibt", (long)pinFps); return; }
                                if (![fpsDevice lockForConfiguration:NULL]) return;
                                NSString* cls = NSStringFromClass([fpsDevice class]);
                                // HoneyCord 05.09.2026 (GEMESSEN auf einem Mac mit UGREEN 35871 und
@@ -570,19 +574,23 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
                                // Pinnen scheiterte auf JEDER UVC-Kamera lautlos, und die Karte lief
                                // in ihrer Format-Vorgabe — bei der UGREEN 1080p = 120 fps MJPEG,
                                // doppelte USB-Last, neben einer zweiten Kamera "device not responding".
-                               // Deshalb: die Dauer AUS DEM BEREICH nehmen (so macht es OBS), 1/fps
-                               // bleibt nur als Rueckfall fuer Kameras ohne passenden Bereich.
+                               // Deshalb: bei DISKRETEN Bereichen (min == max, UVC) die Dauer AUS DEM
+                               // BEREICH nehmen (so macht es OBS); bei VARIABLEN Bereichen (FaceTime HD,
+                               // iPhone 1-30/1-60) weiter fest 1/pinFps — die echte Klasse nimmt jeden
+                               // Wert im Bereich, und die Bereichsdauer waere dort 1 s = Untergrenze
+                               // 1 fps (Pruefbefund 1). 1/fps bleibt zudem der letzte Rueckfall.
+                               NSArray<AVFrameRateRange*>* bereiche = fpsDevice.activeFormat.videoSupportedFrameRateRanges;
                                AVFrameRateRange* bereich = nil;
-                               double bestDiff = 1e9;
-                               for (AVFrameRateRange* r in fpsDevice.activeFormat.videoSupportedFrameRateRanges) {
-                                 double diff = fabs(r.maxFrameRate - (double)pinFps);
-                                 if (diff < bestDiff && diff < 0.75) { bestDiff = diff; bereich = r; }
+                               // 1. Bereich, der das Ziel ENTHAELT (engster zuerst, Pruefbefund 4)
+                               for (AVFrameRateRange* r in bereiche) {
+                                 if (r.minFrameRate - 0.75 <= (double)pinFps && (double)pinFps <= r.maxFrameRate + 0.75 &&
+                                     (bereich == nil || r.maxFrameRate < bereich.maxFrameRate)) bereich = r;
                                }
                                if (bereich == nil) {
-                                 // kein Bereich bei pinFps: den groessten UNTER dem Ziel nehmen
+                                 // 2. kein Bereich bei pinFps: den groessten UNTER dem Ziel nehmen
                                  // (lieber 30 als die 120er-Vorgabe), sonst den kleinsten.
                                  AVFrameRateRange* unter = nil; AVFrameRateRange* kleinster = nil;
-                                 for (AVFrameRateRange* r in fpsDevice.activeFormat.videoSupportedFrameRateRanges) {
+                                 for (AVFrameRateRange* r in bereiche) {
                                    if (kleinster == nil || r.maxFrameRate < kleinster.maxFrameRate) kleinster = r;
                                    if (r.maxFrameRate <= (double)pinFps + 0.75 && (unter == nil || r.maxFrameRate > unter.maxFrameRate)) unter = r;
                                  }
@@ -590,13 +598,33 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
                                }
                                BOOL gepinnt = NO;
                                if (bereich != nil) {
-                                 @try {
-                                   fpsDevice.activeVideoMinFrameDuration = bereich.minFrameDuration;
-                                   fpsDevice.activeVideoMaxFrameDuration = bereich.maxFrameDuration;
-                                   gepinnt = YES;
-                                   NSLog(@"[hc-fps] pinned %.3f fps via range (Ziel %ld, device %@)", bereich.maxFrameRate, (long)pinFps, cls);
-                                 } @catch (NSException* e0) {
-                                   NSLog(@"[hc-fps] range-pin %.3f fps threw (device %@): %@", bereich.maxFrameRate, cls, e0.reason);
+                                 BOOL diskret  = fabs(bereich.maxFrameRate - bereich.minFrameRate) < 0.001;
+                                 BOOL zielDrin = (double)pinFps >= bereich.minFrameRate - 1e-6 &&
+                                                 (double)pinFps <= bereich.maxFrameRate + 1e-6;
+                                 if (!diskret && zielDrin) {
+                                   // variabler Bereich: fest auf 1/pinFps (Ober- UND Untergrenze)
+                                   @try {
+                                     fpsDevice.activeVideoMinFrameDuration = CMTimeMake(1, (int32_t)pinFps);
+                                     fpsDevice.activeVideoMaxFrameDuration = CMTimeMake(1, (int32_t)pinFps);
+                                     gepinnt = YES;
+                                     NSLog(@"[hc-fps] pinned %ld fps fest im Bereich %.3f-%.3f (device %@)",
+                                           (long)pinFps, bereich.minFrameRate, bereich.maxFrameRate, cls);
+                                   } @catch (NSException* eV) {
+                                     NSLog(@"[hc-fps] 1/%ld im variablen Bereich abgelehnt (device %@): %@", (long)pinFps, cls, eV.reason);
+                                   }
+                                 }
+                                 if (!gepinnt) {
+                                   // diskreter Bereich (UVC/Tundra) oder 1/pinFps abgelehnt: exakte
+                                   // Bereichsdauer, BEIDE Grenzen auf minFrameDuration = feste Rate am
+                                   // oberen Ende des Bereichs (bei diskreten Bereichen identisch).
+                                   @try {
+                                     fpsDevice.activeVideoMinFrameDuration = bereich.minFrameDuration;
+                                     fpsDevice.activeVideoMaxFrameDuration = bereich.minFrameDuration;
+                                     gepinnt = YES;
+                                     NSLog(@"[hc-fps] pinned %.3f fps via range (Ziel %ld, device %@)", bereich.maxFrameRate, (long)pinFps, cls);
+                                   } @catch (NSException* e0) {
+                                     NSLog(@"[hc-fps] range-pin %.3f fps threw (device %@): %@", bereich.maxFrameRate, cls, e0.reason);
+                                   }
                                  }
                                }
                                if (!gepinnt) {
@@ -616,9 +644,11 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
                                  }
                                }
                                {
-                                 CMTime akt = fpsDevice.activeVideoMinFrameDuration;
-                                 double aktFps = (akt.value > 0) ? ((double)akt.timescale / (double)akt.value) : 0.0;
-                                 NSLog(@"[hc-fps] aktiv jetzt %.3f fps (device %@)", aktFps, cls);
+                                 // Kontrolle: BEIDE Grenzen (Ober- = minFrameDuration, Unter- = maxFrameDuration)
+                                 CMTime mn = fpsDevice.activeVideoMinFrameDuration, mx = fpsDevice.activeVideoMaxFrameDuration;
+                                 NSLog(@"[hc-fps] aktiv jetzt %.3f..%.3f fps (device %@)",
+                                       mx.value > 0 ? (double)mx.timescale / (double)mx.value : 0.0,
+                                       mn.value > 0 ? (double)mn.timescale / (double)mn.value : 0.0, cls);
                                }
                                [fpsDevice unlockForConfiguration];
                              }];
