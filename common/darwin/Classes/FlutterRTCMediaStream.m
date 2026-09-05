@@ -35,6 +35,88 @@
 
 @end
 
+
+// ★ HoneyCord 05.09.2026 (Kartenton, GEMESSEN an Tims UGREEN 35871 + OBS-Vergleich):
+// OBS startet den UVC-Strom GENAU EINMAL mit der Zielrate. Wir starteten ihn mit
+// der Format-Vorgabe (1080p = 120 fps) und 50 ms spaeter fuer den Pin NEU. Ohne
+// laufende Ton-Schnittstelle verkraftet die Karte den Neustart, mit laufendem
+// UAC-Ton bleibt ihr Bild danach stehen (0 Pakete; 21:58 und 22:14). Deshalb
+// wird die Bildrate jetzt VOR dem Start gesetzt und der Pin nach dem Start
+// nur noch angefasst, wenn die Rate NICHT schon stimmt (kein Neustart).
+static AVFrameRateRange* HoneycordBereichFuer(AVCaptureDeviceFormat* format, NSInteger pinFps) {
+  if (format == nil || pinFps <= 0) return nil;
+  NSArray<AVFrameRateRange*>* bereiche = format.videoSupportedFrameRateRanges;
+  AVFrameRateRange* bereich = nil;
+  for (AVFrameRateRange* r in bereiche) {
+    if (r.minFrameRate - 0.75 <= (double)pinFps && (double)pinFps <= r.maxFrameRate + 0.75 &&
+        (bereich == nil || r.maxFrameRate < bereich.maxFrameRate)) bereich = r;
+  }
+  if (bereich == nil) {
+    AVFrameRateRange* unter = nil; AVFrameRateRange* kleinster = nil;
+    for (AVFrameRateRange* r in bereiche) {
+      if (kleinster == nil || r.maxFrameRate < kleinster.maxFrameRate) kleinster = r;
+      if (r.maxFrameRate <= (double)pinFps + 0.75 && (unter == nil || r.maxFrameRate > unter.maxFrameRate)) unter = r;
+    }
+    bereich = unter ?: kleinster;
+  }
+  return bereich;
+}
+
+static double HoneycordAktiveFps(AVCaptureDevice* d) {
+  CMTime mn = d.activeVideoMinFrameDuration;
+  return mn.value > 0 ? ((double)mn.timescale / (double)mn.value) : 0.0;
+}
+
+/// Setzt Ober- UND Untergrenze der Bildrate am Geraet (Sperre haelt der Aufrufer).
+/// Diskreter Bereich (UVC/Tundra): exakte Bereichsdauer; variabler Bereich: 1/fps.
+/// Rueckgabe: die jetzt aktive Rate (0 = nichts gesetzt).
+static double HoneycordPinnen(AVCaptureDevice* d, AVCaptureDeviceFormat* format, NSInteger pinFps, NSString* wo) {
+  NSString* cls = NSStringFromClass([d class]);
+  AVFrameRateRange* bereich = HoneycordBereichFuer(format, pinFps);
+  BOOL gepinnt = NO;
+  if (bereich != nil) {
+    BOOL diskret  = fabs(bereich.maxFrameRate - bereich.minFrameRate) < 0.001;
+    BOOL zielDrin = (double)pinFps >= bereich.minFrameRate - 1e-6 && (double)pinFps <= bereich.maxFrameRate + 1e-6;
+    if (!diskret && zielDrin) {
+      @try {
+        d.activeVideoMinFrameDuration = CMTimeMake(1, (int32_t)pinFps);
+        d.activeVideoMaxFrameDuration = CMTimeMake(1, (int32_t)pinFps);
+        gepinnt = YES;
+        NSLog(@"[hc-fps] %@: %ld fps fest im Bereich %.3f-%.3f (device %@)", wo, (long)pinFps, bereich.minFrameRate, bereich.maxFrameRate, cls);
+      } @catch (NSException* eV) {
+        NSLog(@"[hc-fps] %@: 1/%ld im variablen Bereich abgelehnt (device %@): %@", wo, (long)pinFps, cls, eV.reason);
+      }
+    }
+    if (!gepinnt) {
+      @try {
+        d.activeVideoMinFrameDuration = bereich.minFrameDuration;
+        d.activeVideoMaxFrameDuration = bereich.minFrameDuration;
+        gepinnt = YES;
+        NSLog(@"[hc-fps] %@: %.3f fps via range (Ziel %ld, device %@)", wo, bereich.maxFrameRate, (long)pinFps, cls);
+      } @catch (NSException* e0) {
+        NSLog(@"[hc-fps] %@: range-pin %.3f fps threw (device %@): %@", wo, bereich.maxFrameRate, cls, e0.reason);
+      }
+    }
+  }
+  if (!gepinnt) {
+    @try {
+      d.activeVideoMinFrameDuration = CMTimeMake(1, (int32_t)pinFps);
+      d.activeVideoMaxFrameDuration = CMTimeMake(1, (int32_t)pinFps);
+      gepinnt = YES;
+      NSLog(@"[hc-fps] %@: %ld fps OK (device %@)", wo, (long)pinFps, cls);
+    } @catch (NSException* e1) {
+      @try {
+        d.activeVideoMinFrameDuration = CMTimeMake(1, (int32_t)pinFps);
+        gepinnt = YES;
+        NSLog(@"[hc-fps] %@: %ld fps MIN-only, max threw (device %@)", wo, (long)pinFps, cls);
+      } @catch (NSException* e2) {
+        NSLog(@"[hc-fps] %@: FAILED to pin %ld fps (device %@): %@", wo, (long)pinFps, cls, e2.userInfo);
+      }
+    }
+  }
+  return gepinnt ? HoneycordAktiveFps(d) : 0.0;
+}
+
 @implementation FlutterWebRTCPlugin (RTCMediaStream)
 
 /**
@@ -551,6 +633,20 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
     // also 1/fps gueltig und dauerhaft. Geraeteklasse wird geloggt (Beweis DAL?).
     AVCaptureDevice* fpsDevice = videoDevice;
     NSInteger pinFps = selectedFps;
+    // ★ VORAB: Format und Bildrate setzen, BEVOR der Capturer die Session startet.
+    // Der Capturer setzt `activeFormat = format` (dasselbe Objekt) — ob das die
+    // Dauer zuruecksetzt, zeigt die Kontrollzeile im completionHandler. Ziel:
+    // EIN UVC-Start mit der Zielrate, wie OBS (s. HoneycordBereichFuer).
+    if (pinFps > 0 && [videoDevice lockForConfiguration:NULL]) {
+      @try {
+        videoDevice.activeFormat = selectedFormat;
+      } @catch (NSException* eF) {
+        NSLog(@"[hc-fps] vorab: activeFormat abgelehnt: %@", eF.reason);
+      }
+      double vorab = HoneycordPinnen(videoDevice, selectedFormat, pinFps, @"vorab");
+      NSLog(@"[hc-fps] vorab aktiv %.3f fps", vorab);
+      [videoDevice unlockForConfiguration];
+    }
     [self.videoCapturer startCaptureWithDevice:videoDevice
                                         format:selectedFormat
                                            fps:selectedFps
@@ -565,86 +661,20 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
                                if (pinFps <= 0) { NSLog(@"[hc-fps] kein Ziel (pinFps %ld), Format-Vorgabe bleibt", (long)pinFps); return; }
                                if (![fpsDevice lockForConfiguration:NULL]) return;
                                NSString* cls = NSStringFromClass([fpsDevice class]);
-                               // HoneyCord 05.09.2026 (GEMESSEN auf einem Mac mit UGREEN 35871 und
-                               // Insta360 Link 2, beide ueber Apples UVC-Erweiterung =
-                               // AVCaptureDevice_Tundra): UVC-Bildraten sind KRUMM — der Bereich
-                               // heisst 60,00024 fps (Dauer 1000000/60000240), nicht 1/60. Die
-                               // Tundra-Klasse vergleicht exakt und wirft fuer CMTimeMake(1, 60)
-                               // "Not supported", obwohl 60 in der Liste steht. Folge bisher: das
-                               // Pinnen scheiterte auf JEDER UVC-Kamera lautlos, und die Karte lief
-                               // in ihrer Format-Vorgabe — bei der UGREEN 1080p = 120 fps MJPEG,
-                               // doppelte USB-Last, neben einer zweiten Kamera "device not responding".
-                               // Deshalb: bei DISKRETEN Bereichen (min == max, UVC) die Dauer AUS DEM
-                               // BEREICH nehmen (so macht es OBS); bei VARIABLEN Bereichen (FaceTime HD,
-                               // iPhone 1-30/1-60) weiter fest 1/pinFps — die echte Klasse nimmt jeden
-                               // Wert im Bereich, und die Bereichsdauer waere dort 1 s = Untergrenze
-                               // 1 fps (Pruefbefund 1). 1/fps bleibt zudem der letzte Rueckfall.
-                               NSArray<AVFrameRateRange*>* bereiche = fpsDevice.activeFormat.videoSupportedFrameRateRanges;
-                               AVFrameRateRange* bereich = nil;
-                               // 1. Bereich, der das Ziel ENTHAELT (engster zuerst, Pruefbefund 4)
-                               for (AVFrameRateRange* r in bereiche) {
-                                 if (r.minFrameRate - 0.75 <= (double)pinFps && (double)pinFps <= r.maxFrameRate + 0.75 &&
-                                     (bereich == nil || r.maxFrameRate < bereich.maxFrameRate)) bereich = r;
-                               }
-                               if (bereich == nil) {
-                                 // 2. kein Bereich bei pinFps: den groessten UNTER dem Ziel nehmen
-                                 // (lieber 30 als die 120er-Vorgabe), sonst den kleinsten.
-                                 AVFrameRateRange* unter = nil; AVFrameRateRange* kleinster = nil;
-                                 for (AVFrameRateRange* r in bereiche) {
-                                   if (kleinster == nil || r.maxFrameRate < kleinster.maxFrameRate) kleinster = r;
-                                   if (r.maxFrameRate <= (double)pinFps + 0.75 && (unter == nil || r.maxFrameRate > unter.maxFrameRate)) unter = r;
-                                 }
-                                 bereich = unter ?: kleinster;
-                               }
-                               BOOL gepinnt = NO;
-                               if (bereich != nil) {
-                                 BOOL diskret  = fabs(bereich.maxFrameRate - bereich.minFrameRate) < 0.001;
-                                 BOOL zielDrin = (double)pinFps >= bereich.minFrameRate - 1e-6 &&
-                                                 (double)pinFps <= bereich.maxFrameRate + 1e-6;
-                                 if (!diskret && zielDrin) {
-                                   // variabler Bereich: fest auf 1/pinFps (Ober- UND Untergrenze)
-                                   @try {
-                                     fpsDevice.activeVideoMinFrameDuration = CMTimeMake(1, (int32_t)pinFps);
-                                     fpsDevice.activeVideoMaxFrameDuration = CMTimeMake(1, (int32_t)pinFps);
-                                     gepinnt = YES;
-                                     NSLog(@"[hc-fps] pinned %ld fps fest im Bereich %.3f-%.3f (device %@)",
-                                           (long)pinFps, bereich.minFrameRate, bereich.maxFrameRate, cls);
-                                   } @catch (NSException* eV) {
-                                     NSLog(@"[hc-fps] 1/%ld im variablen Bereich abgelehnt (device %@): %@", (long)pinFps, cls, eV.reason);
-                                   }
-                                 }
-                                 if (!gepinnt) {
-                                   // diskreter Bereich (UVC/Tundra) oder 1/pinFps abgelehnt: exakte
-                                   // Bereichsdauer, BEIDE Grenzen auf minFrameDuration = feste Rate am
-                                   // oberen Ende des Bereichs (bei diskreten Bereichen identisch).
-                                   @try {
-                                     fpsDevice.activeVideoMinFrameDuration = bereich.minFrameDuration;
-                                     fpsDevice.activeVideoMaxFrameDuration = bereich.minFrameDuration;
-                                     gepinnt = YES;
-                                     NSLog(@"[hc-fps] pinned %.3f fps via range (Ziel %ld, device %@)", bereich.maxFrameRate, (long)pinFps, cls);
-                                   } @catch (NSException* e0) {
-                                     NSLog(@"[hc-fps] range-pin %.3f fps threw (device %@): %@", bereich.maxFrameRate, cls, e0.reason);
-                                   }
-                                 }
-                               }
-                               if (!gepinnt) {
-                                 @try {
-                                   fpsDevice.activeVideoMinFrameDuration = CMTimeMake(1, (int32_t)pinFps);
-                                   fpsDevice.activeVideoMaxFrameDuration = CMTimeMake(1, (int32_t)pinFps);
-                                   NSLog(@"[hc-fps] pinned %ld fps OK (device %@)", (long)pinFps, cls);
-                                 } @catch (NSException* e1) {
-                                   // Manche (DAL-)Geraete lehnen die MAX-Duration ab -> nur MIN
-                                   // setzen (= Deckel bei fps, Cam laeuft bis dahin frei).
-                                   @try {
-                                     fpsDevice.activeVideoMinFrameDuration = CMTimeMake(1, (int32_t)pinFps);
-                                     NSLog(@"[hc-fps] pinned %ld fps MIN-only, max threw (device %@)", (long)pinFps, cls);
-                                   } @catch (NSException* e2) {
-                                     NSLog(@"[hc-fps] FAILED to pin %ld fps (device %@): %@", (long)pinFps, cls, e2.userInfo);
-                                   }
-                                 }
+                               // Stimmt die Rate schon (Vorab-Pin hat den Start ueberlebt)?
+                               // Dann NICHTS anfassen — jedes Setzen startet den UVC-Strom
+                               // neu, und genau der Neustart hielt die Karte neben laufendem
+                               // Ton an. Sonst wie bisher pinnen.
+                               AVFrameRateRange* zielBereich = HoneycordBereichFuer(fpsDevice.activeFormat, pinFps);
+                               const double zielFps = zielBereich ? zielBereich.maxFrameRate : (double)pinFps;
+                               const double aktiv = HoneycordAktiveFps(fpsDevice);
+                               if (aktiv > 0 && fabs(aktiv - zielFps) < 0.05) {
+                                 NSLog(@"[hc-fps] nach Start: schon %.3f fps (Ziel %.3f) — kein Neustart (device %@)", aktiv, zielFps, cls);
+                               } else {
+                                 const double jetzt = HoneycordPinnen(fpsDevice, fpsDevice.activeFormat, pinFps, @"nach Start");
+                                 NSLog(@"[hc-fps] nach Start: war %.3f, jetzt %.3f fps (Ziel %.3f, device %@)", aktiv, jetzt, zielFps, cls);
                                }
                                {
-                                 // Kontrolle: BEIDE Grenzen (Ober- = minFrameDuration, Unter- = maxFrameDuration)
                                  CMTime mn = fpsDevice.activeVideoMinFrameDuration, mx = fpsDevice.activeVideoMaxFrameDuration;
                                  NSLog(@"[hc-fps] aktiv jetzt %.3f..%.3f fps (device %@)",
                                        mx.value > 0 ? (double)mx.timescale / (double)mx.value : 0.0,
