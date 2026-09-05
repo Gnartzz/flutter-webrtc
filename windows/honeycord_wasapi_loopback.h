@@ -30,6 +30,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -57,6 +58,12 @@ class WasapiLoopback {
   explicit WasapiLoopback(
       libwebrtc::scoped_refptr<libwebrtc::RTCAudioSource> source,
       unsigned long include_pid = 0);
+  // ★ HoneyCord (05.09.2026, „Vier Stroeme" Block 1): NICHT der System-Mitschnitt,
+  // sondern ein gewaehltes AUFNAHMEGERAET (WASAPI-Endpoint-Id, z. B. die USB-
+  // Tonseite einer Capture-Karte). Kein Process-Loopback, kein Loopback-Flag;
+  // Format, Resampler und 10-ms-Bloecke sind dieselben wie beim Mitschnitt.
+  WasapiLoopback(libwebrtc::scoped_refptr<libwebrtc::RTCAudioSource> source,
+                 const std::wstring& capture_device_id);
   ~WasapiLoopback();
 
   // Startet den COM-/WASAPI-Stack und den Capture-Thread. Gibt false zurück,
@@ -77,6 +84,9 @@ class WasapiLoopback {
   bool TryStartProcessLoopback(bool include_mode);
   // Klassisches Endpoint-Loopback auf dem Default-Render-Device (Fallback).
   bool StartEndpointLoopback();
+  // Aufnahme eines gewaehlten Capture-Endpoints (capture_device_id_), ohne
+  // Loopback-Flag — der Kartenton-Weg.
+  bool StartCaptureEndpoint();
   // Gibt COM-Objekte/Format/Event frei (fuer Stop + Aufraeumen zwischen den
   // beiden Start-Versuchen). Stoppt NICHT den Thread.
   void ReleaseCom();
@@ -85,6 +95,7 @@ class WasapiLoopback {
   // Per-App-Audio (id16): PID des geteilten Fensters (0 = Screen-Share ->
   // System-Mix im Exclude-Modus).
   unsigned long include_pid_ = 0;
+  std::wstring capture_device_id_;   // leer = Mitschnitt-Modi wie bisher
   std::atomic<bool> running_{false};
   std::thread thread_;
 

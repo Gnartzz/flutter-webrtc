@@ -203,6 +203,11 @@ WasapiLoopback::WasapiLoopback(
     unsigned long include_pid)
     : source_(std::move(source)), include_pid_(include_pid) {}
 
+WasapiLoopback::WasapiLoopback(
+    libwebrtc::scoped_refptr<libwebrtc::RTCAudioSource> source,
+    const std::wstring& capture_device_id)
+    : source_(std::move(source)), capture_device_id_(capture_device_id) {}
+
 WasapiLoopback::~WasapiLoopback() { Stop(); }
 
 bool WasapiLoopback::Start() {
@@ -228,7 +233,18 @@ bool WasapiLoopback::Start() {
   //    Wiedergabe) — lieber Echo als gar kein Stream-Audio.
   const char* mode_desc = nullptr;
   bool ok = false;
-  if (include_pid_ != 0) {
+  if (!capture_device_id_.empty()) {
+    // ★ Kartenton: gewaehltes Aufnahmegeraet direkt. Scheitert das, gibt es
+    // KEINEN Rueckfall auf den System-Mitschnitt — der waere ein anderer Ton
+    // als bestellt, und der Aufrufer wuesste es nicht.
+    if (!StartCaptureEndpoint()) {
+      ReleaseCom();
+      return false;
+    }
+    ok = true;
+    mode_desc = "capture-endpoint (Aufnahmegeraet)";
+  }
+  if (!ok && include_pid_ != 0) {
     ok = TryStartProcessLoopback(/*include_mode=*/true);
     if (ok) {
       mode_desc = "process-include (nur geteilte App)";
@@ -415,6 +431,51 @@ bool WasapiLoopback::StartEndpointLoopback() {
                            AUDCLNT_STREAMFLAGS_LOOPBACK, kBufferDuration100Ns,
                            0, mix_format_, nullptr);
   HcLog("Start: client->Initialize(LOOPBACK) = 0x%08lx", (long)hr);
+  return SUCCEEDED(hr);
+}
+
+bool WasapiLoopback::StartCaptureEndpoint() {
+  HRESULT hr;
+  IMMDeviceEnumerator* enumerator = nullptr;
+  hr = CoCreateInstance(kCLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL,
+                        kIID_IMMDeviceEnumerator,
+                        reinterpret_cast<void**>(&enumerator));
+  HcLog("StartCapture: CoCreateInstance(MMDeviceEnumerator) = 0x%08lx", (long)hr);
+  if (FAILED(hr) || !enumerator) return false;
+  // Die Id kommt aus enumerateDevices (= RecordingDeviceName-GUID des ADM) und
+  // ist die WASAPI-Endpoint-Id ("{0.0.1.00000000}.{…}") — GetDevice nimmt sie.
+  hr = enumerator->GetDevice(capture_device_id_.c_str(), &device_);
+  enumerator->Release();
+  HcLog("StartCapture: GetDevice(%ls) = 0x%08lx dev=%p", capture_device_id_.c_str(),
+        (long)hr, device_);
+  if (FAILED(hr) || !device_) return false;
+
+  hr = device_->Activate(kIID_IAudioClient, CLSCTX_ALL, nullptr,
+                         reinterpret_cast<void**>(&client_));
+  HcLog("StartCapture: Activate(IAudioClient) = 0x%08lx client=%p", (long)hr, client_);
+  if (FAILED(hr) || !client_) return false;
+
+  hr = client_->GetMixFormat(&mix_format_);
+  HcLog("StartCapture: GetMixFormat = 0x%08lx fmt=%p", (long)hr, mix_format_);
+  if (FAILED(hr) || !mix_format_) return false;
+  HcLog("StartCapture: mix_format: tag=0x%x ch=%u sr=%u bits=%u",
+        (unsigned)mix_format_->wFormatTag, (unsigned)mix_format_->nChannels,
+        (unsigned)mix_format_->nSamplesPerSec,
+        (unsigned)mix_format_->wBitsPerSample);
+  // Nur 16-Bit-PCM und Float32 werden gewandelt (CaptureLoop). Alles andere
+  // (24/32-Bit-Int) wuerde als Int16 fehlgedeutet — lieber sauber ablehnen.
+  if (!IsFloatFormat(mix_format_) && mix_format_->wBitsPerSample != 16) {
+    HcLog("StartCapture: Format nicht unterstuetzt (bits=%u, kein Float)",
+          (unsigned)mix_format_->wBitsPerSample);
+    return false;
+  }
+
+  const REFERENCE_TIME kBufferDuration100Ns = 200 * 10000;
+  // OHNE AUDCLNT_STREAMFLAGS_LOOPBACK: echtes Aufnahmegeraet. Polling wie im
+  // Endpoint-Fallback (capture_event_ bleibt null).
+  hr = client_->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, kBufferDuration100Ns,
+                           0, mix_format_, nullptr);
+  HcLog("StartCapture: client->Initialize(CAPTURE) = 0x%08lx", (long)hr);
   return SUCCEEDED(hr);
 }
 

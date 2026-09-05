@@ -77,6 +77,22 @@ void FlutterWebRTC::HandleMethodCall(
     const EncodableMap constraints = findMap(params, "constraints");
 
     GetDisplayMedia(constraints, std::move(result));
+  } else if (method_call.method_name().compare("honeycordCaptureAudioStart") == 0) {
+#if defined(_WIN32)
+    if (!method_call.arguments()) {
+      result->Error("Bad Arguments", "deviceId fehlt");
+      return;
+    }
+    const EncodableMap params = GetValue<EncodableMap>(*method_call.arguments());
+    const std::string deviceId = findString(params, "deviceId");
+    if (deviceId.empty()) {
+      result->Error("Bad Arguments", "deviceId fehlt");
+      return;
+    }
+    CaptureAudioStart(deviceId, std::move(result));
+#else
+    result->Error("Unsupported", "Kartenton bisher nur unter Windows");
+#endif
   } else if (method_call.method_name().compare("getDesktopSources") == 0) {
     // types: ["screen", "window"]
     if (!method_call.arguments()) {

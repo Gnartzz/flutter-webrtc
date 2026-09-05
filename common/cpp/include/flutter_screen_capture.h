@@ -44,6 +44,11 @@ class FlutterScreenCapture : public MediaListObserver,
   // mediaStream.dispose()). Ohne das lief der Capture-Thread nach Share-Ende
   // fuer immer weiter (ein Thread pro beendetem Share).
   void StopLoopbackForStream(const std::string& stream_id);
+  // ★ HoneyCord (05.09.2026, „Vier Stroeme" Block 1): Ton eines AUFNAHMEGERAETS
+  // (Capture-Karte) als eigener Stream mit einer Audiospur; Dart veroeffentlicht
+  // sie als screenShareAudio. Aufraeumen ueber denselben streamDispose-Weg.
+  void CaptureAudioStart(const std::string& device_id,
+                         std::unique_ptr<MethodResultProxy> result);
 #elif defined(__linux__)
   // Linux-Pendant (PipeWire): gleiche Aufgabe, gleicher Aufrufer.
   void StopLoopbackForStream(const std::string& stream_id);

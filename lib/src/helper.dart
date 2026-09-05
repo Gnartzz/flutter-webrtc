@@ -6,6 +6,7 @@ import 'package:logger/logger.dart';
 
 import '../flutter_webrtc.dart';
 import 'native_logs_listener.dart';
+import 'native/media_stream_impl.dart';
 
 class Helper {
   /// Set Logger object for webrtc;
@@ -214,6 +215,21 @@ class Helper {
     final r = await WebRTC.invokeMethod(
         'honeycordScreenAudio', {'enabled': enabled, 'mix': mix});
     return (r is Map && r['running'] == true);
+  }
+
+  /// HoneyCord (05.09.2026, „Vier Ströme" Block 1): Ton eines AUFNAHMEGERÄTS
+  /// (z. B. der USB-Tonseite einer Capture-Karte) als eigener Stream mit einer
+  /// Audiospur — der Aufrufer veröffentlicht sie als `screenShareAudio`.
+  /// `stream.dispose()` stoppt den Aufnehmer. Bisher nur Windows (WASAPI),
+  /// sonst `null`.
+  static Future<MediaStream?> honeycordCaptureAudioStart(String deviceId) async {
+    if (!WebRTC.platformIsWindows) return null;
+    final r = await WebRTC.invokeMethod(
+        'honeycordCaptureAudioStart', {'deviceId': deviceId});
+    if (r is! Map || r['streamId'] is! String) return null;
+    final stream = MediaStreamNative(r['streamId'] as String, 'local');
+    stream.setMediaTracks(r['audioTracks'], r['videoTracks']);
+    return stream;
   }
 
   /// HoneyCord: Laeuft der Ton der Bildschirmfreigabe gerade?

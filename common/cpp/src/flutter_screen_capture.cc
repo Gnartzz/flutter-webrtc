@@ -187,6 +187,69 @@ void FlutterScreenCapture::GetDesktopSourceThumbnail(
 }
 
 #if defined(_WIN32)
+// ★ HoneyCord (05.09.2026, Block 1 „Vier Stroeme"): Ton eines AUFNAHMEGERAETS
+// (Capture-Karte) als eigener Stream mit EINER Audiospur. Derselbe Weg wie der
+// Bildschirm-Mitschnitt — kCustom-Quelle, WasapiLoopback, Eintrag in
+// wasapi_loopbacks_ unter der Stream-Id, damit mediaStreamDispose den
+// Aufnehmer stoppt (id10-Leak-Fix gilt mit) — nur die Quelle ist ein
+// gewaehltes Endpoint statt des Render-Mixes.
+void FlutterScreenCapture::CaptureAudioStart(const std::string& device_id,
+                                             std::unique_ptr<MethodResultProxy> result) {
+  honeycord::WasapiLogFromPlugin("captureAudioStart: geraet=%s", device_id.c_str());
+  scoped_refptr<RTCAudioSource> audio_source = base_->factory_->CreateAudioSource(
+      "capture-card-audio", RTCAudioSource::SourceType::kCustom);
+  if (!audio_source.get()) {
+    result->Error("captureAudio", "CreateAudioSource fehlgeschlagen");
+    return;
+  }
+  auto audio_uuid = base_->GenerateUUID();
+  scoped_refptr<RTCAudioTrack> audio_track =
+      base_->factory_->CreateAudioTrack(audio_source, audio_uuid.c_str());
+  if (!audio_track.get()) {
+    result->Error("captureAudio", "CreateAudioTrack fehlgeschlagen");
+    return;
+  }
+  // enumerateDevices liefert die Id als UTF-8, WASAPI will UTF-16.
+  std::wstring wid;
+  {
+    const int n = MultiByteToWideChar(CP_UTF8, 0, device_id.c_str(), -1, nullptr, 0);
+    if (n > 1) {
+      wid.resize(static_cast<size_t>(n - 1));
+      MultiByteToWideChar(CP_UTF8, 0, device_id.c_str(), -1, &wid[0], n);
+    }
+  }
+  if (wid.empty()) {
+    result->Error("captureAudio", "deviceId leer");
+    return;
+  }
+  auto loopback = std::make_unique<honeycord::WasapiLoopback>(audio_source, wid);
+  if (!loopback->Start()) {
+    honeycord::WasapiLogFromPlugin("captureAudioStart: Start fehlgeschlagen");
+    result->Error("captureAudio", "Aufnahmegeraet liess sich nicht oeffnen");
+    return;
+  }
+  std::string uuid = base_->GenerateUUID();
+  scoped_refptr<RTCMediaStream> stream = base_->factory_->CreateStream(uuid.c_str());
+  EncodableList audio_tracks;
+  EncodableMap a_info;
+  a_info[EncodableValue("id")] = EncodableValue(audio_track->id().std_string());
+  a_info[EncodableValue("label")] = EncodableValue(std::string("capture-card-audio"));
+  a_info[EncodableValue("kind")] = EncodableValue(audio_track->kind().std_string());
+  a_info[EncodableValue("enabled")] = EncodableValue(audio_track->enabled());
+  audio_tracks.push_back(EncodableValue(a_info));
+  stream->AddTrack(audio_track);
+  base_->local_tracks_[audio_track->id().std_string()] = audio_track;
+  wasapi_loopbacks_[uuid] = std::move(loopback);
+  base_->local_streams_[uuid] = stream;
+  honeycord::WasapiLogFromPlugin("captureAudioStart: ok stream=%s track=%s",
+                                  uuid.c_str(), audio_track->id().std_string().c_str());
+  EncodableMap params;
+  params[EncodableValue("streamId")] = EncodableValue(uuid);
+  params[EncodableValue("audioTracks")] = EncodableValue(audio_tracks);
+  params[EncodableValue("videoTracks")] = EncodableValue(EncodableList());
+  result->Success(EncodableValue(params));
+}
+
 void FlutterScreenCapture::StopLoopbackForStream(const std::string& stream_id) {
   auto it = wasapi_loopbacks_.find(stream_id);
   if (it == wasapi_loopbacks_.end()) return;
