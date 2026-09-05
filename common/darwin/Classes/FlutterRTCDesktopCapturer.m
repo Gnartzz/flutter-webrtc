@@ -1446,6 +1446,10 @@ static NSString *HoneycordUidFuerGeraeteNummer(NSString *nummer) {
     NSLog(@"[geraete-ton] OBS-Weg: Geraet %@ nicht gefunden oder keine Session", deviceId);
     return NO;
   }
+  if ([AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio] != AVAuthorizationStatusAuthorized) {
+    NSLog(@"[geraete-ton] OBS-Weg: keine Mikrofon-Freigabe — Ton bleibt weg, Bild laeuft");
+    return NO;
+  }
   RTCCustomAudioSource *quelle = [[RTCCustomAudioSource alloc] initWithFactory:self.peerConnectionFactory];
   HoneycordScreenAudioRelay *relay = [[HoneycordScreenAudioRelay alloc] init];
   relay.source = quelle;

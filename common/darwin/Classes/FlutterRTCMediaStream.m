@@ -767,12 +767,12 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
                                const double aktiv = HoneycordAktiveFps(fpsDevice);
                                if (aktiv > 0 && fabs(aktiv - zielFps) < 0.05) {
                                  NSLog(@"[hc-fps] nach Start: schon %.3f fps (Ziel %.3f) — kein Neustart (device %@)", aktiv, zielFps, cls);
-                               } else if (self.honeycordTonAufnehmer.count > 0) {
+                               } else if (tonInSession) {
                                  // ★ Laeuft der Ton der Capture-Karte, ist der Neustart des
                                  // Video-Stroms genau das, was die Karte anhaelt (gemessen
                                  // 21:58/22:14/22:26/22:37). Lieber die Vorgabe-Rate behalten
                                  // (LiveKit deckelt die Encoder-Rate ohnehin) als eine tote Karte.
-                                 NSLog(@"[hc-fps] nach Start: %.3f statt %.3f fps — KEIN Neustart, weil Karten-Ton laeuft (device %@)", aktiv, zielFps, cls);
+                                 NSLog(@"[hc-fps] nach Start: %.3f statt %.3f fps — KEIN Neustart, weil der Karten-Ton in dieser Session haengt (device %@)", aktiv, zielFps, cls);
                                } else {
                                  const double jetzt = HoneycordPinnen(fpsDevice, fpsDevice.activeFormat, pinFps, @"nach Start");
                                  NSLog(@"[hc-fps] nach Start: war %.3f, jetzt %.3f fps (Ziel %.3f, device %@)", aktiv, jetzt, zielFps, cls);
@@ -798,7 +798,19 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
       // (Stream-Id aus der Warteschlange oder ueber die Aufnehmer-Liste).
       FlutterWebRTCPlugin* me = weakSelfStop;
       NSDictionary* wartend = me ? me.honeycordTonWartend[videoTrack.trackId] : nil;
-      if (wartend) { [me honeycordCaptureAudioStopFuer:wartend[@"streamId"]]; [me.honeycordTonWartend removeObjectForKey:videoTrack.trackId]; }
+      if (wartend) {
+        NSString* sId = wartend[@"streamId"];
+        NSString* tId = [wartend[@"audioTracks"] firstObject][@"id"];
+        [me honeycordCaptureAudioStopFuer:sId];
+        [me.honeycordTonWartend removeObjectForKey:videoTrack.trackId];
+        // Nicht abgeholter Ton-Stream: Stream/Spur ebenfalls freigeben — aber
+        // ASYNCHRON, denn trackDispose enumeriert gerade `localStreams`
+        // (Pruefbefund 2: „mutated while being enumerated").
+        dispatch_async(dispatch_get_main_queue(), ^{
+          if (tId) [me.localTracks removeObjectForKey:tId];
+          if (sId) [me.localStreams removeObjectForKey:sId];
+        });
+      }
       [capturer stopCaptureWithCompletionHandler:handler];
     };
     // STARK halten, bis die Spur endet — die schwache Referenz im Handler

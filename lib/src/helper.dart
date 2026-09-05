@@ -246,7 +246,9 @@ class Helper {
       final stream = MediaStreamNative(r['streamId'] as String, 'local');
       stream.setMediaTracks(r['audioTracks'], r['videoTracks']);
       return stream;
-    } catch (_) {
+    } catch (e) {
+      // Sichtbar lassen — beim ersten Geraetetest zaehlt der Grund.
+      print('[capture-ton] honeycordCaptureAudioFuerVideo: $e');
       return null;
     }
   }
