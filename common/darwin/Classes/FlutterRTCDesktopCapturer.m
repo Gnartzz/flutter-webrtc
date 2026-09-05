@@ -29,6 +29,7 @@
   BOOL _logged;
   uint64_t _bufferCount;
   int16_t *_chunkBuf;   // interleaved Int16, Größe = capacity * outChannels
+  uint64_t _entries;    // Aufrufzaehler fuer die Log-Kadenz (je Instanz)
   size_t _chunkCap;     // capacity in Frames
   size_t _chunkLen;     // momentan belegte Frames
   size_t _chunkChannels;
@@ -39,8 +40,10 @@
 @implementation HoneycordScreenAudioRelay
 
 - (void)screenCapturerDidOutputAudioBuffer:(CMSampleBufferRef)sampleBuffer {
-  static uint64_t entries = 0;
-  entries++;
+  // Ivar statt Funktions-Statik: seit Block 2 gibt es ZWEI Relais (SCK-Systemton
+  // und Kartenton) auf zwei Queues — eine gemeinsame Statik waere ein Datenwettlauf.
+  _entries++;
+  const uint64_t entries = _entries;
   BOOL diag = (entries == 1 || (entries % 200) == 0);
   if (diag) {
     NSLog(@"[scr-audio relay] entry #%llu source=%@ sampleBuffer=%p",
@@ -282,6 +285,7 @@ static inline BOOL HCIsActiveDisplayId(NSString* sourceId) { return NO; }
 // (z. B. „AppleUSBAudioEngine:UGREEN 35871:UGREEN 35871:PRODUCT:3").
 @interface HoneycordGeraeteTonAufnehmer : NSObject <AVCaptureAudioDataOutputSampleBufferDelegate>
 @property(nonatomic, strong) AVCaptureSession *session;
+@property(nonatomic, strong) AVCaptureAudioDataOutput *ausgang;
 @property(nonatomic, strong) HoneycordScreenAudioRelay *relay;
 @property(nonatomic, strong) RTCCustomAudioSource *source;
 @property(nonatomic, strong) dispatch_queue_t queue;
@@ -293,7 +297,7 @@ static inline BOOL HCIsActiveDisplayId(NSString* sourceId) { return NO; }
 
 @implementation HoneycordGeraeteTonAufnehmer
 
-- (BOOL)startMitGeraet:(AVCaptureDevice *)geraet fehler:(NSError **)fehler {
+- (BOOL)vorbereitenMitGeraet:(AVCaptureDevice *)geraet fehler:(NSError **)fehler {
   NSError *err = nil;
   AVCaptureDeviceInput *eingang = [AVCaptureDeviceInput deviceInputWithDevice:geraet error:&err];
   if (eingang == nil) {
@@ -311,13 +315,13 @@ static inline BOOL HCIsActiveDisplayId(NSString* sourceId) { return NO; }
   }
   [session addInput:eingang];
   AVCaptureAudioDataOutput *ausgang = [[AVCaptureAudioDataOutput alloc] init];
-  // Festes Zielformat fuer das Relais: Float32, 48 kHz, 2 Kanaele, interleaved.
-  // Ein Mono-Geraet wird vom Wandler auf zwei Kanaele gelegt, ein 16-bit-Geraet
-  // (die UGREEN) nach Float gewandelt.
+  // Zielformat fuer das Relais: Float32, 48 kHz, interleaved. Die Kanalzahl
+  // bleibt dem Geraet ueberlassen (Pruefbefund: Mono wuerde der Wandler nicht
+  // sicher auf beide Kanaele legen; das Relais klemmt selbst auf <= 2, und
+  // libwebrtc nimmt Mono). Ein 16-bit-Geraet (die UGREEN) wird nach Float gewandelt.
   ausgang.audioSettings = @{
     AVFormatIDKey : @(kAudioFormatLinearPCM),
     AVSampleRateKey : @48000.0,
-    AVNumberOfChannelsKey : @2,
     AVLinearPCMBitDepthKey : @32,
     AVLinearPCMIsFloatKey : @YES,
     AVLinearPCMIsBigEndianKey : @NO,
@@ -334,10 +338,34 @@ static inline BOOL HCIsActiveDisplayId(NSString* sourceId) { return NO; }
   [session addOutput:ausgang];
   [session commitConfiguration];
   self.session = session;
-  [session startRunning];
-  NSLog(@"[geraete-ton] gestartet: %@ (%@) running=%d", geraet.localizedName, geraet.uniqueID,
-        session.isRunning ? 1 : 0);
-  return session.isRunning;
+  self.ausgang = ausgang;
+  // Asynchrone Fehler und Geraete-Abzug SEHEN (Pruefbefund 7): sonst liefert die
+  // Session einfach nichts mehr, und die Spur bleibt stumm veroeffentlicht.
+  __weak HoneycordGeraeteTonAufnehmer *weakSelf = self;
+  [[NSNotificationCenter defaultCenter] addObserverForName:AVCaptureSessionRuntimeErrorNotification
+                                                    object:session queue:nil
+                                                usingBlock:^(NSNotification *n) {
+    NSLog(@"[geraete-ton] Session-Fehler: %@", n.userInfo[AVCaptureSessionErrorKey]);
+  }];
+  [[NSNotificationCenter defaultCenter] addObserverForName:AVCaptureDeviceWasDisconnectedNotification
+                                                    object:geraet queue:nil
+                                                usingBlock:^(NSNotification *n) {
+    NSLog(@"[geraete-ton] Geraet abgezogen: %@ — Aufnehmer wird gestoppt", geraet.localizedName);
+    [weakSelf stop];
+  }];
+  return YES;
+}
+
+/// `startRunning` blockiert (50-300 ms Geraeteoeffnung) — deshalb NICHT auf dem
+/// Platform-Thread (Pruefbefund 1), sondern im Hintergrund; `fertig` kommt auf Main.
+- (void)startenMitGeraet:(AVCaptureDevice *)geraet fertig:(void (^)(BOOL laeuft))fertig {
+  AVCaptureSession *session = self.session;
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    [session startRunning];
+    const BOOL laeuft = session.isRunning;
+    NSLog(@"[geraete-ton] gestartet: %@ (%@) running=%d", geraet.localizedName, geraet.uniqueID, laeuft ? 1 : 0);
+    dispatch_async(dispatch_get_main_queue(), ^{ fertig(laeuft); });
+  });
 }
 
 - (void)captureOutput:(AVCaptureOutput *)output
@@ -361,10 +389,26 @@ static inline BOOL HCIsActiveDisplayId(NSString* sourceId) { return NO; }
   if (self.gestoppt) return;
   self.gestoppt = YES;
   AVCaptureSession *session = self.session;
+  AVCaptureAudioDataOutput *ausgang = self.ausgang;
+  RTCCustomAudioSource *source = self.source;
+  dispatch_queue_t q = self.queue;
   self.session = nil;
-  [session stopRunning];
-  [self.source stop];
-  NSLog(@"[geraete-ton] gestoppt (%llu Puffer)", (unsigned long long)self.puffer);
+  self.ausgang = nil;
+  [[NSNotificationCenter defaultCenter] removeObserver:self];
+  // Apples dokumentierter Weg, Rueckrufe zu beenden — danach kommt kein Puffer mehr.
+  [ausgang setSampleBufferDelegate:nil queue:nil];
+  const uint64_t puffer = self.puffer;
+  // `stopRunning` blockiert -> Hintergrund; `[source stop]` erst AUF der Delegate-
+  // Queue, damit ein bereits laufender Rueckruf sein `pushData` beendet hat
+  // (Pruefbefund 2: deterministisch statt „geht in der Praxis gut").
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    [session stopRunning];
+    if (q) {
+      dispatch_async(q, ^{ [source stop]; NSLog(@"[geraete-ton] gestoppt (%llu Puffer)", (unsigned long long)puffer); });
+    } else {
+      [source stop];
+    }
+  });
 }
 
 @end
@@ -1252,39 +1296,50 @@ static NSData* HCThumbJpegFromCGImage(CGImageRef img, CGFloat maxW) {
     auf.relay = relay;
     auf.source = quelle;
     NSError *fehler = nil;
-    if (![auf startMitGeraet:geraet fehler:&fehler]) {
+    if (![auf vorbereitenMitGeraet:geraet fehler:&fehler]) {
       [quelle stop];
-      NSLog(@"[geraete-ton] Start fehlgeschlagen: %@", fehler.localizedDescription);
+      NSLog(@"[geraete-ton] Vorbereitung fehlgeschlagen: %@", fehler.localizedDescription);
       result([FlutterError errorWithCode:@"captureAudio"
                                  message:@"Aufnahmegeraet liess sich nicht oeffnen"
                                  details:fehler.localizedDescription]);
       return;
     }
-    NSString *streamId = [[NSUUID UUID] UUIDString];
-    NSString *trackId = [[NSUUID UUID] UUIDString];
-    RTCMediaStream *stream = [me.peerConnectionFactory mediaStreamWithStreamId:streamId];
-    RTCAudioTrack *spur = [me.peerConnectionFactory audioTrackWithSource:quelle trackId:trackId];
-    [stream addAudioTrack:spur];
-    LocalAudioTrack *lokal = [[LocalAudioTrack alloc] initWithTrack:spur];
-    [me.localTracks setObject:lokal forKey:trackId];
-    me.localStreams[streamId] = stream;
-    auf.streamId = streamId;
-    auf.trackId = trackId;
-    me.honeycordTonAufnehmer[streamId] = auf;
-    me.honeycordTonAufnehmer[trackId] = auf;
-    NSLog(@"[geraete-ton] Stream %@ Spur %@ fuer %@", streamId, trackId, geraet.localizedName);
-    result(@{
-      @"streamId" : streamId,
-      @"audioTracks" : @[ @{
-        @"id" : trackId,
-        @"kind" : spur.kind,
-        @"label" : @"capture-card-audio",
-        @"enabled" : @(spur.isEnabled),
-        @"remote" : @(NO),
-        @"readyState" : @"live",
-      } ],
-      @"videoTracks" : @[],
-    });
+    // Start im Hintergrund; Registrierung und `result` danach auf Main.
+    [auf startenMitGeraet:geraet fertig:^(BOOL laeuft) {
+      FlutterWebRTCPlugin *me2 = weakSelf;
+      if (!laeuft || me2 == nil) {
+        [auf stop];
+        result([FlutterError errorWithCode:@"captureAudio"
+                                   message:@"Aufnahmegeraet startete nicht"
+                                   details:geraet.localizedName]);
+        return;
+      }
+      NSString *streamId = [[NSUUID UUID] UUIDString];
+      NSString *trackId = [[NSUUID UUID] UUIDString];
+      RTCMediaStream *stream = [me2.peerConnectionFactory mediaStreamWithStreamId:streamId];
+      RTCAudioTrack *spur = [me2.peerConnectionFactory audioTrackWithSource:quelle trackId:trackId];
+      [stream addAudioTrack:spur];
+      LocalAudioTrack *lokal = [[LocalAudioTrack alloc] initWithTrack:spur];
+      [me2.localTracks setObject:lokal forKey:trackId];
+      me2.localStreams[streamId] = stream;
+      auf.streamId = streamId;
+      auf.trackId = trackId;
+      me2.honeycordTonAufnehmer[streamId] = auf;
+      me2.honeycordTonAufnehmer[trackId] = auf;
+      NSLog(@"[geraete-ton] Stream %@ Spur %@ fuer %@", streamId, trackId, geraet.localizedName);
+      result(@{
+        @"streamId" : streamId,
+        @"audioTracks" : @[ @{
+          @"id" : trackId,
+          @"kind" : spur.kind,
+          @"label" : @"capture-card-audio",
+          @"enabled" : @(spur.isEnabled),
+          @"remote" : @(NO),
+          @"readyState" : @"live",
+        } ],
+        @"videoTracks" : @[],
+      });
+    }];
   };
   AVAuthorizationStatus st = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
   if (st == AVAuthorizationStatusAuthorized) {
