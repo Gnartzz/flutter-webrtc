@@ -25,5 +25,7 @@
 - (void)honeycordCaptureAudioStart:(nonnull NSString*)deviceId result:(nonnull FlutterResult)result;
 /// Aufnehmer eines solchen Streams stoppen (Stream- oder Track-Id). Idempotent.
 - (void)honeycordCaptureAudioStopFuer:(nonnull NSString*)streamOderTrackId;
+/// OBS-Weg: Ton der Karte in die VIDEO-Session des Capturers legen (vor dem Start).
+- (BOOL)honeycordTonInSession:(nonnull AVCaptureSession*)session geraetId:(nonnull NSString*)deviceId fuerVideoTrack:(nonnull NSString*)videoTrackId;
 
 @end

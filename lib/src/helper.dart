@@ -232,6 +232,25 @@ class Helper {
     return stream;
   }
 
+  /// HoneyCord (Block 2, OBS-Weg, 05.09.2026): Der Ton der Capture-Karte wurde
+  /// mit dem Bild in EINER Capture-Session gestartet (Schluessel
+  /// `honeycordTonGeraet` in den Video-Constraints von getUserMedia, macOS).
+  /// Hier den fertigen Ton-Stream zur Videospur abholen; `stream.dispose()`
+  /// schliesst die Quelle. `null`, wenn es keinen gibt.
+  static Future<MediaStream?> honeycordCaptureAudioFuerVideo(String videoTrackId) async {
+    if (!WebRTC.platformIsMacOS) return null;
+    try {
+      final r = await WebRTC.invokeMethod(
+          'honeycordCaptureAudioFuerVideo', {'videoTrackId': videoTrackId});
+      if (r is! Map || r['streamId'] is! String) return null;
+      final stream = MediaStreamNative(r['streamId'] as String, 'local');
+      stream.setMediaTracks(r['audioTracks'], r['videoTracks']);
+      return stream;
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// HoneyCord: Laeuft der Ton der Bildschirmfreigabe gerade?
   static Future<Map<String, bool>> screenAudioState() async {
     if (!WebRTC.platformIsAndroid) return {'wanted': false, 'running': false};

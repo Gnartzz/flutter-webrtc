@@ -298,6 +298,9 @@ static inline BOOL HCIsActiveDisplayId(NSString* sourceId) { return NO; }
 /// NICHT (Apple: das zurueckgegebene Token muss entfernt werden; Pruefbefund 2. Runde).
 @property(nonatomic, strong) id beobachterFehler;
 @property(nonatomic, strong) id beobachterAbzug;
+/// OBS-Weg: Eingang/Ausgang liegen in der VIDEO-Session des Capturers — der
+/// Aufnehmer startet/stoppt die Session dann NICHT selbst.
+@property(nonatomic) BOOL fremdeSession;
 @property(atomic) BOOL gestoppt;
 @property(nonatomic) uint64_t puffer;
 @end
@@ -305,6 +308,12 @@ static inline BOOL HCIsActiveDisplayId(NSString* sourceId) { return NO; }
 @implementation HoneycordGeraeteTonAufnehmer
 
 - (BOOL)vorbereitenMitGeraet:(AVCaptureDevice *)geraet fehler:(NSError **)fehler {
+  return [self vorbereitenMitGeraet:geraet inSession:nil fehler:fehler];
+}
+
+/// `inSession` != nil: Ton-Eingang/-Ausgang in DIESE (Video-)Session haengen, nicht
+/// in eine eigene — OBS-Weg. Die Session startet dann der Capturer.
+- (BOOL)vorbereitenMitGeraet:(AVCaptureDevice *)geraet inSession:(AVCaptureSession *)fremd fehler:(NSError **)fehler {
   NSError *err = nil;
   AVCaptureDeviceInput *eingang = [AVCaptureDeviceInput deviceInputWithDevice:geraet error:&err];
   if (eingang == nil) {
@@ -312,7 +321,8 @@ static inline BOOL HCIsActiveDisplayId(NSString* sourceId) { return NO; }
                                                 userInfo:@{NSLocalizedDescriptionKey: @"Eingang liess sich nicht anlegen"}];
     return NO;
   }
-  AVCaptureSession *session = [[AVCaptureSession alloc] init];
+  self.fremdeSession = (fremd != nil);
+  AVCaptureSession *session = fremd ?: [[AVCaptureSession alloc] init];
   [session beginConfiguration];
   if (![session canAddInput:eingang]) {
     [session commitConfiguration];
@@ -417,6 +427,17 @@ static inline BOOL HCIsActiveDisplayId(NSString* sourceId) { return NO; }
   // Apples dokumentierter Weg, Rueckrufe zu beenden — danach kommt kein Puffer mehr.
   [ausgang setSampleBufferDelegate:nil queue:nil];
   const uint64_t puffer = self.puffer;
+  if (self.fremdeSession) {
+    // Die Video-Session gehoert dem Capturer: NICHT stoppen, Eingang/Ausgang
+    // drin lassen (Entfernen im Lauf = Rekonfiguration = UVC-Neustart-Risiko).
+    // Nur die Quelle schliessen — auf der Delegate-Queue nach dem letzten Rueckruf.
+    if (q) {
+      dispatch_async(q, ^{ [source stop]; NSLog(@"[geraete-ton] gestoppt (fremde Session, %llu Puffer)", (unsigned long long)puffer); });
+    } else {
+      [source stop];
+    }
+    return;
+  }
   // `stopRunning` blockiert -> Hintergrund; `[source stop]` erst AUF der Delegate-
   // Queue, damit ein bereits laufender Rueckruf sein `pushData` beendet hat
   // (Pruefbefund 2: deterministisch statt „geht in der Praxis gut").
@@ -1408,6 +1429,63 @@ static NSString *HoneycordUidFuerGeraeteNummer(NSString *nummer) {
   }
 #else
   result([FlutterError errorWithCode:@"captureAudio" message:@"nur macOS" details:nil]);
+#endif
+}
+
+/// OBS-Weg (05.09.2026 nachts, GEMESSEN: zwei getrennte Sessions auf demselben
+/// USB-Geraet → Bild 0 Pakete, auch beim Einzelstart; OBS haelt Bild und Ton der
+/// Karte in EINER Session): Ton-Eingang und -Ausgang der Karte in die VIDEO-
+/// Session des Capturers haengen, BEVOR der Capturer startet — der Capturer
+/// entfernt beim Start nur Eingaenge desselben (Video-)Geraets, der Ton-Eingang
+/// bleibt, und `startRunning` faehrt beides zusammen an. Der fertige Ton-Stream
+/// wartet unter der Video-Track-Id auf `honeycordCaptureAudioFuerVideo`.
+- (BOOL)honeycordTonInSession:(AVCaptureSession *)session geraetId:(NSString *)deviceId fuerVideoTrack:(NSString *)videoTrackId {
+#if TARGET_OS_OSX
+  AVCaptureDevice *geraet = [self honeycordTonGeraetFuer:deviceId];
+  if (geraet == nil || session == nil) {
+    NSLog(@"[geraete-ton] OBS-Weg: Geraet %@ nicht gefunden oder keine Session", deviceId);
+    return NO;
+  }
+  RTCCustomAudioSource *quelle = [[RTCCustomAudioSource alloc] initWithFactory:self.peerConnectionFactory];
+  HoneycordScreenAudioRelay *relay = [[HoneycordScreenAudioRelay alloc] init];
+  relay.source = quelle;
+  HoneycordGeraeteTonAufnehmer *auf = [[HoneycordGeraeteTonAufnehmer alloc] init];
+  auf.relay = relay;
+  auf.source = quelle;
+  NSError *fehler = nil;
+  if (![auf vorbereitenMitGeraet:geraet inSession:session fehler:&fehler]) {
+    [quelle stop];
+    NSLog(@"[geraete-ton] OBS-Weg: Vorbereitung fehlgeschlagen: %@", fehler.localizedDescription);
+    return NO;
+  }
+  NSString *streamId = [[NSUUID UUID] UUIDString];
+  NSString *trackId = [[NSUUID UUID] UUIDString];
+  RTCMediaStream *stream = [self.peerConnectionFactory mediaStreamWithStreamId:streamId];
+  RTCAudioTrack *spur = [self.peerConnectionFactory audioTrackWithSource:quelle trackId:trackId];
+  [stream addAudioTrack:spur];
+  LocalAudioTrack *lokal = [[LocalAudioTrack alloc] initWithTrack:spur];
+  [self.localTracks setObject:lokal forKey:trackId];
+  self.localStreams[streamId] = stream;
+  auf.streamId = streamId;
+  auf.trackId = trackId;
+  self.honeycordTonAufnehmer[streamId] = auf;
+  self.honeycordTonAufnehmer[trackId] = auf;
+  self.honeycordTonWartend[videoTrackId] = @{
+    @"streamId" : streamId,
+    @"audioTracks" : @[ @{
+      @"id" : trackId,
+      @"kind" : spur.kind,
+      @"label" : @"capture-card-audio",
+      @"enabled" : @(spur.isEnabled),
+      @"remote" : @(NO),
+      @"readyState" : @"live",
+    } ],
+    @"videoTracks" : @[],
+  };
+  NSLog(@"[geraete-ton] OBS-Weg: %@ in der Video-Session (Stream %@, Spur %@, Video %@)", geraet.localizedName, streamId, trackId, videoTrackId);
+  return YES;
+#else
+  return NO;
 #endif
 }
 

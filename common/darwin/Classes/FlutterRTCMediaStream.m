@@ -3,6 +3,7 @@
 #import "CameraUtils.h"
 #import "FlutterRTCFrameCapturer.h"
 #import "FlutterRTCMediaStream.h"
+#import "FlutterRTCDesktopCapturer.h"
 #import "FlutterRTCPeerConnection.h"
 #import "VideoProcessingAdapter.h"
 #import "LocalVideoTrack.h"
@@ -727,6 +728,18 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
       NSLog(@"[hc-fps] vorab aktiv %.3f fps", vorab);
       [videoDevice unlockForConfiguration];
     }
+    // ★ OBS-Weg (05.09. nachts): Ton der Capture-Karte in DIESELBE Session wie das
+    // Bild, BEVOR der Capturer startet. Die Video-Track-Id entsteht deshalb schon
+    // hier (sie war vorher erst nach dem Start vergeben).
+    NSString* trackUUID = [[NSUUID UUID] UUIDString];
+    NSString* tonGeraet = videoConstraints[@"honeycordTonGeraet"];
+    BOOL tonInSession = NO;
+#if TARGET_OS_OSX
+    if ([tonGeraet isKindOfClass:[NSString class]] && tonGeraet.length > 0) {
+      tonInSession = [self honeycordTonInSession:self.videoCapturer.captureSession geraetId:tonGeraet fuerVideoTrack:trackUUID];
+      NSLog(@"[geraete-ton] OBS-Weg vor dem Start: %@", tonInSession ? @"eingehaengt" : @"NICHT eingehaengt");
+    }
+#endif
     HoneycordFormatWaechter* waechter = (pinFps > 0)
         ? [[HoneycordFormatWaechter alloc] initMitGeraet:videoDevice session:self.videoCapturer.captureSession zielFps:pinFps] : nil;
     [self.videoCapturer startCaptureWithDevice:videoDevice
@@ -773,14 +786,19 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
                                [fpsDevice unlockForConfiguration];
                              }];
 
-    NSString* trackUUID = [[NSUUID UUID] UUIDString];
     RTCVideoTrack* videoTrack = [self.peerConnectionFactory videoTrackWithSource:videoSource
                                                                         trackId:trackUUID];
     LocalVideoTrack *localVideoTrack = [[LocalVideoTrack alloc] initWithTrack:videoTrack videoProcessing:videoProcessingAdapter];
       
     __weak RTCCameraVideoCapturer* capturer = self.videoCapturer;
+    __weak FlutterWebRTCPlugin* weakSelfStop = self;
     self.videoCapturerStopHandlers[videoTrack.trackId] = ^(CompletionHandler handler) {
       NSLog(@"Stop video capturer, trackID %@", videoTrack.trackId);
+      // OBS-Weg: der Karten-Ton haengt in dieser Session — Quelle mit schliessen
+      // (Stream-Id aus der Warteschlange oder ueber die Aufnehmer-Liste).
+      FlutterWebRTCPlugin* me = weakSelfStop;
+      NSDictionary* wartend = me ? me.honeycordTonWartend[videoTrack.trackId] : nil;
+      if (wartend) { [me honeycordCaptureAudioStopFuer:wartend[@"streamId"]]; [me.honeycordTonWartend removeObjectForKey:videoTrack.trackId]; }
       [capturer stopCaptureWithCompletionHandler:handler];
     };
     // STARK halten, bis die Spur endet — die schwache Referenz im Handler
