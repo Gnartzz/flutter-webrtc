@@ -117,6 +117,55 @@ static double HoneycordPinnen(AVCaptureDevice* d, AVCaptureDeviceFormat* format,
   return gepinnt ? HoneycordAktiveFps(d) : 0.0;
 }
 
+
+// ★ GEMESSEN (Auric 22:26, Alpha 2.6.148): der Vorab-Pin (59,94 fps) ueberlebt den
+// Capturer-Start NICHT — `updateDeviceCaptureFormat` setzt `activeFormat = format`,
+// und macOS setzt dabei die Frame-Dauern auf die Format-Vorgabe zurueck (120 fps);
+// erst unser Nach-Pin holte 59,94 zurueck = der zweite UVC-Start, der die Karte
+// neben laufendem Ton anhaelt. Deshalb jetzt ein KVO-Beobachter auf `activeFormat`:
+// er feuert SYNCHRON im Setter des Capturers (auf dessen Queue, Geraet bereits
+// gesperrt) und setzt die exakte Bereichsdauer, BEVOR `startRunning` laeuft.
+// Ergebnis: EIN UVC-Start mit der Zielrate, wie OBS.
+@interface HoneycordFormatWaechter : NSObject
+@property(nonatomic, strong) AVCaptureDevice* geraet;
+@property(nonatomic) NSInteger zielFps;
+@property(nonatomic) BOOL aktiv;
+@property(nonatomic) NSUInteger treffer;
+- (instancetype)initMitGeraet:(AVCaptureDevice*)geraet zielFps:(NSInteger)fps;
+- (void)beenden;
+@end
+
+@implementation HoneycordFormatWaechter
+- (instancetype)initMitGeraet:(AVCaptureDevice*)geraet zielFps:(NSInteger)fps {
+  if ((self = [super init])) {
+    _geraet = geraet;
+    _zielFps = fps;
+    @try {
+      [geraet addObserver:self forKeyPath:@"activeFormat" options:NSKeyValueObservingOptionNew context:NULL];
+      _aktiv = YES;
+    } @catch (NSException* e) {
+      NSLog(@"[hc-fps] Waechter: addObserver warf: %@", e.reason);
+    }
+  }
+  return self;
+}
+- (void)observeValueForKeyPath:(NSString*)keyPath ofObject:(id)object change:(NSDictionary*)change context:(void*)context {
+  if (![keyPath isEqualToString:@"activeFormat"] || !self.aktiv) return;
+  AVCaptureDevice* d = (AVCaptureDevice*)object;
+  self.treffer++;
+  // Das Geraet ist im Setter des Capturers gesperrt (lockForConfiguration im
+  // startCaptureWithDevice-Block). Ohne Sperre wirft der Setter — @try in HoneycordPinnen.
+  double jetzt = HoneycordPinnen(d, d.activeFormat, self.zielFps, @"waechter");
+  NSLog(@"[hc-fps] waechter #%lu: activeFormat gesetzt -> %.3f fps", (unsigned long)self.treffer, jetzt);
+}
+- (void)beenden {
+  if (!self.aktiv) return;
+  self.aktiv = NO;
+  @try { [self.geraet removeObserver:self forKeyPath:@"activeFormat"]; } @catch (NSException* e) {}
+}
+- (void)dealloc { [self beenden]; }
+@end
+
 @implementation FlutterWebRTCPlugin (RTCMediaStream)
 
 /**
@@ -647,10 +696,14 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
       NSLog(@"[hc-fps] vorab aktiv %.3f fps", vorab);
       [videoDevice unlockForConfiguration];
     }
+    HoneycordFormatWaechter* waechter = (pinFps > 0)
+        ? [[HoneycordFormatWaechter alloc] initMitGeraet:videoDevice zielFps:pinFps] : nil;
     [self.videoCapturer startCaptureWithDevice:videoDevice
                                         format:selectedFormat
                                            fps:selectedFps
                              completionHandler:^(NSError* error) {
+                               // Der Start ist durch (Session laeuft) — Beobachter abmelden.
+                               [waechter beenden];
                                if (error) {
                                  NSLog(@"Start capture error: %@", [error localizedDescription]);
                                  return;
