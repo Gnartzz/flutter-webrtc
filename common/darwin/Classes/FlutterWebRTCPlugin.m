@@ -699,9 +699,15 @@ static FlutterWebRTCPlugin *sharedSingleton;
         if (stopHandler) {
           shouldCallResult = NO;
           stopHandler(^{
-            NSLog(@"video capturer stopped, trackID = %@", videoTrack.trackId);
-            [self capturerFreigebenFuerTrack:videoTrack.trackId];
-            result(nil);
+            // ★ Der Completion-Block kommt von der Capture-Queue. Woerterbuch
+            // und `result` gehoeren auf den Main-Thread — getUserVideo schreibt
+            // dort gleichzeitig (Pruefbefund 05.09.; `result` vom Hintergrund-
+            // Faden war schon vorher ein Verstoss gegen Flutters Platform-Thread).
+            dispatch_async(dispatch_get_main_queue(), ^{
+              NSLog(@"video capturer stopped, trackID = %@", videoTrack.trackId);
+              [self capturerFreigebenFuerTrack:videoTrack.trackId];
+              result(nil);
+            });
           });
           [self.videoCapturerStopHandlers removeObjectForKey:videoTrack.trackId];
         }
@@ -798,8 +804,10 @@ static FlutterWebRTCPlugin *sharedSingleton;
           CapturerStopHandler stopHandler = self.videoCapturerStopHandlers[track.trackId];
           if (stopHandler) {
             stopHandler(^{
-              NSLog(@"video capturer stopped, trackID = %@", track.trackId);
-              [self capturerFreigebenFuerTrack:track.trackId];
+              dispatch_async(dispatch_get_main_queue(), ^{
+                NSLog(@"video capturer stopped, trackID = %@", track.trackId);
+                [self capturerFreigebenFuerTrack:track.trackId];
+              });
             });
             [self.videoCapturerStopHandlers removeObjectForKey:track.trackId];
           }
