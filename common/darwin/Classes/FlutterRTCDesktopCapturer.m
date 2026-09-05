@@ -291,6 +291,10 @@ static inline BOOL HCIsActiveDisplayId(NSString* sourceId) { return NO; }
 @property(nonatomic, strong) dispatch_queue_t queue;
 @property(nonatomic, copy) NSString *streamId;
 @property(nonatomic, copy) NSString *trackId;
+/// Token der Block-Beobachter — `removeObserver:self` entfernt Block-Beobachter
+/// NICHT (Apple: das zurueckgegebene Token muss entfernt werden; Pruefbefund 2. Runde).
+@property(nonatomic, strong) id beobachterFehler;
+@property(nonatomic, strong) id beobachterAbzug;
 @property(atomic) BOOL gestoppt;
 @property(nonatomic) uint64_t puffer;
 @end
@@ -342,18 +346,30 @@ static inline BOOL HCIsActiveDisplayId(NSString* sourceId) { return NO; }
   // Asynchrone Fehler und Geraete-Abzug SEHEN (Pruefbefund 7): sonst liefert die
   // Session einfach nichts mehr, und die Spur bleibt stumm veroeffentlicht.
   __weak HoneycordGeraeteTonAufnehmer *weakSelf = self;
-  [[NSNotificationCenter defaultCenter] addObserverForName:AVCaptureSessionRuntimeErrorNotification
-                                                    object:session queue:nil
-                                                usingBlock:^(NSNotification *n) {
+  NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+  // Zustellung auf Main — `stop` laeuft sonst parallel zu einem `stop` von Main.
+  self.beobachterFehler = [nc addObserverForName:AVCaptureSessionRuntimeErrorNotification
+                                          object:session queue:[NSOperationQueue mainQueue]
+                                      usingBlock:^(NSNotification *n) {
     NSLog(@"[geraete-ton] Session-Fehler: %@", n.userInfo[AVCaptureSessionErrorKey]);
   }];
-  [[NSNotificationCenter defaultCenter] addObserverForName:AVCaptureDeviceWasDisconnectedNotification
-                                                    object:geraet queue:nil
-                                                usingBlock:^(NSNotification *n) {
+  self.beobachterAbzug = [nc addObserverForName:AVCaptureDeviceWasDisconnectedNotification
+                                         object:geraet queue:[NSOperationQueue mainQueue]
+                                     usingBlock:^(NSNotification *n) {
     NSLog(@"[geraete-ton] Geraet abgezogen: %@ — Aufnehmer wird gestoppt", geraet.localizedName);
     [weakSelf stop];
   }];
   return YES;
+}
+
+- (void)beobachterEntfernen {
+  NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+  if (self.beobachterFehler) { [nc removeObserver:self.beobachterFehler]; self.beobachterFehler = nil; }
+  if (self.beobachterAbzug)  { [nc removeObserver:self.beobachterAbzug];  self.beobachterAbzug  = nil; }
+}
+
+- (void)dealloc {
+  [self beobachterEntfernen];
 }
 
 /// `startRunning` blockiert (50-300 ms Geraeteoeffnung) — deshalb NICHT auf dem
@@ -394,7 +410,7 @@ static inline BOOL HCIsActiveDisplayId(NSString* sourceId) { return NO; }
   dispatch_queue_t q = self.queue;
   self.session = nil;
   self.ausgang = nil;
-  [[NSNotificationCenter defaultCenter] removeObserver:self];
+  [self beobachterEntfernen];
   // Apples dokumentierter Weg, Rueckrufe zu beenden — danach kommt kein Puffer mehr.
   [ausgang setSampleBufferDelegate:nil queue:nil];
   const uint64_t puffer = self.puffer;

@@ -1731,8 +1731,8 @@ static FlutterWebRTCPlugin *sharedSingleton;
 - (void)dealloc {
   // HoneyCord: laufende Geraete-Ton-Aufnehmer stoppen (Hot-Restart liesse sie
   // sonst samt Session weiterlaufen — Pruefbefund 3).
-  for (id a in [self.honeycordTonAufnehmer.allValues copy]) {
-    if ([a respondsToSelector:@selector(stop)]) [a performSelector:@selector(stop)];
+  for (NSString *k in [self.honeycordTonAufnehmer.allKeys copy]) {
+    [self honeycordCaptureAudioStopFuer:k];   // idempotent, raeumt beide Schluessel
   }
   [self.honeycordTonAufnehmer removeAllObjects];
   [_localTracks removeAllObjects];
