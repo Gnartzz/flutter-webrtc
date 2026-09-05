@@ -202,6 +202,7 @@ static FlutterWebRTCPlugin *sharedSingleton;
   self.keyProviders = [NSMutableDictionary new];
   self.videoCapturerStopHandlers = [NSMutableDictionary new];
   self.videoCapturers = [NSMutableDictionary new];
+  self.honeycordTonAufnehmer = [NSMutableDictionary new];
   self.recorders = [NSMutableDictionary new];
 #if TARGET_OS_IPHONE
   self.focusMode = @"locked";
@@ -414,6 +415,12 @@ static FlutterWebRTCPlugin *sharedSingleton;
     NSDictionary* argsMap = call.arguments;
     NSDictionary* constraints = argsMap[@"constraints"];
     [self getDisplayMedia:constraints result:result];
+  } else if ([@"honeycordCaptureAudioStart" isEqualToString:call.method]) {
+    // HoneyCord Block 2: Ton der Capture-Karte (macOS). Windows hat denselben
+    // Methodennamen in flutter_webrtc.cc (WASAPI); hier AVCaptureSession.
+    NSDictionary* argsMap = call.arguments;
+    NSString* deviceId = argsMap[@"deviceId"];
+    [self honeycordCaptureAudioStart:(deviceId ?: @"") result:result];
   } else if ([@"requestCapturePermission" isEqualToString:call.method]) {
 #if TARGET_OS_OSX || TARGET_OS_MACCATALYST
     if (@available(macOS 10.15, macCatalyst 13.1, *)) {
@@ -715,6 +722,9 @@ static FlutterWebRTCPlugin *sharedSingleton;
       for (RTCAudioTrack* track in stream.audioTracks) {
         [_localTracks removeObjectForKey:track.trackId];
       }
+      // HoneyCord: Geraete-Ton-Aufnehmer dieses Streams mit beenden (Windows:
+      // StopLoopbackForStream an derselben Stelle).
+      [self honeycordCaptureAudioStopFuer:streamId];
       [self.localStreams removeObjectForKey:streamId];
       [self deactiveRtcAudioSession];
     }
@@ -796,6 +806,7 @@ static FlutterWebRTCPlugin *sharedSingleton;
         if ([trackId isEqualToString:track.trackId]) {
           [stream removeAudioTrack:track];
           audioTrack = YES;
+          [self honeycordCaptureAudioStopFuer:trackId];   // HoneyCord: Karten-Ton
         }
       }
       for (RTCVideoTrack* track in stream.videoTracks) {

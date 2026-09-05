@@ -263,6 +263,113 @@ static BOOL HCIsActiveDisplayId(NSString* sourceId) {
 static inline BOOL HCIsActiveDisplayId(NSString* sourceId) { return NO; }
 #endif
 
+
+#if TARGET_OS_OSX
+// ★ HoneyCord Block 2 („Vier Stroeme", 05.09.2026): Ton eines AUFNAHMEGERAETS —
+// die USB-Tonseite einer HDMI-Capture-Karte — als eigener Stream, den die App
+// als `screenShareAudio` veroeffentlicht (Kartenton an der Karten-Kachel, mit
+// eigenem Regler beim Zuhoerer). Windows macht dasselbe ueber WASAPI
+// (`FlutterScreenCapture::CaptureAudioStart`), hier AVCaptureSession +
+// AVCaptureAudioDataOutput. Der Weg in libwebrtc ist derselbe wie beim
+// SCK-Systemton: `HoneycordScreenAudioRelay` wandelt Float32 in Int16 und
+// pusht 10-ms-Bloecke in eine RTCCustomAudioSource. Deshalb wird die Ausgabe
+// auf Float32/48 kHz/2 Kanaele festgelegt — GEMESSEN liefert die UGREEN 35871
+// nativ 48 kHz, 2 Kanaele, 16-bit Int; der Wandler der AudioDataOutput macht
+// daraus Float, und das Relais braucht nichts Neues.
+//
+// Kennungen: enumerateDevices liefert auf macOS `RTCIODevice.deviceId` = die
+// CoreAudio-UID, und die ist GEMESSEN wortgleich mit `AVCaptureDevice.uniqueID`
+// (z. B. „AppleUSBAudioEngine:UGREEN 35871:UGREEN 35871:PRODUCT:3").
+@interface HoneycordGeraeteTonAufnehmer : NSObject <AVCaptureAudioDataOutputSampleBufferDelegate>
+@property(nonatomic, strong) AVCaptureSession *session;
+@property(nonatomic, strong) HoneycordScreenAudioRelay *relay;
+@property(nonatomic, strong) RTCCustomAudioSource *source;
+@property(nonatomic, strong) dispatch_queue_t queue;
+@property(nonatomic, copy) NSString *streamId;
+@property(nonatomic, copy) NSString *trackId;
+@property(atomic) BOOL gestoppt;
+@property(nonatomic) uint64_t puffer;
+@end
+
+@implementation HoneycordGeraeteTonAufnehmer
+
+- (BOOL)startMitGeraet:(AVCaptureDevice *)geraet fehler:(NSError **)fehler {
+  NSError *err = nil;
+  AVCaptureDeviceInput *eingang = [AVCaptureDeviceInput deviceInputWithDevice:geraet error:&err];
+  if (eingang == nil) {
+    if (fehler) *fehler = err ?: [NSError errorWithDomain:@"honeycord" code:1
+                                                userInfo:@{NSLocalizedDescriptionKey: @"Eingang liess sich nicht anlegen"}];
+    return NO;
+  }
+  AVCaptureSession *session = [[AVCaptureSession alloc] init];
+  [session beginConfiguration];
+  if (![session canAddInput:eingang]) {
+    [session commitConfiguration];
+    if (fehler) *fehler = [NSError errorWithDomain:@"honeycord" code:2
+                                          userInfo:@{NSLocalizedDescriptionKey: @"Session nimmt den Eingang nicht"}];
+    return NO;
+  }
+  [session addInput:eingang];
+  AVCaptureAudioDataOutput *ausgang = [[AVCaptureAudioDataOutput alloc] init];
+  // Festes Zielformat fuer das Relais: Float32, 48 kHz, 2 Kanaele, interleaved.
+  // Ein Mono-Geraet wird vom Wandler auf zwei Kanaele gelegt, ein 16-bit-Geraet
+  // (die UGREEN) nach Float gewandelt.
+  ausgang.audioSettings = @{
+    AVFormatIDKey : @(kAudioFormatLinearPCM),
+    AVSampleRateKey : @48000.0,
+    AVNumberOfChannelsKey : @2,
+    AVLinearPCMBitDepthKey : @32,
+    AVLinearPCMIsFloatKey : @YES,
+    AVLinearPCMIsBigEndianKey : @NO,
+    AVLinearPCMIsNonInterleaved : @NO,
+  };
+  self.queue = dispatch_queue_create("honeycord.geraeteton", DISPATCH_QUEUE_SERIAL);
+  [ausgang setSampleBufferDelegate:self queue:self.queue];
+  if (![session canAddOutput:ausgang]) {
+    [session commitConfiguration];
+    if (fehler) *fehler = [NSError errorWithDomain:@"honeycord" code:3
+                                          userInfo:@{NSLocalizedDescriptionKey: @"Session nimmt den Ausgang nicht"}];
+    return NO;
+  }
+  [session addOutput:ausgang];
+  [session commitConfiguration];
+  self.session = session;
+  [session startRunning];
+  NSLog(@"[geraete-ton] gestartet: %@ (%@) running=%d", geraet.localizedName, geraet.uniqueID,
+        session.isRunning ? 1 : 0);
+  return session.isRunning;
+}
+
+- (void)captureOutput:(AVCaptureOutput *)output
+    didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
+           fromConnection:(AVCaptureConnection *)connection {
+  if (self.gestoppt) return;
+  self.puffer++;
+  if (self.puffer == 1 || (self.puffer % 500) == 0) {
+    CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(sampleBuffer);
+    const AudioStreamBasicDescription *asbd = fmt ? CMAudioFormatDescriptionGetStreamBasicDescription(fmt) : NULL;
+    NSLog(@"[geraete-ton] Puffer #%llu frames=%lld sr=%.0f ch=%u flags=0x%x",
+          (unsigned long long)self.puffer, (long long)CMSampleBufferGetNumSamples(sampleBuffer),
+          asbd ? asbd->mSampleRate : 0.0, asbd ? (unsigned)asbd->mChannelsPerFrame : 0u,
+          asbd ? (unsigned)asbd->mFormatFlags : 0u);
+  }
+  // Dasselbe Relais wie der SCK-Systemton: Float -> Int16, 10-ms-Bloecke, push.
+  [self.relay screenCapturerDidOutputAudioBuffer:sampleBuffer];
+}
+
+- (void)stop {
+  if (self.gestoppt) return;
+  self.gestoppt = YES;
+  AVCaptureSession *session = self.session;
+  self.session = nil;
+  [session stopRunning];
+  [self.source stop];
+  NSLog(@"[geraete-ton] gestoppt (%llu Puffer)", (unsigned long long)self.puffer);
+}
+
+@end
+#endif
+
 @implementation FlutterWebRTCPlugin (DesktopCapturer)
 
 - (void)getDisplayMedia:(NSDictionary*)constraints result:(FlutterResult)result {
@@ -1095,5 +1202,116 @@ static NSData* HCThumbJpegFromCGImage(CGImageRef img, CGFloat maxW) {
 }
 
 #endif
+
+
+#if TARGET_OS_OSX
+- (AVCaptureDevice *)honeycordTonGeraetFuer:(NSString *)deviceId {
+  if (deviceId.length == 0) return nil;
+  AVCaptureDevice *d = [AVCaptureDevice deviceWithUniqueID:deviceId];
+  if (d != nil && [d hasMediaType:AVMediaTypeAudio]) return d;
+  // Rueckfall: alle Tongeraete durchgehen (uniqueID ODER Name).
+  NSArray<AVCaptureDevice *> *alle = nil;
+  if (@available(macOS 14.0, *)) {
+    AVCaptureDeviceDiscoverySession *ds =
+        [AVCaptureDeviceDiscoverySession discoverySessionWithDeviceTypes:@[ AVCaptureDeviceTypeMicrophone, AVCaptureDeviceTypeExternal ]
+                                                               mediaType:AVMediaTypeAudio
+                                                                position:AVCaptureDevicePositionUnspecified];
+    alle = ds.devices;
+  } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    alle = [AVCaptureDevice devicesWithMediaType:AVMediaTypeAudio];
+#pragma clang diagnostic pop
+  }
+  for (AVCaptureDevice *k in alle) {
+    if ([k.uniqueID isEqualToString:deviceId] || [k.localizedName isEqualToString:deviceId]) return k;
+  }
+  return nil;
+}
+#endif
+
+- (void)honeycordCaptureAudioStart:(NSString *)deviceId result:(FlutterResult)result {
+#if TARGET_OS_OSX
+  AVCaptureDevice *geraet = [self honeycordTonGeraetFuer:deviceId];
+  if (geraet == nil) {
+    NSLog(@"[geraete-ton] Geraet nicht gefunden: %@", deviceId);
+    result([FlutterError errorWithCode:@"captureAudio" message:@"Aufnahmegeraet nicht gefunden" details:deviceId]);
+    return;
+  }
+  // Mikrofon-Freigabe: die App hat sie in der Regel schon (Mikrofon laeuft);
+  // sonst hier anfragen und im Rueckruf starten — Start OHNE Freigabe liefert
+  // stumm null Puffer, und niemand saehe warum.
+  __weak FlutterWebRTCPlugin *weakSelf = self;
+  void (^starten)(void) = ^{
+    FlutterWebRTCPlugin *me = weakSelf;
+    if (me == nil) { result([FlutterError errorWithCode:@"captureAudio" message:@"Plugin weg" details:nil]); return; }
+    RTCCustomAudioSource *quelle = [[RTCCustomAudioSource alloc] initWithFactory:me.peerConnectionFactory];
+    HoneycordScreenAudioRelay *relay = [[HoneycordScreenAudioRelay alloc] init];
+    relay.source = quelle;
+    HoneycordGeraeteTonAufnehmer *auf = [[HoneycordGeraeteTonAufnehmer alloc] init];
+    auf.relay = relay;
+    auf.source = quelle;
+    NSError *fehler = nil;
+    if (![auf startMitGeraet:geraet fehler:&fehler]) {
+      [quelle stop];
+      NSLog(@"[geraete-ton] Start fehlgeschlagen: %@", fehler.localizedDescription);
+      result([FlutterError errorWithCode:@"captureAudio"
+                                 message:@"Aufnahmegeraet liess sich nicht oeffnen"
+                                 details:fehler.localizedDescription]);
+      return;
+    }
+    NSString *streamId = [[NSUUID UUID] UUIDString];
+    NSString *trackId = [[NSUUID UUID] UUIDString];
+    RTCMediaStream *stream = [me.peerConnectionFactory mediaStreamWithStreamId:streamId];
+    RTCAudioTrack *spur = [me.peerConnectionFactory audioTrackWithSource:quelle trackId:trackId];
+    [stream addAudioTrack:spur];
+    LocalAudioTrack *lokal = [[LocalAudioTrack alloc] initWithTrack:spur];
+    [me.localTracks setObject:lokal forKey:trackId];
+    me.localStreams[streamId] = stream;
+    auf.streamId = streamId;
+    auf.trackId = trackId;
+    me.honeycordTonAufnehmer[streamId] = auf;
+    me.honeycordTonAufnehmer[trackId] = auf;
+    NSLog(@"[geraete-ton] Stream %@ Spur %@ fuer %@", streamId, trackId, geraet.localizedName);
+    result(@{
+      @"streamId" : streamId,
+      @"audioTracks" : @[ @{
+        @"id" : trackId,
+        @"kind" : spur.kind,
+        @"label" : @"capture-card-audio",
+        @"enabled" : @(spur.isEnabled),
+        @"remote" : @(NO),
+        @"readyState" : @"live",
+      } ],
+      @"videoTracks" : @[],
+    });
+  };
+  AVAuthorizationStatus st = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
+  if (st == AVAuthorizationStatusAuthorized) {
+    starten();
+  } else if (st == AVAuthorizationStatusNotDetermined) {
+    [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio completionHandler:^(BOOL granted) {
+      dispatch_async(dispatch_get_main_queue(), ^{
+        if (granted) starten();
+        else result([FlutterError errorWithCode:@"captureAudio" message:@"Mikrofon-Freigabe verweigert" details:nil]);
+      });
+    }];
+  } else {
+    result([FlutterError errorWithCode:@"captureAudio" message:@"Mikrofon-Freigabe fehlt" details:nil]);
+  }
+#else
+  result([FlutterError errorWithCode:@"captureAudio" message:@"nur macOS" details:nil]);
+#endif
+}
+
+- (void)honeycordCaptureAudioStopFuer:(NSString *)streamOderTrackId {
+#if TARGET_OS_OSX
+  HoneycordGeraeteTonAufnehmer *auf = self.honeycordTonAufnehmer[streamOderTrackId];
+  if (auf == nil) return;
+  [auf stop];
+  if (auf.streamId) [self.honeycordTonAufnehmer removeObjectForKey:auf.streamId];
+  if (auf.trackId) [self.honeycordTonAufnehmer removeObjectForKey:auf.trackId];
+#endif
+}
 
 @end

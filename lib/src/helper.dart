@@ -220,10 +220,10 @@ class Helper {
   /// HoneyCord (05.09.2026, „Vier Ströme" Block 1): Ton eines AUFNAHMEGERÄTS
   /// (z. B. der USB-Tonseite einer Capture-Karte) als eigener Stream mit einer
   /// Audiospur — der Aufrufer veröffentlicht sie als `screenShareAudio`.
-  /// `stream.dispose()` stoppt den Aufnehmer. Bisher nur Windows (WASAPI),
-  /// sonst `null`.
+  /// `stream.dispose()` stoppt den Aufnehmer. Windows (WASAPI) und seit
+  /// 05.09.2026 macOS (AVCaptureSession, Block 2), sonst `null`.
   static Future<MediaStream?> honeycordCaptureAudioStart(String deviceId) async {
-    if (!WebRTC.platformIsWindows) return null;
+    if (!WebRTC.platformIsWindows && !WebRTC.platformIsMacOS) return null;
     final r = await WebRTC.invokeMethod(
         'honeycordCaptureAudioStart', {'deviceId': deviceId});
     if (r is! Map || r['streamId'] is! String) return null;

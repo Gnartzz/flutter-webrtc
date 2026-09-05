@@ -41,6 +41,10 @@ typedef void (^CapturerStopHandler)(CompletionHandler _Nonnull handler);
 @property(nonatomic, strong) NSMutableDictionary<NSNumber*, FlutterRTCMediaRecorder*>* _Nonnull recorders;
 @property(nonatomic, strong)
     NSMutableDictionary<NSString*, CapturerStopHandler>* _Nullable videoCapturerStopHandlers;
+/// HoneyCord: laufende Geraete-Ton-Aufnehmer (Capture-Karte), unter Stream-Id UND
+/// Track-Id eingetragen — beide Wege (mediaStreamDispose, trackDispose) muessen
+/// den Aufnehmer finden.
+@property(nonatomic, strong) NSMutableDictionary<NSString*, id>* _Nullable honeycordTonAufnehmer;
 
 @property(nonatomic, strong)
     NSMutableDictionary<NSString*, RTCFrameCryptor*>* _Nullable frameCryptors;
