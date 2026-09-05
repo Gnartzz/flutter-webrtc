@@ -558,7 +558,17 @@ void WasapiLoopback::CaptureLoop() {
       if (!running_) break;
     }
     UINT32 packet_size = 0;
-    if (FAILED(capture_->GetNextPacketSize(&packet_size))) {
+    const HRESULT pk_hr = capture_->GetNextPacketSize(&packet_size);
+    if (FAILED(pk_hr)) {
+      // ★ Geraet weg (Pruefbefund 05.09.): Beim Kartenton ist „Kabel raus" der
+      // Normalfall — WASAPI liefert dann dauerhaft DEVICE_INVALIDATED, und die
+      // 2-ms-Schleife liefe bis Stop() fuer nichts. Einmal loggen, Faden beenden;
+      // die Spur bleibt stumm stehen, bis der Nutzer die Freigabe schliesst.
+      if (pk_hr == AUDCLNT_E_DEVICE_INVALIDATED || pk_hr == AUDCLNT_E_SERVICE_NOT_RUNNING) {
+        HcLog("CaptureLoop: Geraet weg (0x%08lx) — Aufnahme endet", (long)pk_hr);
+        running_ = false;
+        break;
+      }
       Sleep(2);
       continue;
     }

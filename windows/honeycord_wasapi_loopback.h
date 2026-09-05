@@ -103,8 +103,9 @@ class WasapiLoopback {
   IAudioClient* client_ = nullptr;
   IAudioCaptureClient* capture_ = nullptr;
   WAVEFORMATEX* mix_format_ = nullptr;
-  // Capture-Event (nur Process-Loopback-Modus; Fallback pollt wie bisher).
-  // void* statt HANDLE, damit der Header ohne windows.h auskommt.
+  // Capture-Event (Process-Loopback- und Capture-Endpoint-Modus; nur der
+  // Endpoint-Fallback pollt). void* statt HANDLE, damit der Header ohne
+  // windows.h auskommt.
   void* capture_event_ = nullptr;
 
   // 10-ms-Akkumulator (interleaved Int16) NACH Resampling auf
