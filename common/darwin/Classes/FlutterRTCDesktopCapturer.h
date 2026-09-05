@@ -23,6 +23,8 @@
 /// HoneyCord (Block 2, 05.09.2026): Ton eines AUFNAHMEGERAETS (USB-Tonseite
 /// einer Capture-Karte) als eigener Stream mit einer Audiospur — macOS.
 - (void)honeycordCaptureAudioStart:(nonnull NSString*)deviceId result:(nonnull FlutterResult)result;
+/// `weg` = @"auhal": CoreAudio-Audio-Unit direkt am Geraet (OBS-Weg fuer den Ton).
+- (void)honeycordCaptureAudioStart:(nonnull NSString*)deviceId weg:(nullable NSString*)weg result:(nonnull FlutterResult)result;
 /// Aufnehmer eines solchen Streams stoppen (Stream- oder Track-Id). Idempotent.
 - (void)honeycordCaptureAudioStopFuer:(nonnull NSString*)streamOderTrackId;
 /// OBS-Weg: Ton der Karte in die VIDEO-Session des Capturers legen (vor dem Start).

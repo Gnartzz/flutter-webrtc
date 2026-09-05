@@ -16,6 +16,7 @@
 #import <WebRTC/RTCCustomAudioSource.h>
 #if TARGET_OS_OSX
 #import <CoreAudio/CoreAudio.h>
+#import <AudioUnit/AudioUnit.h>
 #endif
 #import "FlutterScreenCaptureKitCapturer.h"
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
@@ -38,6 +39,8 @@
   size_t _chunkChannels;
 }
 @property(nonatomic, strong) RTCCustomAudioSource *source;
+/// Int16-interleaved direkt einspeisen (AUHAL-Weg): 10-ms-Chunking + push.
+- (void)verarbeiteInt16:(const int16_t *)interleaved frames:(size_t)frames channels:(size_t)outChannels sampleRate:(int)sampleRate;
 @end
 
 @implementation HoneycordScreenAudioRelay
@@ -186,10 +189,25 @@
     }
   }
 
+  [self verarbeiteInt16:interleaved frames:frames channels:outChannels sampleRate:sampleRate];
+
+cleanup:
+  if (interleaved != NULL) free(interleaved);
+  free(list);
+  if (block != NULL) CFRelease(block);
+}
+
+- (void)dealloc {
+  free(_chunkBuf);
+  _chunkBuf = NULL;
+}
+
+- (void)verarbeiteInt16:(const int16_t *)interleaved frames:(size_t)frames channels:(size_t)outChannels sampleRate:(int)sampleRate {
+  if (interleaved == NULL || frames == 0 || outChannels == 0 || self.source == nil) return;
   // 10-ms-Chunking. libwebrtc verlangt EXAKT 10-ms-AudioFrames im
   // Sender-Pfad (AudioSendStream::SendAudioData hat ein RTC_CHECK_EQ
-  // samples_per_channel == sample_rate/100). SCK liefert aber 1024-/2048-
-  // Frame-Buffer → wir puffern und drainen in chunks von 480 Frames @ 48 kHz.
+  // samples_per_channel == sample_rate/100). Quellen liefern 512-/1024-/2048-
+  // Frame-Buffer → puffern und in Chunks von sampleRate/100 Frames drainen.
   const size_t chunkFrames = (size_t)sampleRate / 100;  // 10 ms
   if (chunkFrames > 0) {
     // Buffer (neu) reservieren wenn Kanal-/Größenänderung.
@@ -226,15 +244,6 @@
     }
   }
 
-cleanup:
-  if (interleaved != NULL) free(interleaved);
-  free(list);
-  if (block != NULL) CFRelease(block);
-}
-
-- (void)dealloc {
-  free(_chunkBuf);
-  _chunkBuf = NULL;
 }
 
 @end
@@ -286,6 +295,119 @@ static inline BOOL HCIsActiveDisplayId(NSString* sourceId) { return NO; }
 // Kennungen: enumerateDevices liefert auf macOS `RTCIODevice.deviceId` = die
 // CoreAudio-UID, und die ist GEMESSEN wortgleich mit `AVCaptureDevice.uniqueID`
 // (z. B. „AppleUSBAudioEngine:UGREEN 35871:UGREEN 35871:PRODUCT:3").
+
+// ★ Alternative zum AVCapture-Ton (05.09. nachts): der Weg von OBS' „Audio-
+// Eingabeaufnahme" — CoreAudio-Audio-Unit (HALOutput, Eingang an, Ausgang aus)
+// direkt am Geraet, Client-Format Int16 interleaved bei der Geraete-Rate; die
+// Audio-Unit wandelt aus dem HAL-Format. Keine AVCaptureSession, kein
+// AudioConverter-Property-Set in der Session. GEMESSEN: die HAL-Sequenz beim
+// Start (StartIO → RequestConfigChange → StartIO) ist bei OBS und AVCapture
+// identisch; ob DIESER Weg das Bild der Karte verschont, entscheidet der Test.
+@interface HoneycordAuhalTonAufnehmer : NSObject
+@property(nonatomic, strong) HoneycordScreenAudioRelay *relay;
+@property(nonatomic, strong) RTCCustomAudioSource *source;
+@property(nonatomic, copy) NSString *streamId;
+@property(nonatomic, copy) NSString *trackId;
+@property(atomic) BOOL gestoppt;
+@property(nonatomic) uint64_t puffer;
+- (BOOL)startMitGeraeteNummer:(AudioDeviceID)dev fehler:(NSError **)fehler;
+- (void)stop;
+@end
+
+@implementation HoneycordAuhalTonAufnehmer {
+  AudioUnit _au;
+  AudioBufferList *_abl;
+  size_t _ablFrames;
+  int _rate;
+  size_t _kanaele;
+}
+
+static OSStatus HoneycordAuhalInput(void *inRefCon, AudioUnitRenderActionFlags *ioActionFlags,
+                                    const AudioTimeStamp *inTimeStamp, UInt32 inBusNumber,
+                                    UInt32 inNumberFrames, AudioBufferList *ioData) {
+  HoneycordAuhalTonAufnehmer *self = (__bridge HoneycordAuhalTonAufnehmer *)inRefCon;
+  return [self renderFrames:inNumberFrames flags:ioActionFlags zeit:inTimeStamp bus:inBusNumber];
+}
+
+- (OSStatus)renderFrames:(UInt32)n flags:(AudioUnitRenderActionFlags *)flags zeit:(const AudioTimeStamp *)ts bus:(UInt32)bus {
+  if (self.gestoppt || _au == NULL || _abl == NULL) return noErr;
+  if (n > _ablFrames) n = (UInt32)_ablFrames;
+  _abl->mBuffers[0].mDataByteSize = (UInt32)(n * _kanaele * sizeof(int16_t));
+  OSStatus st = AudioUnitRender(_au, flags, ts, bus, n, _abl);
+  if (st != noErr) {
+    if ((self.puffer % 500) == 0) NSLog(@"[geraete-ton auhal] Render-Fehler %d", (int)st);
+    return st;
+  }
+  self.puffer++;
+  if (self.puffer == 1 || (self.puffer % 500) == 0) {
+    NSLog(@"[geraete-ton auhal] Puffer #%llu frames=%u sr=%d ch=%zu", (unsigned long long)self.puffer, (unsigned)n, _rate, _kanaele);
+  }
+  [self.relay verarbeiteInt16:(const int16_t *)_abl->mBuffers[0].mData frames:n channels:_kanaele sampleRate:_rate];
+  return noErr;
+}
+
+- (BOOL)startMitGeraeteNummer:(AudioDeviceID)dev fehler:(NSError **)fehler {
+  AudioComponentDescription d = { kAudioUnitType_Output, kAudioUnitSubType_HALOutput, kAudioUnitManufacturer_Apple, 0, 0 };
+  AudioComponent comp = AudioComponentFindNext(NULL, &d);
+  OSStatus st = comp ? AudioComponentInstanceNew(comp, &_au) : -1;
+  if (st != noErr || _au == NULL) { if (fehler) *fehler = [NSError errorWithDomain:@"honeycord" code:st userInfo:@{NSLocalizedDescriptionKey: @"AUHAL nicht anlegbar"}]; return NO; }
+  UInt32 an = 1, aus = 0;
+  st = AudioUnitSetProperty(_au, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &an, sizeof(an));
+  if (st == noErr) st = AudioUnitSetProperty(_au, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &aus, sizeof(aus));
+  if (st == noErr) st = AudioUnitSetProperty(_au, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &dev, sizeof(dev));
+  if (st != noErr) { if (fehler) *fehler = [NSError errorWithDomain:@"honeycord" code:st userInfo:@{NSLocalizedDescriptionKey: @"AUHAL: EnableIO/CurrentDevice"}]; return NO; }
+  // Hardware-Format des Eingangs (Rate + Kanaele) lesen — die Rate MUSS uebernommen werden.
+  AudioStreamBasicDescription hw = {0}; UInt32 sz = sizeof(hw);
+  st = AudioUnitGetProperty(_au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 1, &hw, &sz);
+  if (st != noErr || hw.mSampleRate <= 0) { if (fehler) *fehler = [NSError errorWithDomain:@"honeycord" code:st userInfo:@{NSLocalizedDescriptionKey: @"AUHAL: Hardware-Format"}]; return NO; }
+  _rate = (int)hw.mSampleRate;
+  _kanaele = hw.mChannelsPerFrame >= 2 ? 2 : 1;
+  AudioStreamBasicDescription cl = {0};
+  cl.mSampleRate = hw.mSampleRate;
+  cl.mFormatID = kAudioFormatLinearPCM;
+  cl.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
+  cl.mBitsPerChannel = 16;
+  cl.mChannelsPerFrame = (UInt32)_kanaele;
+  cl.mBytesPerFrame = (UInt32)(2 * _kanaele);
+  cl.mFramesPerPacket = 1;
+  cl.mBytesPerPacket = cl.mBytesPerFrame;
+  st = AudioUnitSetProperty(_au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &cl, sizeof(cl));
+  if (st != noErr) { if (fehler) *fehler = [NSError errorWithDomain:@"honeycord" code:st userInfo:@{NSLocalizedDescriptionKey: @"AUHAL: Client-Format"}]; return NO; }
+  AURenderCallbackStruct cb = { HoneycordAuhalInput, (__bridge void *)self };
+  st = AudioUnitSetProperty(_au, kAudioOutputUnitProperty_SetInputCallback, kAudioUnitScope_Global, 0, &cb, sizeof(cb));
+  if (st != noErr) { if (fehler) *fehler = [NSError errorWithDomain:@"honeycord" code:st userInfo:@{NSLocalizedDescriptionKey: @"AUHAL: Callback"}]; return NO; }
+  _ablFrames = 8192;
+  _abl = (AudioBufferList *)calloc(1, sizeof(AudioBufferList));
+  _abl->mNumberBuffers = 1;
+  _abl->mBuffers[0].mNumberChannels = (UInt32)_kanaele;
+  _abl->mBuffers[0].mDataByteSize = (UInt32)(_ablFrames * _kanaele * sizeof(int16_t));
+  _abl->mBuffers[0].mData = calloc(_ablFrames * _kanaele, sizeof(int16_t));
+  st = AudioUnitInitialize(_au);
+  if (st == noErr) st = AudioOutputUnitStart(_au);
+  if (st != noErr) { if (fehler) *fehler = [NSError errorWithDomain:@"honeycord" code:st userInfo:@{NSLocalizedDescriptionKey: @"AUHAL: Initialize/Start"}]; return NO; }
+  NSLog(@"[geraete-ton auhal] gestartet: Geraet %u, hw sr=%.0f ch=%u -> Client Int16 %d Hz %zu ch",
+        (unsigned)dev, hw.mSampleRate, (unsigned)hw.mChannelsPerFrame, _rate, _kanaele);
+  return YES;
+}
+
+- (void)stop {
+  if (self.gestoppt) return;
+  self.gestoppt = YES;
+  AudioUnit au = _au; _au = NULL;
+  RTCCustomAudioSource *source = self.source;
+  const uint64_t puffer = self.puffer;
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    if (au) { AudioOutputUnitStop(au); AudioUnitUninitialize(au); AudioComponentInstanceDispose(au); }
+    [source stop];
+    NSLog(@"[geraete-ton auhal] gestoppt (%llu Puffer)", (unsigned long long)puffer);
+  });
+}
+
+- (void)dealloc {
+  if (_abl) { free(_abl->mBuffers[0].mData); free(_abl); _abl = NULL; }
+}
+@end
+
 @interface HoneycordGeraeteTonAufnehmer : NSObject <AVCaptureAudioDataOutputSampleBufferDelegate>
 @property(nonatomic, strong) AVCaptureSession *session;
 @property(nonatomic, strong) AVCaptureAudioDataOutput *ausgang;
@@ -1348,7 +1470,50 @@ static NSString *HoneycordUidFuerGeraeteNummer(NSString *nummer) {
 #endif
 
 - (void)honeycordCaptureAudioStart:(NSString *)deviceId result:(FlutterResult)result {
+  [self honeycordCaptureAudioStart:deviceId weg:nil result:result];
+}
+
+- (void)honeycordCaptureAudioStart:(NSString *)deviceId weg:(NSString *)weg result:(FlutterResult)result {
 #if TARGET_OS_OSX
+  if ([weg isEqualToString:@"auhal"]) {
+    // OBS-Weg fuer den Ton: Audio-Unit direkt am Geraet (Geraetenummer aus enumerateDevices).
+    const long long nummer = [deviceId longLongValue];
+    if (nummer <= 0) {
+      result([FlutterError errorWithCode:@"captureAudio" message:@"AUHAL braucht die Geraetenummer" details:deviceId]);
+      return;
+    }
+    RTCCustomAudioSource *quelle = [[RTCCustomAudioSource alloc] initWithFactory:self.peerConnectionFactory];
+    HoneycordScreenAudioRelay *relay = [[HoneycordScreenAudioRelay alloc] init];
+    relay.source = quelle;
+    HoneycordAuhalTonAufnehmer *auf = [[HoneycordAuhalTonAufnehmer alloc] init];
+    auf.relay = relay;
+    auf.source = quelle;
+    NSError *fehler = nil;
+    if (![auf startMitGeraeteNummer:(AudioDeviceID)nummer fehler:&fehler]) {
+      [quelle stop];
+      NSLog(@"[geraete-ton auhal] Start fehlgeschlagen: %@ (%ld)", fehler.localizedDescription, (long)fehler.code);
+      result([FlutterError errorWithCode:@"captureAudio" message:@"AUHAL-Start fehlgeschlagen" details:fehler.localizedDescription]);
+      return;
+    }
+    NSString *streamId = [[NSUUID UUID] UUIDString];
+    NSString *trackId = [[NSUUID UUID] UUIDString];
+    RTCMediaStream *stream = [self.peerConnectionFactory mediaStreamWithStreamId:streamId];
+    RTCAudioTrack *spur = [self.peerConnectionFactory audioTrackWithSource:quelle trackId:trackId];
+    [stream addAudioTrack:spur];
+    LocalAudioTrack *lokal = [[LocalAudioTrack alloc] initWithTrack:spur];
+    [self.localTracks setObject:lokal forKey:trackId];
+    self.localStreams[streamId] = stream;
+    auf.streamId = streamId;
+    auf.trackId = trackId;
+    self.honeycordTonAufnehmer[streamId] = auf;
+    self.honeycordTonAufnehmer[trackId] = auf;
+    NSLog(@"[geraete-ton auhal] Stream %@ Spur %@ fuer Geraet %lld", streamId, trackId, nummer);
+    result(@{ @"streamId" : streamId,
+              @"audioTracks" : @[ @{ @"id" : trackId, @"kind" : spur.kind, @"label" : @"capture-card-audio",
+                                     @"enabled" : @(spur.isEnabled), @"remote" : @(NO), @"readyState" : @"live" } ],
+              @"videoTracks" : @[] });
+    return;
+  }
   AVCaptureDevice *geraet = [self honeycordTonGeraetFuer:deviceId];
   if (geraet == nil) {
     NSLog(@"[geraete-ton] Geraet nicht gefunden: %{public}@", deviceId);
@@ -1495,11 +1660,16 @@ static NSString *HoneycordUidFuerGeraeteNummer(NSString *nummer) {
 
 - (void)honeycordCaptureAudioStopFuer:(NSString *)streamOderTrackId {
 #if TARGET_OS_OSX
-  HoneycordGeraeteTonAufnehmer *auf = self.honeycordTonAufnehmer[streamOderTrackId];
+  id auf = self.honeycordTonAufnehmer[streamOderTrackId];
   if (auf == nil) return;
-  [auf stop];
-  if (auf.streamId) [self.honeycordTonAufnehmer removeObjectForKey:auf.streamId];
-  if (auf.trackId) [self.honeycordTonAufnehmer removeObjectForKey:auf.trackId];
+  NSString *sId = nil, *tId = nil;
+  if ([auf isKindOfClass:[HoneycordGeraeteTonAufnehmer class]]) {
+    HoneycordGeraeteTonAufnehmer *a = auf; [a stop]; sId = a.streamId; tId = a.trackId;
+  } else if ([auf isKindOfClass:[HoneycordAuhalTonAufnehmer class]]) {
+    HoneycordAuhalTonAufnehmer *a = auf; [a stop]; sId = a.streamId; tId = a.trackId;
+  }
+  if (sId) [self.honeycordTonAufnehmer removeObjectForKey:sId];
+  if (tId) [self.honeycordTonAufnehmer removeObjectForKey:tId];
 #endif
 }
 

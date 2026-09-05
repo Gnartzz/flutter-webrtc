@@ -222,10 +222,12 @@ class Helper {
   /// Audiospur — der Aufrufer veröffentlicht sie als `screenShareAudio`.
   /// `stream.dispose()` stoppt den Aufnehmer. Windows (WASAPI) und seit
   /// 05.09.2026 macOS (AVCaptureSession, Block 2), sonst `null`.
-  static Future<MediaStream?> honeycordCaptureAudioStart(String deviceId) async {
+  /// `weg` (macOS): `'auhal'` = CoreAudio-Audio-Unit direkt am Geraet (wie OBS'
+  /// Audio-Eingabeaufnahme), sonst AVCaptureSession.
+  static Future<MediaStream?> honeycordCaptureAudioStart(String deviceId, {String? weg}) async {
     if (!WebRTC.platformIsWindows && !WebRTC.platformIsMacOS) return null;
     final r = await WebRTC.invokeMethod(
-        'honeycordCaptureAudioStart', {'deviceId': deviceId});
+        'honeycordCaptureAudioStart', {'deviceId': deviceId, if (weg != null) 'weg': weg});
     if (r is! Map || r['streamId'] is! String) return null;
     final stream = MediaStreamNative(r['streamId'] as String, 'local');
     stream.setMediaTracks(r['audioTracks'], r['videoTracks']);

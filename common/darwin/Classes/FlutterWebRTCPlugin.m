@@ -434,7 +434,8 @@ static FlutterWebRTCPlugin *sharedSingleton;
     // Methodennamen in flutter_webrtc.cc (WASAPI); hier AVCaptureSession.
     NSDictionary* argsMap = call.arguments;
     NSString* deviceId = argsMap[@"deviceId"];
-    [self honeycordCaptureAudioStart:(deviceId ?: @"") result:result];
+    NSString* weg = argsMap[@"weg"];
+    [self honeycordCaptureAudioStart:(deviceId ?: @"") weg:([weg isKindOfClass:[NSString class]] ? weg : nil) result:result];
   } else if ([@"requestCapturePermission" isEqualToString:call.method]) {
 #if TARGET_OS_OSX || TARGET_OS_MACCATALYST
     if (@available(macOS 10.15, macCatalyst 13.1, *)) {
