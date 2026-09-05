@@ -471,11 +471,22 @@ bool WasapiLoopback::StartCaptureEndpoint() {
   }
 
   const REFERENCE_TIME kBufferDuration100Ns = 200 * 10000;
-  // OHNE AUDCLNT_STREAMFLAGS_LOOPBACK: echtes Aufnahmegeraet. Polling wie im
-  // Endpoint-Fallback (capture_event_ bleibt null).
-  hr = client_->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, kBufferDuration100Ns,
+  // OHNE AUDCLNT_STREAMFLAGS_LOOPBACK: echtes Aufnahmegeraet. MIT Event-
+  // Callback (Pruefbefund 05.09.): der Polling-Weg des Endpoint-Fallbacks
+  // wacht bei leerem Puffer alle 2 ms auf — rund 500-mal je Sekunde fuer
+  // nichts. Capture-Endpoints koennen Events, die Schleife kann sie auch.
+  hr = client_->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                           AUDCLNT_STREAMFLAGS_EVENTCALLBACK, kBufferDuration100Ns,
                            0, mix_format_, nullptr);
-  HcLog("StartCapture: client->Initialize(CAPTURE) = 0x%08lx", (long)hr);
+  HcLog("StartCapture: client->Initialize(CAPTURE, EVENT) = 0x%08lx", (long)hr);
+  if (FAILED(hr)) return false;
+  capture_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  if (!capture_event_) {
+    HcLog("StartCapture: CreateEvent fehlgeschlagen");
+    return false;
+  }
+  hr = client_->SetEventHandle(static_cast<HANDLE>(capture_event_));
+  HcLog("StartCapture: SetEventHandle = 0x%08lx", (long)hr);
   return SUCCEEDED(hr);
 }
 
