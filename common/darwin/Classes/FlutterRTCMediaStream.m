@@ -128,17 +128,19 @@ static double HoneycordPinnen(AVCaptureDevice* d, AVCaptureDeviceFormat* format,
 // Ergebnis: EIN UVC-Start mit der Zielrate, wie OBS.
 @interface HoneycordFormatWaechter : NSObject
 @property(nonatomic, strong) AVCaptureDevice* geraet;
+@property(nonatomic, weak) AVCaptureSession* session;
 @property(nonatomic) NSInteger zielFps;
 @property(nonatomic) BOOL aktiv;
 @property(nonatomic) NSUInteger treffer;
-- (instancetype)initMitGeraet:(AVCaptureDevice*)geraet zielFps:(NSInteger)fps;
+- (instancetype)initMitGeraet:(AVCaptureDevice*)geraet session:(AVCaptureSession*)session zielFps:(NSInteger)fps;
 - (void)beenden;
 @end
 
 @implementation HoneycordFormatWaechter
-- (instancetype)initMitGeraet:(AVCaptureDevice*)geraet zielFps:(NSInteger)fps {
+- (instancetype)initMitGeraet:(AVCaptureDevice*)geraet session:(AVCaptureSession*)session zielFps:(NSInteger)fps {
   if ((self = [super init])) {
     _geraet = geraet;
+    _session = session;
     _zielFps = fps;
     @try {
       [geraet addObserver:self forKeyPath:@"activeFormat" options:NSKeyValueObservingOptionNew context:NULL];
@@ -157,6 +159,35 @@ static double HoneycordPinnen(AVCaptureDevice* d, AVCaptureDeviceFormat* format,
   // startCaptureWithDevice-Block). Ohne Sperre wirft der Setter — @try in HoneycordPinnen.
   double jetzt = HoneycordPinnen(d, d.activeFormat, self.zielFps, @"waechter");
   NSLog(@"[hc-fps] waechter #%lu: activeFormat gesetzt -> %.3f fps", (unsigned long)self.treffer, jetzt);
+  // ★ GEMESSEN (2.6.149): auch DAS ueberlebt den Start nicht — der CMIO-Stream-
+  // Start einer DAL-Kamera nimmt die Format-Vorgabe (120 fps), die AVFoundation-
+  // Dauer greift erst danach (= Neustart). OBS setzt die Rate an der VERBINDUNG
+  // zum Ausgang (im OBS-Log: „ConfigureToBestMatch…MinimumFrameDuration" vor dem
+  // Start). Also hier ebenso: videoMin/MaxFrameDuration an jeder Verbindung der
+  // Session, die es unterstuetzt — die Verbindung besteht, weil der Capturer den
+  // Input VOR dem Format setzt.
+#if TARGET_OS_OSX
+  AVFrameRateRange* bereich = HoneycordBereichFuer(d.activeFormat, self.zielFps);
+  if (bereich != nil) {
+    BOOL diskret = fabs(bereich.maxFrameRate - bereich.minFrameRate) < 0.001;
+    CMTime dauer = diskret ? bereich.minFrameDuration : CMTimeMake(1, (int32_t)self.zielFps);
+    for (AVCaptureConnection* c in self.session.connections) {
+      if (![c.output isKindOfClass:[AVCaptureVideoDataOutput class]]) continue;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+      @try {
+        if (c.isVideoMinFrameDurationSupported) c.videoMinFrameDuration = dauer;
+        if (c.isVideoMaxFrameDurationSupported) c.videoMaxFrameDuration = dauer;
+        NSLog(@"[hc-fps] waechter: Verbindung min=%d max=%d -> %.3f fps",
+              c.isVideoMinFrameDurationSupported ? 1 : 0, c.isVideoMaxFrameDurationSupported ? 1 : 0,
+              dauer.value > 0 ? (double)dauer.timescale / (double)dauer.value : 0.0);
+      } @catch (NSException* e) {
+        NSLog(@"[hc-fps] waechter: Verbindung warf: %@", e.reason);
+      }
+#pragma clang diagnostic pop
+    }
+  }
+#endif
 }
 - (void)beenden {
   if (!self.aktiv) return;
@@ -697,7 +728,7 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
       [videoDevice unlockForConfiguration];
     }
     HoneycordFormatWaechter* waechter = (pinFps > 0)
-        ? [[HoneycordFormatWaechter alloc] initMitGeraet:videoDevice zielFps:pinFps] : nil;
+        ? [[HoneycordFormatWaechter alloc] initMitGeraet:videoDevice session:self.videoCapturer.captureSession zielFps:pinFps] : nil;
     [self.videoCapturer startCaptureWithDevice:videoDevice
                                         format:selectedFormat
                                            fps:selectedFps
@@ -723,6 +754,12 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
                                const double aktiv = HoneycordAktiveFps(fpsDevice);
                                if (aktiv > 0 && fabs(aktiv - zielFps) < 0.05) {
                                  NSLog(@"[hc-fps] nach Start: schon %.3f fps (Ziel %.3f) — kein Neustart (device %@)", aktiv, zielFps, cls);
+                               } else if (self.honeycordTonAufnehmer.count > 0) {
+                                 // ★ Laeuft der Ton der Capture-Karte, ist der Neustart des
+                                 // Video-Stroms genau das, was die Karte anhaelt (gemessen
+                                 // 21:58/22:14/22:26/22:37). Lieber die Vorgabe-Rate behalten
+                                 // (LiveKit deckelt die Encoder-Rate ohnehin) als eine tote Karte.
+                                 NSLog(@"[hc-fps] nach Start: %.3f statt %.3f fps — KEIN Neustart, weil Karten-Ton laeuft (device %@)", aktiv, zielFps, cls);
                                } else {
                                  const double jetzt = HoneycordPinnen(fpsDevice, fpsDevice.activeFormat, pinFps, @"nach Start");
                                  NSLog(@"[hc-fps] nach Start: war %.3f, jetzt %.3f fps (Ziel %.3f, device %@)", aktiv, jetzt, zielFps, cls);
