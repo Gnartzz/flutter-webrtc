@@ -14,6 +14,9 @@
 #if TARGET_OS_OSX
 #import <AVFoundation/AVFoundation.h>
 #import <WebRTC/RTCCustomAudioSource.h>
+#if TARGET_OS_OSX
+#import <CoreAudio/CoreAudio.h>
+#endif
 #import "FlutterScreenCaptureKitCapturer.h"
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <CoreGraphics/CoreGraphics.h>
@@ -1265,11 +1268,44 @@ static NSData* HCThumbJpegFromCGImage(CGImageRef img, CGFloat maxW) {
 
 
 #if TARGET_OS_OSX
+// ★ GEMESSEN auf Auric (05.09. 21:45): enumerateDevices liefert auf macOS als
+// `deviceId` die CoreAudio-GERAETENUMMER als Zeichenkette („148" = UGREEN 35871),
+// NICHT die UID — mein Fork-Erstversuch suchte nach der UID und fand nichts
+// („Aufnahmegeraet nicht gefunden"). Die Nummer wird hier ueber
+// kAudioDevicePropertyDeviceUID in die UID uebersetzt, und die ist wortgleich
+// mit AVCaptureDevice.uniqueID. Nummern sind nur bis zum naechsten Umstecken
+// gueltig — der Waehler zaehlt die Geraete aber bei jedem Oeffnen neu auf.
+static NSString *HoneycordUidFuerGeraeteNummer(NSString *nummer) {
+  if (nummer.length == 0 || nummer.length > 10) return nil;
+  NSCharacterSet *nichtZiffer = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
+  if ([nummer rangeOfCharacterFromSet:nichtZiffer].location != NSNotFound) return nil;
+  const long long n = [nummer longLongValue];
+  if (n <= 0 || n > UINT32_MAX) return nil;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+  AudioObjectPropertyAddress adresse = { kAudioDevicePropertyDeviceUID,
+                                         kAudioObjectPropertyScopeGlobal,
+                                         kAudioObjectPropertyElementMaster };
+#pragma clang diagnostic pop
+  CFStringRef uid = NULL;
+  UInt32 groesse = sizeof(uid);
+  OSStatus st = AudioObjectGetPropertyData((AudioObjectID)n, &adresse, 0, NULL, &groesse, &uid);
+  if (st != noErr || uid == NULL) return nil;
+  return (NSString *)CFBridgingRelease(uid);
+}
+
 - (AVCaptureDevice *)honeycordTonGeraetFuer:(NSString *)deviceId {
   if (deviceId.length == 0) return nil;
   AVCaptureDevice *d = [AVCaptureDevice deviceWithUniqueID:deviceId];
   if (d != nil && [d hasMediaType:AVMediaTypeAudio]) return d;
-  // Rueckfall: alle Tongeraete durchgehen (uniqueID ODER Name).
+  // 1. Geraetenummer (CoreAudio) -> UID -> AVCaptureDevice
+  NSString *uid = HoneycordUidFuerGeraeteNummer(deviceId);
+  if (uid != nil) {
+    AVCaptureDevice *ueberUid = [AVCaptureDevice deviceWithUniqueID:uid];
+    NSLog(@"[geraete-ton] Nummer %@ -> UID %@ -> %@", deviceId, uid, ueberUid ? ueberUid.localizedName : @"(kein AVCaptureDevice)");
+    if (ueberUid != nil && [ueberUid hasMediaType:AVMediaTypeAudio]) return ueberUid;
+  }
+  // 2. Rueckfall: alle Tongeraete durchgehen (uniqueID ODER Name).
   NSArray<AVCaptureDevice *> *alle = nil;
   if (@available(macOS 14.0, *)) {
     AVCaptureDeviceDiscoverySession *ds =
@@ -1294,7 +1330,7 @@ static NSData* HCThumbJpegFromCGImage(CGImageRef img, CGFloat maxW) {
 #if TARGET_OS_OSX
   AVCaptureDevice *geraet = [self honeycordTonGeraetFuer:deviceId];
   if (geraet == nil) {
-    NSLog(@"[geraete-ton] Geraet nicht gefunden: %@", deviceId);
+    NSLog(@"[geraete-ton] Geraet nicht gefunden: %{public}@", deviceId);
     result([FlutterError errorWithCode:@"captureAudio" message:@"Aufnahmegeraet nicht gefunden" details:deviceId]);
     return;
   }
