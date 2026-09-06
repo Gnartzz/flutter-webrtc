@@ -310,6 +310,8 @@ static inline BOOL HCIsActiveDisplayId(NSString* sourceId) { return NO; }
 @property(nonatomic, copy) NSString *trackId;
 @property(atomic) BOOL gestoppt;
 @property(nonatomic) uint64_t puffer;
+@property(nonatomic) uint64_t fehlerZaehler;
+@property(nonatomic, strong) id lebtBeobachter;
 - (BOOL)startMitGeraeteNummer:(AudioDeviceID)dev fehler:(NSError **)fehler;
 - (void)stop;
 @end
@@ -320,6 +322,7 @@ static inline BOOL HCIsActiveDisplayId(NSString* sourceId) { return NO; }
   size_t _ablFrames;
   int _rate;
   size_t _kanaele;
+  AudioDeviceID _geraet;
 }
 
 static OSStatus HoneycordAuhalInput(void *inRefCon, AudioUnitRenderActionFlags *ioActionFlags,
@@ -335,7 +338,12 @@ static OSStatus HoneycordAuhalInput(void *inRefCon, AudioUnitRenderActionFlags *
   _abl->mBuffers[0].mDataByteSize = (UInt32)(n * _kanaele * sizeof(int16_t));
   OSStatus st = AudioUnitRender(_au, flags, ts, bus, n, _abl);
   if (st != noErr) {
-    if ((self.puffer % 500) == 0) NSLog(@"[geraete-ton auhal] Render-Fehler %d", (int)st);
+    // Eigener Zaehler: `puffer` steht bei einem Dauerfehler still, die alte
+    // Drossel haette dann entweder JEDEN Rueckruf geloggt (90/s) oder keinen.
+    self.fehlerZaehler++;
+    if (self.fehlerZaehler <= 5 || (self.fehlerZaehler % 500) == 0) {
+      NSLog(@"[geraete-ton auhal] Render-Fehler %d (#%llu)", (int)st, (unsigned long long)self.fehlerZaehler);
+    }
     return st;
   }
   self.puffer++;
@@ -355,7 +363,7 @@ static OSStatus HoneycordAuhalInput(void *inRefCon, AudioUnitRenderActionFlags *
   st = AudioUnitSetProperty(_au, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &an, sizeof(an));
   if (st == noErr) st = AudioUnitSetProperty(_au, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &aus, sizeof(aus));
   if (st == noErr) st = AudioUnitSetProperty(_au, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &dev, sizeof(dev));
-  if (st != noErr) { if (fehler) *fehler = [NSError errorWithDomain:@"honeycord" code:st userInfo:@{NSLocalizedDescriptionKey: @"AUHAL: EnableIO/CurrentDevice"}]; return NO; }
+  if (st != noErr) { AudioComponentInstanceDispose(_au); _au = NULL; if (fehler) *fehler = [NSError errorWithDomain:@"honeycord" code:st userInfo:@{NSLocalizedDescriptionKey: @"AUHAL: EnableIO/CurrentDevice"}]; return NO; }
   // Hardware-Format des Eingangs (Rate + Kanaele) lesen — die Rate MUSS uebernommen werden.
   AudioStreamBasicDescription hw = {0}; UInt32 sz = sizeof(hw);
   st = AudioUnitGetProperty(_au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 1, &hw, &sz);
@@ -372,10 +380,10 @@ static OSStatus HoneycordAuhalInput(void *inRefCon, AudioUnitRenderActionFlags *
   cl.mFramesPerPacket = 1;
   cl.mBytesPerPacket = cl.mBytesPerFrame;
   st = AudioUnitSetProperty(_au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &cl, sizeof(cl));
-  if (st != noErr) { if (fehler) *fehler = [NSError errorWithDomain:@"honeycord" code:st userInfo:@{NSLocalizedDescriptionKey: @"AUHAL: Client-Format"}]; return NO; }
+  if (st != noErr) { AudioComponentInstanceDispose(_au); _au = NULL; if (fehler) *fehler = [NSError errorWithDomain:@"honeycord" code:st userInfo:@{NSLocalizedDescriptionKey: @"AUHAL: Client-Format"}]; return NO; }
   AURenderCallbackStruct cb = { HoneycordAuhalInput, (__bridge void *)self };
   st = AudioUnitSetProperty(_au, kAudioOutputUnitProperty_SetInputCallback, kAudioUnitScope_Global, 0, &cb, sizeof(cb));
-  if (st != noErr) { if (fehler) *fehler = [NSError errorWithDomain:@"honeycord" code:st userInfo:@{NSLocalizedDescriptionKey: @"AUHAL: Callback"}]; return NO; }
+  if (st != noErr) { AudioComponentInstanceDispose(_au); _au = NULL; if (fehler) *fehler = [NSError errorWithDomain:@"honeycord" code:st userInfo:@{NSLocalizedDescriptionKey: @"AUHAL: Callback"}]; return NO; }
   _ablFrames = 8192;
   _abl = (AudioBufferList *)calloc(1, sizeof(AudioBufferList));
   _abl->mNumberBuffers = 1;
@@ -384,29 +392,86 @@ static OSStatus HoneycordAuhalInput(void *inRefCon, AudioUnitRenderActionFlags *
   _abl->mBuffers[0].mData = calloc(_ablFrames * _kanaele, sizeof(int16_t));
   st = AudioUnitInitialize(_au);
   if (st == noErr) st = AudioOutputUnitStart(_au);
-  if (st != noErr) { if (fehler) *fehler = [NSError errorWithDomain:@"honeycord" code:st userInfo:@{NSLocalizedDescriptionKey: @"AUHAL: Initialize/Start"}]; return NO; }
-  NSLog(@"[geraete-ton auhal] gestartet: Geraet %u, hw sr=%.0f ch=%u -> Client Int16 %d Hz %zu ch",
-        (unsigned)dev, hw.mSampleRate, (unsigned)hw.mChannelsPerFrame, _rate, _kanaele);
+  if (st != noErr) {
+    AudioComponentInstanceDispose(_au); _au = NULL;   // sonst leckt jeder Fehlversuch eine HAL-Unit
+    if (fehler) *fehler = [NSError errorWithDomain:@"honeycord" code:st userInfo:@{NSLocalizedDescriptionKey: @"AUHAL: Initialize/Start"}];
+    return NO;
+  }
+  // Geraete-Abzug im Betrieb sehen (Pruefbefund 8) — sonst bliebe eine stumme
+  // Tonspur veroeffentlicht, ohne eine Zeile im Log.
+  _geraet = dev;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+  AudioObjectPropertyAddress lebt = { kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster };
+#pragma clang diagnostic pop
+  __weak HoneycordAuhalTonAufnehmer *weakSelf = self;
+  AudioObjectPropertyListenerBlock lebtBlock = ^(UInt32 n, const AudioObjectPropertyAddress *a) {
+    UInt32 lebtWert = 0, sz = sizeof(lebtWert);
+    AudioObjectGetPropertyData((AudioObjectID)dev, a, 0, NULL, &sz, &lebtWert);
+    if (lebtWert == 0) {
+      NSLog(@"[geraete-ton auhal] Geraet %u weg — Aufnehmer wird gestoppt", (unsigned)dev);
+      [weakSelf stop];
+    }
+  };
+  self.lebtBeobachter = lebtBlock;   // zum spaeteren Entfernen aufheben
+  AudioObjectAddPropertyListenerBlock((AudioObjectID)dev, &lebt, dispatch_get_main_queue(), lebtBlock);
+  // Kennung mitloggen (Pruefbefund 22): die Nummer allein sagt nicht, WELCHES Geraet.
+  NSString *uid = nil;
+  {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    AudioObjectPropertyAddress ua = { kAudioDevicePropertyDeviceUID, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster };
+#pragma clang diagnostic pop
+    CFStringRef cf = NULL; UInt32 sz = sizeof(cf);
+    if (AudioObjectGetPropertyData((AudioObjectID)dev, &ua, 0, NULL, &sz, &cf) == noErr && cf) uid = (NSString *)CFBridgingRelease(cf);
+  }
+  NSLog(@"[geraete-ton auhal] gestartet: Geraet %u (%@), hw sr=%.0f ch=%u -> Client Int16 %d Hz %zu ch",
+        (unsigned)dev, uid ?: @"?", hw.mSampleRate, (unsigned)hw.mChannelsPerFrame, _rate, _kanaele);
   return YES;
+}
+
+- (void)lebtBeobachterEntfernen {
+  if (self.lebtBeobachter == nil || _geraet == 0) return;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+  AudioObjectPropertyAddress lebt = { kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMaster };
+#pragma clang diagnostic pop
+  AudioObjectRemovePropertyListenerBlock(_geraet, &lebt, dispatch_get_main_queue(),
+                                         (AudioObjectPropertyListenerBlock)self.lebtBeobachter);
+  self.lebtBeobachter = nil;
+  _geraet = 0;
 }
 
 - (void)stop {
   if (self.gestoppt) return;
   self.gestoppt = YES;
-  AudioUnit au = _au; _au = NULL;
+  AudioUnit au = _au;
   RTCCustomAudioSource *source = self.source;
   const uint64_t puffer = self.puffer;
+  [self lebtBeobachterEntfernen];
   // ★ SYNCHRON stoppen (gemessen 06.09. 09:13): der Aufrufer laesst der Karte
   // danach Zeit, bevor er ihr Bild stoppt — das geht nur, wenn der Ton-Abbau
   // hier wirklich durch ist. `AudioOutputUnitStop` und das Abraeumen der Unit
   // kosten wenige Millisekunden (die 5-s-Zeitueberschreitungen im Log stammen
   // vom VIDEO-Endpunkt, nicht von hier).
-  if (au) { AudioOutputUnitStop(au); AudioUnitUninitialize(au); AudioComponentInstanceDispose(au); }
+  //
+  // ★ REIHENFOLGE (Pruefbefund 06.09.): erst `AudioOutputUnitStop` — das wartet
+  // dokumentiert auf den laufenden IOProc —, DANN `_au` nullen. Andersherum
+  // konnte der Render-Rueckruf `AudioUnitRender(NULL, …)` aufrufen.
+  if (au) {
+    AudioOutputUnitStop(au);
+    _au = NULL;
+    AudioUnitUninitialize(au);
+    AudioComponentInstanceDispose(au);
+  } else {
+    _au = NULL;
+  }
   [source stop];
   NSLog(@"[geraete-ton auhal] gestoppt (%llu Puffer)", (unsigned long long)puffer);
 }
 
 - (void)dealloc {
+  [self stop];   // Unit freigeben, falls der Aufrufer es versaeumt hat (Pruefbefund 7)
   if (_abl) { free(_abl->mBuffers[0].mData); free(_abl); _abl = NULL; }
 }
 @end
