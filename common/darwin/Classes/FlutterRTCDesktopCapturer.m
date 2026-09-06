@@ -17,7 +17,7 @@
 #if TARGET_OS_OSX
 #import <CoreAudio/CoreAudio.h>
 #import <AudioUnit/AudioUnit.h>
-#import <libkern/OSAtomic.h>
+#import <stdatomic.h>
 #endif
 #import "FlutterScreenCaptureKitCapturer.h"
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
@@ -293,9 +293,10 @@ static inline BOOL HCIsActiveDisplayId(NSString* sourceId) { return NO; }
 // nativ 48 kHz, 2 Kanaele, 16-bit Int; der Wandler der AudioDataOutput macht
 // daraus Float, und das Relais braucht nichts Neues.
 //
-// Kennungen: enumerateDevices liefert auf macOS `RTCIODevice.deviceId` = die
-// CoreAudio-UID, und die ist GEMESSEN wortgleich mit `AVCaptureDevice.uniqueID`
-// (z. B. „AppleUSBAudioEngine:UGREEN 35871:UGREEN 35871:PRODUCT:3").
+// Kennungen: `enumerateDevices` liefert auf macOS als `deviceId` die CoreAudio-
+// GERAETENUMMER als Zeichenkette („148"), NICHT die UID — spaeter gemessen und
+// korrigiert, s. `HoneycordUidFuerGeraeteNummer`. Die UID wiederum ist wortgleich
+// mit `AVCaptureDevice.uniqueID` („AppleUSBAudioEngine:UGREEN 35871:…:PRODUCT:3").
 
 // ★ Alternative zum AVCapture-Ton (05.09. nachts): der Weg von OBS' „Audio-
 // Eingabeaufnahme" — CoreAudio-Audio-Unit (HALOutput, Eingang an, Ausgang aus)
@@ -336,11 +337,18 @@ static inline BOOL HCIsActiveDisplayId(NSString* sourceId) { return NO; }
   // der Puffer wird deshalb ohne Sperre über zwei atomare Indizes geführt
   // (ein Schreiber, ein Leser). Läuft er leer, gibt es Stille statt Knacken.
   AudioUnit _ausAu;
+  // ★ Der Ring gehoert dem AUFNEHMER, nicht dem Mithoeren: er entsteht beim
+  //   Start (wenn Rate und Kanalzahl feststehen) und stirbt erst in `dealloc`.
+  //   Vorher gab ihn `mithoerenBeenden` frei, waehrend der Eingangs-Rueckruf
+  //   weiterlief — Schreibzugriff auf freigegebenen Speicher und (bei
+  //   `_ringFrames == 0`) eine Division durch null. Pruefbefunde 1 und 2.
   int16_t *_ring;
   size_t _ringFrames;          // Kapazität in Frames
-  volatile int64_t _ringSchreib;
-  volatile int64_t _ringLese;
+  _Atomic(int64_t) _ringSchreib;
+  _Atomic(int64_t) _ringLese;
+  _Atomic(bool) _ringAktiv;    // schreibt der Eingang gerade in den Ring?
   uint64_t _leerlauf;          // wie oft der Leser nichts vorfand
+  uint64_t _ueberlauf;         // wie oft der Schreiber kuerzen musste (Drift!)
 }
 
 static OSStatus HoneycordAuhalInput(void *inRefCon, AudioUnitRenderActionFlags *ioActionFlags,
@@ -366,20 +374,27 @@ static OSStatus HoneycordAuhalInput(void *inRefCon, AudioUnitRenderActionFlags *
   }
   self.puffer++;
   if (self.puffer == 1 || (self.puffer % 500) == 0) {
-    NSLog(@"[geraete-ton auhal] Puffer #%llu frames=%u sr=%d ch=%zu", (unsigned long long)self.puffer, (unsigned)n, _rate, _kanaele);
+    // Fuellstand mitloggen: Karte und Ausgabegeraet haben zwei Uhren, der Ring
+    // wandert langsam (Pruefbefund 7). Leerlauf/Ueberlauf zeigen die Richtung.
+    const int64_t stand = atomic_load_explicit(&_ringSchreib, memory_order_relaxed)
+                        - atomic_load_explicit(&_ringLese, memory_order_relaxed);
+    NSLog(@"[geraete-ton auhal] Puffer #%llu frames=%u sr=%d ch=%zu%@",
+          (unsigned long long)self.puffer, (unsigned)n, _rate, _kanaele,
+          self.mithoeren ? [NSString stringWithFormat:@" mithoeren(stand=%lld leer=%llu voll=%llu)",
+                            (long long)stand, (unsigned long long)_leerlauf, (unsigned long long)_ueberlauf] : @"");
   }
   const int16_t *daten = (const int16_t *)_abl->mBuffers[0].mData;
   [self.relay verarbeiteInt16:daten frames:n channels:_kanaele sampleRate:_rate];
-  if (_ring != NULL && _ringFrames > 0) [self ringSchreiben:daten frames:n];
+  if (atomic_load_explicit(&_ringAktiv, memory_order_relaxed)) [self ringSchreiben:daten frames:n];
   return noErr;
 }
 
 // ── Ringpuffer (ein Schreiber, ein Leser) ──────────────────────────────────
 - (void)ringSchreiben:(const int16_t *)daten frames:(size_t)n {
-  const int64_t schreib = _ringSchreib;
-  const int64_t lese = _ringLese;
+  const int64_t schreib = atomic_load_explicit(&_ringSchreib, memory_order_relaxed);
+  const int64_t lese = atomic_load_explicit(&_ringLese, memory_order_acquire);
   const size_t frei = _ringFrames - (size_t)(schreib - lese) - 1;
-  if (n > frei) n = frei;              // Überlauf: das Älteste behalten, Neues kürzen
+  if (n > frei) { n = frei; _ueberlauf++; }   // Überlauf: Ältestes behalten, Neues kürzen
   if (n == 0) return;
   const size_t start = (size_t)(schreib % (int64_t)_ringFrames);
   const size_t bisEnde = _ringFrames - start;
@@ -388,13 +403,12 @@ static OSStatus HoneycordAuhalInput(void *inRefCon, AudioUnitRenderActionFlags *
   if (n > ersteFrames) {
     memcpy(_ring, daten + ersteFrames * _kanaele, (n - ersteFrames) * _kanaele * sizeof(int16_t));
   }
-  OSMemoryBarrier();
-  _ringSchreib = schreib + (int64_t)n;
+  atomic_store_explicit(&_ringSchreib, schreib + (int64_t)n, memory_order_release);
 }
 
 - (size_t)ringLesen:(int16_t *)ziel frames:(size_t)n {
-  const int64_t lese = _ringLese;
-  const int64_t schreib = _ringSchreib;
+  const int64_t lese = atomic_load_explicit(&_ringLese, memory_order_relaxed);
+  const int64_t schreib = atomic_load_explicit(&_ringSchreib, memory_order_acquire);
   size_t da = (size_t)(schreib - lese);
   if (da > n) da = n;
   if (da == 0) return 0;
@@ -405,8 +419,7 @@ static OSStatus HoneycordAuhalInput(void *inRefCon, AudioUnitRenderActionFlags *
   if (da > ersteFrames) {
     memcpy(ziel + ersteFrames * _kanaele, _ring, (da - ersteFrames) * _kanaele * sizeof(int16_t));
   }
-  OSMemoryBarrier();
-  _ringLese = lese + (int64_t)da;
+  atomic_store_explicit(&_ringLese, lese + (int64_t)da, memory_order_release);
   return da;
 }
 
@@ -422,7 +435,7 @@ static OSStatus HoneycordAuhalOutput(void *inRefCon, AudioUnitRenderActionFlags 
   int16_t *ziel = (int16_t *)ioData->mBuffers[0].mData;
   const size_t platz = ioData->mBuffers[0].mDataByteSize / (sizeof(int16_t) * _kanaele);
   const size_t n2 = n < platz ? n : platz;
-  size_t gelesen = (self.gestoppt || _ring == NULL) ? 0 : [self ringLesen:ziel frames:n2];
+  size_t gelesen = (self.gestoppt || _ring == NULL || _ringFrames == 0) ? 0 : [self ringLesen:ziel frames:n2];
   if (gelesen < n2) {
     // Stille auffüllen statt alte Daten wiederholen (kein Knacken).
     memset(ziel + gelesen * _kanaele, 0, (n2 - gelesen) * _kanaele * sizeof(int16_t));
@@ -435,14 +448,12 @@ static OSStatus HoneycordAuhalOutput(void *inRefCon, AudioUnitRenderActionFlags 
 
 /// Zweite Audio-Unit auf dem Standard-Ausgabegerät, gefüttert aus dem Ring.
 - (BOOL)mithoerenStarten {
+  if (self.gestoppt) return NO;          // nach `stop` nichts mehr aufmachen (Prüfbefund 9)
   if (_ausAu != NULL) return YES;
-  if (_rate <= 0 || _kanaele == 0) return NO;
-  // Ringpuffer: eine halbe Sekunde reicht reichlich und kostet 96 KB bei 48 kHz stereo.
-  _ringFrames = (size_t)_rate / 2;
-  _ring = (int16_t *)calloc(_ringFrames * _kanaele, sizeof(int16_t));
-  _ringSchreib = 0;
-  _ringLese = 0;
-  if (_ring == NULL) return NO;
+  if (_rate <= 0 || _kanaele == 0 || _ring == NULL || _ringFrames == 0) return NO;
+  atomic_store_explicit(&_ringSchreib, 0, memory_order_relaxed);
+  atomic_store_explicit(&_ringLese, 0, memory_order_relaxed);
+  atomic_store_explicit(&_ringAktiv, true, memory_order_release);
   AudioComponentDescription d = { kAudioUnitType_Output, kAudioUnitSubType_DefaultOutput, kAudioUnitManufacturer_Apple, 0, 0 };
   AudioComponent comp = AudioComponentFindNext(NULL, &d);
   OSStatus st = comp ? AudioComponentInstanceNew(comp, &_ausAu) : -1;
@@ -471,18 +482,21 @@ static OSStatus HoneycordAuhalOutput(void *inRefCon, AudioUnitRenderActionFlags 
 
 - (void)mithoerenBeenden {
   self.mithoeren = NO;
+  // Erst den Schreiber abmelden, dann die Ausgabe stoppen. Der Ring selbst
+  // bleibt bis `dealloc` stehen — ihn hier freizugeben hiesse, ihn unter dem
+  // laufenden Eingangs-Rueckruf wegzuziehen (Pruefbefunde 1/2).
+  atomic_store_explicit(&_ringAktiv, false, memory_order_release);
   AudioUnit au = _ausAu;
   if (au) {
-    AudioOutputUnitStop(au);
+    AudioOutputUnitStop(au);   // wartet auf den laufenden Ausgabe-Rueckruf
     _ausAu = NULL;
     AudioUnitUninitialize(au);
     AudioComponentInstanceDispose(au);
-    NSLog(@"[geraete-ton auhal] Mithoeren aus (%llu Leerlaeufe)", (unsigned long long)_leerlauf);
+    NSLog(@"[geraete-ton auhal] Mithoeren aus (%llu Leerlaeufe, %llu Ueberlaeufe)",
+          (unsigned long long)_leerlauf, (unsigned long long)_ueberlauf);
   } else {
     _ausAu = NULL;
   }
-  if (_ring) { free(_ring); _ring = NULL; }
-  _ringFrames = 0;
 }
 
 - (BOOL)startMitGeraeteNummer:(AudioDeviceID)dev fehler:(NSError **)fehler {
@@ -515,6 +529,14 @@ static OSStatus HoneycordAuhalOutput(void *inRefCon, AudioUnitRenderActionFlags 
   AURenderCallbackStruct cb = { HoneycordAuhalInput, (__bridge void *)self };
   st = AudioUnitSetProperty(_au, kAudioOutputUnitProperty_SetInputCallback, kAudioUnitScope_Global, 0, &cb, sizeof(cb));
   if (st != noErr) { AudioComponentInstanceDispose(_au); _au = NULL; if (fehler) *fehler = [NSError errorWithDomain:@"honeycord" code:st userInfo:@{NSLocalizedDescriptionKey: @"AUHAL: Callback"}]; return NO; }
+  // Ring fuer das Mithoeren gleich hier anlegen (eine halbe Sekunde, ~94 KB) —
+  // dann kann ihn niemand unter dem laufenden Eingang wegziehen.
+  _ringFrames = (size_t)_rate / 2;
+  _ring = (int16_t *)calloc(_ringFrames * _kanaele, sizeof(int16_t));
+  if (_ring == NULL) _ringFrames = 0;
+  atomic_store_explicit(&_ringSchreib, 0, memory_order_relaxed);
+  atomic_store_explicit(&_ringLese, 0, memory_order_relaxed);
+  atomic_store_explicit(&_ringAktiv, false, memory_order_relaxed);
   _ablFrames = 8192;
   _abl = (AudioBufferList *)calloc(1, sizeof(AudioBufferList));
   _abl->mNumberBuffers = 1;
@@ -579,7 +601,6 @@ static OSStatus HoneycordAuhalOutput(void *inRefCon, AudioUnitRenderActionFlags 
   AudioUnit au = _au;
   RTCCustomAudioSource *source = self.source;
   const uint64_t puffer = self.puffer;
-  [self mithoerenBeenden];   // Ausgabe zuerst — sonst liest sie aus einem freigegebenen Ring
   [self lebtBeobachterEntfernen];
   // ★ SYNCHRON stoppen (gemessen 06.09. 09:13): der Aufrufer laesst der Karte
   // danach Zeit, bevor er ihr Bild stoppt — das geht nur, wenn der Ton-Abbau
@@ -590,6 +611,8 @@ static OSStatus HoneycordAuhalOutput(void *inRefCon, AudioUnitRenderActionFlags 
   // ★ REIHENFOLGE (Pruefbefund 06.09.): erst `AudioOutputUnitStop` — das wartet
   // dokumentiert auf den laufenden IOProc —, DANN `_au` nullen. Andersherum
   // konnte der Render-Rueckruf `AudioUnitRender(NULL, …)` aufrufen.
+  // ★ Reihenfolge (Pruefbefund 1): ZUERST den Eingang anhalten — danach kann
+  // kein Rueckruf mehr in den Ring schreiben —, dann das Mithoeren abbauen.
   if (au) {
     AudioOutputUnitStop(au);
     _au = NULL;
@@ -598,6 +621,7 @@ static OSStatus HoneycordAuhalOutput(void *inRefCon, AudioUnitRenderActionFlags 
   } else {
     _au = NULL;
   }
+  [self mithoerenBeenden];
   [source stop];
   NSLog(@"[geraete-ton auhal] gestoppt (%llu Puffer)", (unsigned long long)puffer);
 }
@@ -605,6 +629,7 @@ static OSStatus HoneycordAuhalOutput(void *inRefCon, AudioUnitRenderActionFlags 
 - (void)dealloc {
   [self stop];   // Unit freigeben, falls der Aufrufer es versaeumt hat (Pruefbefund 7)
   if (_abl) { free(_abl->mBuffers[0].mData); free(_abl); _abl = NULL; }
+  if (_ring) { free(_ring); _ring = NULL; _ringFrames = 0; }
 }
 @end
 
@@ -1662,7 +1687,10 @@ static NSString *HoneycordUidFuerGeraeteNummer(NSString *nummer) {
     // OBS-Weg fuer den Ton: Audio-Unit direkt am Geraet (Geraetenummer aus enumerateDevices).
     const long long nummer = [deviceId longLongValue];
     if (nummer <= 0) {
-      result([FlutterError errorWithCode:@"captureAudio" message:@"AUHAL braucht die Geraetenummer" details:deviceId]);
+      // Kennung ist keine Geraetenummer (z. B. eine UID) — der AVCapture-Weg
+      // kann sie direkt oeffnen, also dorthin statt zu scheitern (Pruefbefund 18).
+      NSLog(@"[geraete-ton auhal] '%@' ist keine Geraetenummer — Rueckfall auf AVCaptureSession", deviceId);
+      [self honeycordCaptureAudioStart:deviceId weg:nil mithoeren:mithoeren result:result];
       return;
     }
     RTCCustomAudioSource *quelle = [[RTCCustomAudioSource alloc] initWithFactory:self.peerConnectionFactory];
@@ -1674,14 +1702,15 @@ static NSString *HoneycordUidFuerGeraeteNummer(NSString *nummer) {
     NSError *fehler = nil;
     if (![auf startMitGeraeteNummer:(AudioDeviceID)nummer fehler:&fehler]) {
       [quelle stop];
-      NSLog(@"[geraete-ton auhal] Start fehlgeschlagen: %@ (%ld) — Rueckfall auf AVCaptureSession",
-            fehler.localizedDescription, (long)fehler.code);
+      NSLog(@"[geraete-ton auhal] Start fehlgeschlagen: %@ (%ld) — Rueckfall auf AVCaptureSession%@",
+            fehler.localizedDescription, (long)fehler.code,
+            mithoeren ? @" (OHNE Mithoeren — der Rueckfallweg kann es nicht)" : @"");
       // ★ Rueckfall (Pruefbefund 15): der AVCapture-Weg bleibt als zweiter Weg
       // verdrahtet — bei genau EINER getesteten Karte ist ein Ersatzpfad Gold wert.
       [self honeycordCaptureAudioStart:deviceId weg:nil mithoeren:mithoeren result:result];
       return;
     }
-    if (mithoeren) [auf mithoerenStarten];
+    const BOOL mithoerenOk = mithoeren ? [auf mithoerenStarten] : NO;
     NSString *streamId = [[NSUUID UUID] UUIDString];
     NSString *trackId = [[NSUUID UUID] UUIDString];
     RTCMediaStream *stream = [self.peerConnectionFactory mediaStreamWithStreamId:streamId];
@@ -1696,6 +1725,7 @@ static NSString *HoneycordUidFuerGeraeteNummer(NSString *nummer) {
     self.honeycordTonAufnehmer[trackId] = auf;
     NSLog(@"[geraete-ton auhal] Stream %@ Spur %@ fuer Geraet %lld", streamId, trackId, nummer);
     result(@{ @"streamId" : streamId,
+              @"mithoeren" : @(mithoerenOk),
               @"audioTracks" : @[ @{ @"id" : trackId, @"kind" : spur.kind, @"label" : @"capture-card-audio",
                                      @"enabled" : @(spur.isEnabled), @"remote" : @(NO), @"readyState" : @"live" } ],
               @"videoTracks" : @[] });

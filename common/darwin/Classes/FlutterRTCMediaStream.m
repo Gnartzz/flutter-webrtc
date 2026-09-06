@@ -728,7 +728,7 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
       NSLog(@"[hc-fps] vorab aktiv %.3f fps", vorab);
       [videoDevice unlockForConfiguration];
     }
-    // Die Video-Track-Id entsteht vor dem Start (der Stop-Handler braucht sie).
+    // Die Video-Track-Id entsteht schon hier (sie geht in den Stop-Handler ein).
     NSString* trackUUID = [[NSUUID UUID] UUIDString];
     HoneycordFormatWaechter* waechter = (pinFps > 0)
         ? [[HoneycordFormatWaechter alloc] initMitGeraet:videoDevice session:self.videoCapturer.captureSession zielFps:pinFps] : nil;
