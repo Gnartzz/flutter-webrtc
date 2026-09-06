@@ -203,7 +203,6 @@ static FlutterWebRTCPlugin *sharedSingleton;
   self.videoCapturerStopHandlers = [NSMutableDictionary new];
   self.videoCapturers = [NSMutableDictionary new];
   self.honeycordTonAufnehmer = [NSMutableDictionary new];
-  self.honeycordTonWartend = [NSMutableDictionary new];
   self.recorders = [NSMutableDictionary new];
 #if TARGET_OS_IPHONE
   self.focusMode = @"locked";
@@ -416,26 +415,17 @@ static FlutterWebRTCPlugin *sharedSingleton;
     NSDictionary* argsMap = call.arguments;
     NSDictionary* constraints = argsMap[@"constraints"];
     [self getDisplayMedia:constraints result:result];
-  } else if ([@"honeycordCaptureAudioFuerVideo" isEqualToString:call.method]) {
-    // HoneyCord (OBS-Weg): den mit dem Bild in EINER Session gestarteten Ton
-    // der Capture-Karte abholen (angelegt in getUserVideo, Schluessel
-    // `honeycordTonGeraet` in den Video-Constraints).
-    NSDictionary* argsMap = call.arguments;
-    NSString* videoTrackId = argsMap[@"videoTrackId"];
-    NSDictionary* fertig = videoTrackId ? self.honeycordTonWartend[videoTrackId] : nil;
-    if (fertig == nil) {
-      result([FlutterError errorWithCode:@"captureAudio" message:@"kein Karten-Ton fuer diese Videospur" details:videoTrackId]);
-    } else {
-      [self.honeycordTonWartend removeObjectForKey:videoTrackId];
-      result(fertig);
-    }
   } else if ([@"honeycordCaptureAudioStart" isEqualToString:call.method]) {
     // HoneyCord Block 2: Ton der Capture-Karte (macOS). Windows hat denselben
     // Methodennamen in flutter_webrtc.cc (WASAPI); hier AVCaptureSession.
     NSDictionary* argsMap = call.arguments;
     NSString* deviceId = argsMap[@"deviceId"];
     NSString* weg = argsMap[@"weg"];
-    [self honeycordCaptureAudioStart:(deviceId ?: @"") weg:([weg isKindOfClass:[NSString class]] ? weg : nil) result:result];
+    NSNumber* mit = argsMap[@"mithoeren"];
+    [self honeycordCaptureAudioStart:(deviceId ?: @"")
+                                 weg:([weg isKindOfClass:[NSString class]] ? weg : nil)
+                           mithoeren:[mit isKindOfClass:[NSNumber class]] ? mit.boolValue : NO
+                              result:result];
   } else if ([@"requestCapturePermission" isEqualToString:call.method]) {
 #if TARGET_OS_OSX || TARGET_OS_MACCATALYST
     if (@available(macOS 10.15, macCatalyst 13.1, *)) {

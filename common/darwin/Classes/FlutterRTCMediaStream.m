@@ -728,18 +728,8 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
       NSLog(@"[hc-fps] vorab aktiv %.3f fps", vorab);
       [videoDevice unlockForConfiguration];
     }
-    // ★ OBS-Weg (05.09. nachts): Ton der Capture-Karte in DIESELBE Session wie das
-    // Bild, BEVOR der Capturer startet. Die Video-Track-Id entsteht deshalb schon
-    // hier (sie war vorher erst nach dem Start vergeben).
+    // Die Video-Track-Id entsteht vor dem Start (der Stop-Handler braucht sie).
     NSString* trackUUID = [[NSUUID UUID] UUIDString];
-    NSString* tonGeraet = videoConstraints[@"honeycordTonGeraet"];
-    BOOL tonInSession = NO;
-#if TARGET_OS_OSX
-    if ([tonGeraet isKindOfClass:[NSString class]] && tonGeraet.length > 0) {
-      tonInSession = [self honeycordTonInSession:self.videoCapturer.captureSession geraetId:tonGeraet fuerVideoTrack:trackUUID];
-      NSLog(@"[geraete-ton] OBS-Weg vor dem Start: %@", tonInSession ? @"eingehaengt" : @"NICHT eingehaengt");
-    }
-#endif
     HoneycordFormatWaechter* waechter = (pinFps > 0)
         ? [[HoneycordFormatWaechter alloc] initMitGeraet:videoDevice session:self.videoCapturer.captureSession zielFps:pinFps] : nil;
     [self.videoCapturer startCaptureWithDevice:videoDevice
@@ -767,12 +757,6 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
                                const double aktiv = HoneycordAktiveFps(fpsDevice);
                                if (aktiv > 0 && fabs(aktiv - zielFps) < 0.05) {
                                  NSLog(@"[hc-fps] nach Start: schon %.3f fps (Ziel %.3f) — kein Neustart (device %@)", aktiv, zielFps, cls);
-                               } else if (tonInSession) {
-                                 // ★ Laeuft der Ton der Capture-Karte, ist der Neustart des
-                                 // Video-Stroms genau das, was die Karte anhaelt (gemessen
-                                 // 21:58/22:14/22:26/22:37). Lieber die Vorgabe-Rate behalten
-                                 // (LiveKit deckelt die Encoder-Rate ohnehin) als eine tote Karte.
-                                 NSLog(@"[hc-fps] nach Start: %.3f statt %.3f fps — KEIN Neustart, weil der Karten-Ton in dieser Session haengt (device %@)", aktiv, zielFps, cls);
                                } else {
                                  const double jetzt = HoneycordPinnen(fpsDevice, fpsDevice.activeFormat, pinFps, @"nach Start");
                                  NSLog(@"[hc-fps] nach Start: war %.3f, jetzt %.3f fps (Ziel %.3f, device %@)", aktiv, jetzt, zielFps, cls);
@@ -791,26 +775,8 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
     LocalVideoTrack *localVideoTrack = [[LocalVideoTrack alloc] initWithTrack:videoTrack videoProcessing:videoProcessingAdapter];
       
     __weak RTCCameraVideoCapturer* capturer = self.videoCapturer;
-    __weak FlutterWebRTCPlugin* weakSelfStop = self;
     self.videoCapturerStopHandlers[videoTrack.trackId] = ^(CompletionHandler handler) {
       NSLog(@"Stop video capturer, trackID %@", videoTrack.trackId);
-      // OBS-Weg: der Karten-Ton haengt in dieser Session — Quelle mit schliessen
-      // (Stream-Id aus der Warteschlange oder ueber die Aufnehmer-Liste).
-      FlutterWebRTCPlugin* me = weakSelfStop;
-      NSDictionary* wartend = me ? me.honeycordTonWartend[videoTrack.trackId] : nil;
-      if (wartend) {
-        NSString* sId = wartend[@"streamId"];
-        NSString* tId = [wartend[@"audioTracks"] firstObject][@"id"];
-        [me honeycordCaptureAudioStopFuer:sId];
-        [me.honeycordTonWartend removeObjectForKey:videoTrack.trackId];
-        // Nicht abgeholter Ton-Stream: Stream/Spur ebenfalls freigeben — aber
-        // ASYNCHRON, denn trackDispose enumeriert gerade `localStreams`
-        // (Pruefbefund 2: „mutated while being enumerated").
-        dispatch_async(dispatch_get_main_queue(), ^{
-          if (tId) [me.localTracks removeObjectForKey:tId];
-          if (sId) [me.localStreams removeObjectForKey:sId];
-        });
-      }
       [capturer stopCaptureWithCompletionHandler:handler];
     };
     // STARK halten, bis die Spur endet — die schwache Referenz im Handler

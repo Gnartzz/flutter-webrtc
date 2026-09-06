@@ -45,10 +45,6 @@ typedef void (^CapturerStopHandler)(CompletionHandler _Nonnull handler);
 /// Track-Id eingetragen — beide Wege (mediaStreamDispose, trackDispose) muessen
 /// den Aufnehmer finden.
 @property(nonatomic, strong) NSMutableDictionary<NSString*, id>* _Nullable honeycordTonAufnehmer;
-/// HoneyCord (OBS-Weg): Ton der Capture-Karte liegt in der VIDEO-Session des
-/// Capturers; der fertige Ton-Stream wartet hier unter der Video-Track-Id auf
-/// den Abruf durch `honeycordCaptureAudioFuerVideo`.
-@property(nonatomic, strong) NSMutableDictionary<NSString*, NSDictionary*>* _Nullable honeycordTonWartend;
 
 @property(nonatomic, strong)
     NSMutableDictionary<NSString*, RTCFrameCryptor*>* _Nullable frameCryptors;

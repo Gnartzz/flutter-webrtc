@@ -224,35 +224,20 @@ class Helper {
   /// 05.09.2026 macOS (AVCaptureSession, Block 2), sonst `null`.
   /// `weg` (macOS): `'auhal'` = CoreAudio-Audio-Unit direkt am Geraet (wie OBS'
   /// Audio-Eingabeaufnahme), sonst AVCaptureSession.
-  static Future<MediaStream?> honeycordCaptureAudioStart(String deviceId, {String? weg}) async {
+  /// `mithoeren` (macOS): denselben Ton zusaetzlich auf das Standard-Ausgabegeraet
+  /// legen — der Sender hoert seine Freigabe sonst nie.
+  static Future<MediaStream?> honeycordCaptureAudioStart(String deviceId,
+      {String? weg, bool mithoeren = false}) async {
     if (!WebRTC.platformIsWindows && !WebRTC.platformIsMacOS) return null;
-    final r = await WebRTC.invokeMethod(
-        'honeycordCaptureAudioStart', {'deviceId': deviceId, if (weg != null) 'weg': weg});
+    final r = await WebRTC.invokeMethod('honeycordCaptureAudioStart', {
+      'deviceId': deviceId,
+      if (weg != null) 'weg': weg,
+      if (mithoeren) 'mithoeren': true,
+    });
     if (r is! Map || r['streamId'] is! String) return null;
     final stream = MediaStreamNative(r['streamId'] as String, 'local');
     stream.setMediaTracks(r['audioTracks'], r['videoTracks']);
     return stream;
-  }
-
-  /// HoneyCord (Block 2, OBS-Weg, 05.09.2026): Der Ton der Capture-Karte wurde
-  /// mit dem Bild in EINER Capture-Session gestartet (Schluessel
-  /// `honeycordTonGeraet` in den Video-Constraints von getUserMedia, macOS).
-  /// Hier den fertigen Ton-Stream zur Videospur abholen; `stream.dispose()`
-  /// schliesst die Quelle. `null`, wenn es keinen gibt.
-  static Future<MediaStream?> honeycordCaptureAudioFuerVideo(String videoTrackId) async {
-    if (!WebRTC.platformIsMacOS) return null;
-    try {
-      final r = await WebRTC.invokeMethod(
-          'honeycordCaptureAudioFuerVideo', {'videoTrackId': videoTrackId});
-      if (r is! Map || r['streamId'] is! String) return null;
-      final stream = MediaStreamNative(r['streamId'] as String, 'local');
-      stream.setMediaTracks(r['audioTracks'], r['videoTracks']);
-      return stream;
-    } catch (e) {
-      // Sichtbar lassen — beim ersten Geraetetest zaehlt der Grund.
-      print('[capture-ton] honeycordCaptureAudioFuerVideo: $e');
-      return null;
-    }
   }
 
   /// HoneyCord: Laeuft der Ton der Bildschirmfreigabe gerade?
