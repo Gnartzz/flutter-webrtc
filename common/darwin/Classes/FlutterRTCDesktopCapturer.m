@@ -396,11 +396,14 @@ static OSStatus HoneycordAuhalInput(void *inRefCon, AudioUnitRenderActionFlags *
   AudioUnit au = _au; _au = NULL;
   RTCCustomAudioSource *source = self.source;
   const uint64_t puffer = self.puffer;
-  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-    if (au) { AudioOutputUnitStop(au); AudioUnitUninitialize(au); AudioComponentInstanceDispose(au); }
-    [source stop];
-    NSLog(@"[geraete-ton auhal] gestoppt (%llu Puffer)", (unsigned long long)puffer);
-  });
+  // ★ SYNCHRON stoppen (gemessen 06.09. 09:13): der Aufrufer laesst der Karte
+  // danach Zeit, bevor er ihr Bild stoppt — das geht nur, wenn der Ton-Abbau
+  // hier wirklich durch ist. `AudioOutputUnitStop` und das Abraeumen der Unit
+  // kosten wenige Millisekunden (die 5-s-Zeitueberschreitungen im Log stammen
+  // vom VIDEO-Endpunkt, nicht von hier).
+  if (au) { AudioOutputUnitStop(au); AudioUnitUninitialize(au); AudioComponentInstanceDispose(au); }
+  [source stop];
+  NSLog(@"[geraete-ton auhal] gestoppt (%llu Puffer)", (unsigned long long)puffer);
 }
 
 - (void)dealloc {
