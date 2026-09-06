@@ -415,6 +415,13 @@ static FlutterWebRTCPlugin *sharedSingleton;
     NSDictionary* argsMap = call.arguments;
     NSDictionary* constraints = argsMap[@"constraints"];
     [self getDisplayMedia:constraints result:result];
+  } else if ([@"honeycordCaptureAudioMithoeren" isEqualToString:call.method]) {
+    NSDictionary* argsMap = call.arguments;
+    NSString* sid = argsMap[@"streamId"];
+    NSNumber* an = argsMap[@"an"];
+    const BOOL laeuft = [self honeycordCaptureAudioMithoeren:(sid ?: @"")
+                                                          an:[an isKindOfClass:[NSNumber class]] ? an.boolValue : NO];
+    result(@{@"mithoeren": @(laeuft)});
   } else if ([@"honeycordCaptureAudioStart" isEqualToString:call.method]) {
     // HoneyCord Block 2: Ton der Capture-Karte (macOS). Windows hat denselben
     // Methodennamen in flutter_webrtc.cc (WASAPI); hier AVCaptureSession.

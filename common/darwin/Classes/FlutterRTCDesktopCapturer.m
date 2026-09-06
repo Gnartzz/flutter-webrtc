@@ -1814,6 +1814,26 @@ static NSString *HoneycordUidFuerGeraeteNummer(NSString *nummer) {
 #endif
 }
 
+/// Mithoeren eines laufenden Geraete-Tons im Betrieb ein-/ausschalten.
+/// Beruehrt NUR die Ausgabe-Unit auf dem Standard-Ausgabegeraet — die Karte
+/// selbst (Eingang, UVC-Video) bleibt unangetastet; deshalb ist das im Gegensatz
+/// zum Start des Tons gefahrlos. Gibt zurueck, ob es jetzt laeuft.
+- (BOOL)honeycordCaptureAudioMithoeren:(NSString *)streamOderTrackId an:(BOOL)an {
+#if TARGET_OS_OSX
+  id auf = self.honeycordTonAufnehmer[streamOderTrackId];
+  if (![auf isKindOfClass:[HoneycordAuhalTonAufnehmer class]]) {
+    NSLog(@"[geraete-ton auhal] Mithoeren: kein passender Aufnehmer zu %@", streamOderTrackId);
+    return NO;
+  }
+  HoneycordAuhalTonAufnehmer *a = auf;
+  if (an) return [a mithoerenStarten];
+  [a mithoerenBeenden];
+  return NO;
+#else
+  return NO;
+#endif
+}
+
 - (void)honeycordCaptureAudioStopFuer:(NSString *)streamOderTrackId {
 #if TARGET_OS_OSX
   id auf = self.honeycordTonAufnehmer[streamOderTrackId];

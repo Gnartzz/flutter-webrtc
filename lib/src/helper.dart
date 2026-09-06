@@ -240,6 +240,21 @@ class Helper {
     return stream;
   }
 
+  /// HoneyCord (macOS): Mithoeren eines laufenden Karten-Tons umschalten.
+  /// Beruehrt nur die Wiedergabe — die Karte selbst bleibt unangetastet.
+  /// Gibt zurueck, ob das Mithoeren jetzt laeuft.
+  static Future<bool> honeycordCaptureAudioMithoeren(String streamId, bool an) async {
+    if (!WebRTC.platformIsMacOS) return false;
+    try {
+      final r = await WebRTC.invokeMethod(
+          'honeycordCaptureAudioMithoeren', {'streamId': streamId, 'an': an});
+      return r is Map && r['mithoeren'] == true;
+    } catch (e) {
+      print('[capture-ton] Mithoeren umschalten: $e');
+      return false;
+    }
+  }
+
   /// HoneyCord: Laeuft der Ton der Bildschirmfreigabe gerade?
   static Future<Map<String, bool>> screenAudioState() async {
     if (!WebRTC.platformIsAndroid) return {'wanted': false, 'running': false};

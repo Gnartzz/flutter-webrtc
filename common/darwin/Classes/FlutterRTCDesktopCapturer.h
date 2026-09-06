@@ -25,6 +25,8 @@
 - (void)honeycordCaptureAudioStart:(nonnull NSString*)deviceId result:(nonnull FlutterResult)result;
 /// `weg` = @"auhal": CoreAudio-Audio-Unit direkt am Geraet (wie OBS' Audio-Eingabeaufnahme).
 - (void)honeycordCaptureAudioStart:(nonnull NSString*)deviceId weg:(nullable NSString*)weg result:(nonnull FlutterResult)result;
+/// Mithoeren im Betrieb umschalten (nur die Ausgabe; die Karte bleibt unberuehrt).
+- (BOOL)honeycordCaptureAudioMithoeren:(nonnull NSString*)streamOderTrackId an:(BOOL)an;
 /// `mithoeren` = YES: denselben Ton zusaetzlich auf das Standard-Ausgabegeraet legen.
 - (void)honeycordCaptureAudioStart:(nonnull NSString*)deviceId weg:(nullable NSString*)weg mithoeren:(BOOL)mithoeren result:(nonnull FlutterResult)result;
 /// Aufnehmer eines solchen Streams stoppen (Stream- oder Track-Id). Idempotent.
