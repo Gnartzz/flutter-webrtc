@@ -78,7 +78,7 @@ void FlutterWebRTC::HandleMethodCall(
 
     GetDisplayMedia(constraints, std::move(result));
   } else if (method_call.method_name().compare("honeycordCaptureAudioStart") == 0) {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
     if (!method_call.arguments()) {
       result->Error("Bad Arguments", "deviceId fehlt");
       return;
@@ -91,7 +91,7 @@ void FlutterWebRTC::HandleMethodCall(
     }
     CaptureAudioStart(deviceId, std::move(result));
 #else
-    result->Error("Unsupported", "Kartenton bisher nur unter Windows");
+    result->Error("Unsupported", "Kartenton nur unter Windows und Linux (macOS: Darwin-Plugin)");
 #endif
   } else if (method_call.method_name().compare("getDesktopSources") == 0) {
     // types: ["screen", "window"]

@@ -62,6 +62,18 @@ class PipewireLoopback {
  public:
   explicit PipewireLoopback(
       libwebrtc::scoped_refptr<libwebrtc::RTCAudioSource> source);
+  // ★ HoneyCord (10.09.2026, „Vier Stroeme" Block 3): Ton EINES Geraets
+  // (Capture-Karte) statt der Wiedergabe aller fremden Anwendungen.
+  // [ziel] ist die Geraete-Id aus enumerateDevices = der PulseAudio-Name der
+  // Quelle (`alsa_input.usb-…`, oder `<senke>.monitor`). PipeWire kennt ihn
+  // als `node.name`; bei `.monitor` ist das Ziel die Senke, und der Aufnehmer
+  // haengt sich mit `stream.capture.sink` an deren Monitor-Anschluesse.
+  // Verknuepft wird dann NICHT von Hand (Registratur), sondern ueber
+  // `target.object` + `node.autoconnect` — PipeWires eigene Zuordnung.
+  // Gemessen 10.09.2026 auf der Fedora-VM mit pw-record (Null-Senke als
+  // Karten-Attrappe): der Ton kommt an.
+  PipewireLoopback(libwebrtc::scoped_refptr<libwebrtc::RTCAudioSource> source,
+                   const std::string& ziel);
   ~PipewireLoopback();
 
   PipewireLoopback(const PipewireLoopback&) = delete;
@@ -126,6 +138,10 @@ class PipewireLoopback {
   std::vector<Anschluss> eigene_eingaenge_;  // Eingänge unseres Aufnehmers
   std::vector<uint32_t> apps_;               // fremde Wiedergabe-Knoten
   std::vector<Verknuepfung> links_;
+
+  // Leer = Systemton (alle fremden Wiedergaben); sonst der Zielknoten.
+  std::string ziel_knoten_;
+  bool ziel_ist_monitor_ = false;
 
   uint32_t own_node_id_ = 0;  // unser Aufnehmer (nie mit sich selbst verknüpfen)
   int own_pid_ = 0;

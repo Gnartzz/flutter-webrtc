@@ -112,6 +112,21 @@ PipewireLoopback::PipewireLoopback(
                   own_pid_, own_app_id_.c_str(), own_binary_.c_str());
 }
 
+PipewireLoopback::PipewireLoopback(
+    libwebrtc::scoped_refptr<libwebrtc::RTCAudioSource> source,
+    const std::string& ziel)
+    : PipewireLoopback(source) {
+  ziel_knoten_ = ziel;
+  const std::string endung = ".monitor";
+  if (ziel_knoten_.size() > endung.size() &&
+      ziel_knoten_.compare(ziel_knoten_.size() - endung.size(), endung.size(), endung) == 0) {
+    ziel_knoten_.resize(ziel_knoten_.size() - endung.size());
+    ziel_ist_monitor_ = true;
+  }
+  PwLogFromPlugin("Kartenton: Ziel '%s'%s", ziel_knoten_.c_str(),
+                  ziel_ist_monitor_ ? " (Monitor einer Senke)" : "");
+}
+
 PipewireLoopback::~PipewireLoopback() {
   Stop();
 }
@@ -184,6 +199,18 @@ bool PipewireLoopback::IstEigenerKnoten(const struct spa_dict* props) const {
 }
 
 void PipewireLoopback::HandleNode(uint32_t id, const struct spa_dict* props) {
+  // Zielmodus (Kartenton): PipeWire verknuepft selbst (target.object), hier
+  // wird nur protokolliert, ob das Ziel ueberhaupt existiert — das ist die
+  // haeufigste Fehlerursache (Karte abgezogen, Name veraltet).
+  if (!ziel_knoten_.empty()) {
+    const char* name = spa_dict_lookup(props, PW_KEY_NODE_NAME);
+    if (name && ziel_knoten_ == name) {
+      const char* mc = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS);
+      PwLogFromPlugin("Kartenton: Zielknoten %u gefunden (%s, %s)", id, name,
+                      mc ? mc : "?");
+    }
+    return;
+  }
   const char* media_class = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS);
   if (!media_class || strcmp(media_class, kAppPlaybackClass) != 0) return;
 
@@ -208,6 +235,7 @@ void PipewireLoopback::HandleNode(uint32_t id, const struct spa_dict* props) {
 }
 
 void PipewireLoopback::HandlePort(uint32_t id, const struct spa_dict* props) {
+  if (!ziel_knoten_.empty()) return;  // Zielmodus: keine Handverknuepfung
   const char* richtung = spa_dict_lookup(props, PW_KEY_PORT_DIRECTION);
   const char* knoten = spa_dict_lookup(props, PW_KEY_NODE_ID);
   if (!richtung || !knoten) return;
@@ -416,15 +444,32 @@ bool PipewireLoopback::Start() {
     pw_registry_add_listener(registry_, &hooks_->registry, &registry_events, this);
   }
 
-  pw_properties* props = pw_properties_new(
-      PW_KEY_MEDIA_TYPE, "Audio", PW_KEY_MEDIA_CATEGORY, "Capture",
-      PW_KEY_MEDIA_ROLE, "Screen", PW_KEY_NODE_NAME, "honeycord-bildschirmton",
-      PW_KEY_NODE_DESCRIPTION, "HoneyCord Bildschirmton",
-      // NICHT automatisch verbinden: sonst haengt PipeWire uns an die
-      // Standard-Quelle (= Monitor inkl. unserer eigenen Wiedergabe) und der
-      // Selbst-Ausschluss waere hinfaellig.
-      PW_KEY_NODE_AUTOCONNECT, "false", nullptr);
-  stream_ = pw_stream_new(core_, "HoneyCord Bildschirmton", props);
+  pw_properties* props;
+  if (ziel_knoten_.empty()) {
+    props = pw_properties_new(
+        PW_KEY_MEDIA_TYPE, "Audio", PW_KEY_MEDIA_CATEGORY, "Capture",
+        PW_KEY_MEDIA_ROLE, "Screen", PW_KEY_NODE_NAME, "honeycord-bildschirmton",
+        PW_KEY_NODE_DESCRIPTION, "HoneyCord Bildschirmton",
+        // NICHT automatisch verbinden: sonst haengt PipeWire uns an die
+        // Standard-Quelle (= Monitor inkl. unserer eigenen Wiedergabe) und der
+        // Selbst-Ausschluss waere hinfaellig.
+        PW_KEY_NODE_AUTOCONNECT, "false", nullptr);
+  } else {
+    // Kartenton: GENAU dieses Geraet, von PipeWire selbst verknuepft. Fuer
+    // eine Senke (`.monitor`) sagt `stream.capture.sink`, dass wir ihren
+    // Monitor wollen; fuer eine Quelle (ALSA-Eingang der Karte) ist der
+    // Schluessel ohne Wirkung. Kein Selbst-Ausschluss noetig — unsere eigene
+    // Wiedergabe haengt nicht an der Karte.
+    props = pw_properties_new(
+        PW_KEY_MEDIA_TYPE, "Audio", PW_KEY_MEDIA_CATEGORY, "Capture",
+        PW_KEY_MEDIA_ROLE, "Music", PW_KEY_NODE_NAME, "honeycord-kartenton",
+        PW_KEY_NODE_DESCRIPTION, "HoneyCord Kartenton",
+        PW_KEY_TARGET_OBJECT, ziel_knoten_.c_str(),
+        PW_KEY_NODE_AUTOCONNECT, "true", nullptr);
+    if (ziel_ist_monitor_) pw_properties_set(props, "stream.capture.sink", "true");
+  }
+  stream_ = pw_stream_new(
+      core_, ziel_knoten_.empty() ? "HoneyCord Bildschirmton" : "HoneyCord Kartenton", props);
   if (!stream_) {
     PwLogFromPlugin("Start: Aufnehmer liess sich nicht anlegen");
     pw_thread_loop_unlock(loop_);
@@ -465,7 +510,8 @@ bool PipewireLoopback::Start() {
   }
 
   started_ = true;
-  PwLogFromPlugin("Start: laeuft (eigene pid %d, 48 kHz/16 Bit/stereo)", own_pid_);
+  PwLogFromPlugin("Start: laeuft (eigene pid %d, 48 kHz/16 Bit/stereo%s%s)", own_pid_,
+                  ziel_knoten_.empty() ? "" : ", Ziel ", ziel_knoten_.c_str());
   return true;
 }
 

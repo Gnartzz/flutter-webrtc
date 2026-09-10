@@ -260,6 +260,58 @@ void FlutterScreenCapture::StopLoopbackForStream(const std::string& stream_id) {
   wasapi_loopbacks_.erase(it);
 }
 #elif defined(__linux__)
+// ★ HoneyCord (10.09.2026, „Vier Stroeme" Block 3): Kartenton unter Linux.
+// Spiegel der Windows-Fassung oben; die Quelle ist ein PipeWire-Aufnehmer, den
+// PipeWire selbst an das gewaehlte Geraet haengt (target.object). Aufraeumen
+// ueber denselben streamDispose-Weg (StopLoopbackForStream).
+void FlutterScreenCapture::CaptureAudioStart(const std::string& device_id,
+                                             std::unique_ptr<MethodResultProxy> result) {
+  honeycord::PwLogFromPlugin("captureAudioStart: geraet=%s", device_id.c_str());
+  if (device_id.empty()) {
+    result->Error("captureAudio", "deviceId leer");
+    return;
+  }
+  scoped_refptr<RTCAudioSource> audio_source = base_->factory_->CreateAudioSource(
+      "capture-card-audio", RTCAudioSource::SourceType::kCustom);
+  if (!audio_source.get()) {
+    result->Error("captureAudio", "CreateAudioSource fehlgeschlagen");
+    return;
+  }
+  auto audio_uuid = base_->GenerateUUID();
+  scoped_refptr<RTCAudioTrack> audio_track =
+      base_->factory_->CreateAudioTrack(audio_source, audio_uuid.c_str());
+  if (!audio_track.get()) {
+    result->Error("captureAudio", "CreateAudioTrack fehlgeschlagen");
+    return;
+  }
+  auto loopback = std::make_unique<honeycord::PipewireLoopback>(audio_source, device_id);
+  if (!loopback->Start()) {
+    honeycord::PwLogFromPlugin("captureAudioStart: Start fehlgeschlagen");
+    result->Error("captureAudio", "Aufnahmegeraet liess sich nicht oeffnen");
+    return;
+  }
+  std::string uuid = base_->GenerateUUID();
+  scoped_refptr<RTCMediaStream> stream = base_->factory_->CreateStream(uuid.c_str());
+  EncodableList audio_tracks;
+  EncodableMap a_info;
+  a_info[EncodableValue("id")] = EncodableValue(audio_track->id().std_string());
+  a_info[EncodableValue("label")] = EncodableValue(std::string("capture-card-audio"));
+  a_info[EncodableValue("kind")] = EncodableValue(audio_track->kind().std_string());
+  a_info[EncodableValue("enabled")] = EncodableValue(audio_track->enabled());
+  audio_tracks.push_back(EncodableValue(a_info));
+  stream->AddTrack(audio_track);
+  base_->local_tracks_[audio_track->id().std_string()] = audio_track;
+  pipewire_loopbacks_[uuid] = std::move(loopback);
+  base_->local_streams_[uuid] = stream;
+  honeycord::PwLogFromPlugin("captureAudioStart: ok stream=%s track=%s",
+                             uuid.c_str(), audio_track->id().std_string().c_str());
+  EncodableMap params;
+  params[EncodableValue("streamId")] = EncodableValue(uuid);
+  params[EncodableValue("audioTracks")] = EncodableValue(audio_tracks);
+  params[EncodableValue("videoTracks")] = EncodableValue(EncodableList());
+  result->Success(EncodableValue(params));
+}
+
 void FlutterScreenCapture::StopLoopbackForStream(const std::string& stream_id) {
   auto it = pipewire_loopbacks_.find(stream_id);
   if (it == pipewire_loopbacks_.end()) return;

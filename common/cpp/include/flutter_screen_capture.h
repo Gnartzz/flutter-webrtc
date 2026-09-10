@@ -52,6 +52,10 @@ class FlutterScreenCapture : public MediaListObserver,
 #elif defined(__linux__)
   // Linux-Pendant (PipeWire): gleiche Aufgabe, gleicher Aufrufer.
   void StopLoopbackForStream(const std::string& stream_id);
+  // ★ HoneyCord (10.09.2026, Block 3): Kartenton unter Linux — PipeWire-Aufnehmer
+  // mit target.object auf dem gewaehlten Aufnahmegeraet.
+  void CaptureAudioStart(const std::string& device_id,
+                         std::unique_ptr<MethodResultProxy> result);
 #endif
 
  protected:
