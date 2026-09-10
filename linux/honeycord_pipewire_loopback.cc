@@ -411,7 +411,8 @@ bool PipewireLoopback::Start() {
   hooks_ = new Hooks();
   memset(hooks_, 0, sizeof(Hooks));
 
-  loop_ = pw_thread_loop_new("honeycord-bildschirmton", nullptr);
+  loop_ = pw_thread_loop_new(
+      ziel_knoten_.empty() ? "honeycord-bildschirmton" : "honeycord-kartenton", nullptr);
   if (!loop_) {
     PwLogFromPlugin("Start: eigene Schleife liess sich nicht anlegen");
     Stop();

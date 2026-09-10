@@ -228,7 +228,11 @@ class Helper {
   /// legen — der Sender hoert seine Freigabe sonst nie.
   static Future<MediaStream?> honeycordCaptureAudioStart(String deviceId,
       {String? weg, bool mithoeren = false}) async {
-    if (!WebRTC.platformIsWindows && !WebRTC.platformIsMacOS) return null;
+    // ★ Linux seit 10.09.2026 (Block 3, PipeWire target.object). Pruefbefund H2:
+    // dieses Gate hatte den ganzen nativen Linux-Weg unerreichbar gemacht.
+    if (!WebRTC.platformIsWindows && !WebRTC.platformIsMacOS && !WebRTC.platformIsLinux) {
+      return null;
+    }
     final r = await WebRTC.invokeMethod('honeycordCaptureAudioStart', {
       'deviceId': deviceId,
       if (weg != null) 'weg': weg,
