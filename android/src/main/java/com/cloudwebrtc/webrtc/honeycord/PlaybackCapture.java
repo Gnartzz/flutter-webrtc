@@ -68,6 +68,84 @@ public final class PlaybackCapture {
 
     private int rate, kanaele;
 
+    // ── Pegel-Messung (#125, Diagnose 17.09.2026) ─────────────────────────
+    //
+    // Tims Meldung: der Freigabeton vom Handy übertönt alles. Bevor wir den
+    // Pegel absenken, wird gemessen, WIE laut Mikrofon und System-Ton hier im
+    // Haken ankommen — also VOR Echo-Unterdrückung und Aussteuerung von WebRTC.
+    //
+    // ★ Läuft ausschließlich, solange eine Aufnahme aktiv ist (`fuelleIntern`
+    // wird nur dann gerufen). Ein Gespräch mit Kamera oder nur Mikrofon
+    // berührt diesen Code nicht: dort endet `ScreenAudio.pufferHaken` schon in
+    // der ersten Zeile. Nur der WebRTC-Aufnahmefaden schreibt hier, deshalb
+    // ohne Sperre.
+    private static final long BERICHT_NS = 5_000_000_000L;
+    private long berichtStart = 0;
+    private double quadMik = 0, quadSys = 0;
+    private long werteMik = 0, werteSys = 0;
+    private int spitzeMik = 0, spitzeSys = 0;
+    private long bytesGewollt = 0, bytesGeliefert = 0;
+    private int aufrufe = 0, teilweise = 0, leer = 0;
+
+    private static double dbfs(double wert) {
+        return wert <= 0 ? -120.0 : 20.0 * Math.log10(wert / 32768.0);
+    }
+
+    /** Pegel eines 16-Bit-PCM-Bereichs aufsummieren. */
+    private void messe(ByteBuffer puffer, int start, int bytes, boolean mik) {
+        double q = 0;
+        int spitze = 0;
+        int n = 0;
+        for (int i = 0; i + 1 < bytes; i += 2) {
+            int v = (short) ((puffer.get(start + i) & 0xFF) | (puffer.get(start + i + 1) << 8));
+            q += (double) v * v;
+            int b = Math.abs(v);
+            if (b > spitze) spitze = b;
+            n++;
+        }
+        if (mik) { quadMik += q; werteMik += n; spitzeMik = Math.max(spitzeMik, spitze); }
+        else { quadSys += q; werteSys += n; spitzeSys = Math.max(spitzeSys, spitze); }
+    }
+
+    private void messe(byte[] daten, int bytes) {
+        double q = 0;
+        int spitze = 0;
+        int n = 0;
+        for (int i = 0; i + 1 < bytes; i += 2) {
+            int v = (short) ((daten[i] & 0xFF) | (daten[i + 1] << 8));
+            q += (double) v * v;
+            int b = Math.abs(v);
+            if (b > spitze) spitze = b;
+            n++;
+        }
+        quadSys += q; werteSys += n; spitzeSys = Math.max(spitzeSys, spitze);
+    }
+
+    private void berichteWennFaellig(boolean mischen) {
+        long jetzt = System.nanoTime();
+        if (berichtStart == 0) { berichtStart = jetzt; return; }
+        if (jetzt - berichtStart < BERICHT_NS) return;
+        double rmsMik = werteMik > 0 ? Math.sqrt(quadMik / werteMik) : 0;
+        double rmsSys = werteSys > 0 ? Math.sqrt(quadSys / werteSys) : 0;
+        int fuellung;
+        synchronized (ringSchloss) { fuellung = gefuellt; }
+        int bytesJeMs = Math.max(1, rate * kanaele * 2 / 1000);
+        Log.i(TAG, String.format(java.util.Locale.ROOT,
+                "[schirmton-pegel] modus=%s rate=%d kanaele=%d | mik rms=%.1f spitze=%.1f dBFS"
+                        + " | system rms=%.1f spitze=%.1f dBFS | geliefert=%d%% teilweise=%d leer=%d"
+                        + " aufrufe=%d ring=%dms",
+                mischen ? "mischen" : "ersetzen", rate, kanaele,
+                dbfs(rmsMik), dbfs(spitzeMik), dbfs(rmsSys), dbfs(spitzeSys),
+                bytesGewollt > 0 ? (int) (100 * bytesGeliefert / bytesGewollt) : 0,
+                teilweise, leer, aufrufe, fuellung / bytesJeMs));
+        berichtStart = jetzt;
+        quadMik = quadSys = 0;
+        werteMik = werteSys = 0;
+        spitzeMik = spitzeSys = 0;
+        bytesGewollt = bytesGeliefert = 0;
+        aufrufe = teilweise = leer = 0;
+    }
+
     private PlaybackCapture() {}
 
     /**
@@ -231,6 +309,11 @@ public final class PlaybackCapture {
 
     private boolean fuelleIntern(ByteBuffer puffer, int bytes, boolean mischen) {
         if (!laeuft.get() || bytes <= 0) return false;
+        // Messung: was das Mikrofon geliefert hat, BEVOR wir den Puffer anfassen.
+        aufrufe++;
+        bytesGewollt += bytes;
+        messe(puffer, puffer.position(), bytes, true);
+        berichteWennFaellig(mischen);
         byte[] aus = new byte[bytes];
         int da;
         synchronized (ringSchloss) {
@@ -241,11 +324,14 @@ public final class PlaybackCapture {
             }
             gefuellt -= da;
         }
-        if (da <= 0) return false;
+        if (da <= 0) { leer++; return false; }
+        if (da < bytes) teilweise++;
         // Ein angebrochenes Sample-Paar würde als Knacken hörbar; auf ein
         // Vielfaches von 2 Byte (16 Bit) abrunden.
         da &= ~1;
-        if (da <= 0) return false;
+        if (da <= 0) { leer++; return false; }
+        bytesGeliefert += da;
+        messe(aus, da);
 
         final int start = puffer.position();
         if (!mischen) {
