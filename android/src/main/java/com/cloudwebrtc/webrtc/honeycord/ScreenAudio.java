@@ -39,6 +39,13 @@ public final class ScreenAudio {
     private static volatile MediaProjection projection = null;
     /** Damit der Startversuch nicht bei jedem 10-ms-Puffer wiederholt wird. */
     private static volatile boolean startFehlgeschlagen = false;
+    /** Läuft der Haken hinter der Aufbereitung? Sonst der alte Weg davor. */
+    private static volatile boolean nachHakenLaeuft = false;
+
+    public static void nachHakenBereit(boolean an) {
+        nachHakenLaeuft = an;
+        Log.i(TAG, "Einspeisung " + (an ? "HINTER der Aufbereitung" : "vor der Aufbereitung"));
+    }
 
     /**
      * Von Dart: Ton der Freigabe an oder aus.
@@ -95,6 +102,30 @@ public final class ScreenAudio {
      * <p>Diese Methode läuft auf dem Aufnahme-Faden von WebRTC und darf nie
      * blockieren; ein hängender Puffer-Haken legt die ganze Verbindung still.
      */
+    /**
+     * Der Haken NACH der Tonaufbereitung von WebRTC (A1, 18.09.2026).
+     *
+     * ★★★ GEMESSEN am 18.09.2026 (Tracker #125): Der System-Ton wurde bis
+     * hierher VOR der Aufbereitung eingesetzt — und die automatische
+     * Aussteuerung zog jede Dämpfung wieder hoch. Für sie ist ein leiser
+     * Spielton eine leise Stimme. Tim hörte deshalb dreimal hintereinander
+     * „zu laut", obwohl die Rohpegel sanken.
+     *
+     * `ExternalAudioProcessingFactory.setCapturePostProcessing` liefert den
+     * Puffer NACH Echo-Unterdrückung, Rauschunterdrückung und Aussteuerung
+     * (`audio_processing_impl.cc`: erst `MergeFrequencyBands`, dann der
+     * Haken). Was hier dazukommt, wird von WebRTC nicht mehr angefasst.
+     *
+     * Format (aus dem Quelltext von webrtc-sdk nachgelesen):
+     * Fließkomma, EIN Kanal (`audio->channels()[0]`), 10 ms, Wertebereich wie
+     * 16-Bit (±32768), Länge `numFrames`.
+     */
+    public static void nachHaken(java.nio.FloatBuffer puffer, int numFrames) {
+        if (!gewuenscht || puffer == null || numFrames <= 0) return;
+        if (!PlaybackCapture.istAktiv()) return;
+        PlaybackCapture.mischeNach(puffer, numFrames, pegel, mischen);
+    }
+
     public static void pufferHaken(ByteBuffer puffer, int kanaele, int rate, int bytes) {
         if (!gewuenscht || puffer == null || bytes <= 0) return;
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return;
@@ -117,6 +148,13 @@ public final class ScreenAudio {
                 }
             }
         }
-        PlaybackCapture.fuelle(puffer, bytes, mischen, pegel);
+        // ★ Der Vorab-Haken hält die Aufnahme nur noch AM LEBEN (er startet sie
+        // und nennt Rate und Kanalzahl). Eingesetzt wird hinter der
+        // Aufbereitung — sonst regelt die Aussteuerung alles wieder hoch.
+        if (nachHakenLaeuft) {
+            PlaybackCapture.nurMessen(puffer, bytes, pegel, mischen);
+        } else {
+            PlaybackCapture.fuelle(puffer, bytes, mischen, pegel);
+        }
     }
 }

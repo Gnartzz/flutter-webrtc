@@ -133,19 +133,21 @@ public final class PlaybackCapture {
         synchronized (ringSchloss) { fuellung = gefuellt; }
         int bytesJeMs = Math.max(1, rate * kanaele * 2 / 1000);
         Log.i(TAG, String.format(java.util.Locale.ROOT,
-                "[schirmton-pegel] modus=%s pegel=%.2f rate=%d kanaele=%d | mik rms=%.1f spitze=%.1f dBFS"
+                "[schirmton-pegel] weg=%s modus=%s pegel=%.2f rate=%d kanaele=%d | mik rms=%.1f spitze=%.1f dBFS"
                         + " | system rms=%.1f spitze=%.1f dBFS | geliefert=%d%% teilweise=%d leer=%d"
                         + " aufrufe=%d ring=%dms",
+                bytesGeliefertNach > 0 ? "nach-APM" : "vor-APM",
                 mischen ? "mischen" : "ersetzen", letzterPegel, rate, kanaele,
                 dbfs(rmsMik), dbfs(spitzeMik), dbfs(rmsSys), dbfs(spitzeSys),
                 bytesGewollt > 0 ? (int) (100 * bytesGeliefert / bytesGewollt) : 0,
-                teilweise, leer, aufrufe, fuellung / bytesJeMs));
+                teilweise, leer + leerNach, aufrufe, fuellung / bytesJeMs));
         berichtStart = jetzt;
         quadMik = quadSys = 0;
         werteMik = werteSys = 0;
         spitzeMik = spitzeSys = 0;
         bytesGewollt = bytesGeliefert = 0;
-        aufrufe = teilweise = leer = 0;
+        bytesGeliefertNach = 0;
+        aufrufe = teilweise = leer = leerNach = 0;
     }
 
     private PlaybackCapture() {}
@@ -315,6 +317,70 @@ public final class PlaybackCapture {
         if (v < -32768) return -32768;
         return v;
     }
+
+    /**
+     * Nur messen, nichts einsetzen — für den Weg mit dem Haken HINTER der
+     * Aufbereitung (A1). Der Vorab-Haken bleibt dann reine Messstelle und hält
+     * die Aufnahme am Leben.
+     */
+    public static void nurMessen(ByteBuffer puffer, int bytes, float pegel, boolean mischen) {
+        PlaybackCapture p = aktiv;
+        if (p != null) p.messeNur(puffer, bytes, pegel, mischen);
+    }
+
+    private void messeNur(ByteBuffer puffer, int bytes, float pegel, boolean mischen) {
+        if (!laeuft.get() || bytes <= 0) return;
+        aufrufe++;
+        bytesGewollt += bytes;
+        letzterPegel = pegel;
+        messe(puffer, puffer.position(), bytes, true);
+        berichteWennFaellig(mischen);
+    }
+
+    /**
+     * Den System-Ton HINTER der Aufbereitung dazumischen (A1, 18.09.2026).
+     *
+     * Die Werte sind Fließkomma im 16-Bit-Wertebereich. Steht kein Ton an,
+     * bleibt der Puffer unberührt — dann geht die Stimme unverändert hinaus.
+     */
+    public static void mischeNach(java.nio.FloatBuffer puffer, int numFrames, float pegel, boolean mischen) {
+        PlaybackCapture p = aktiv;
+        if (p != null) p.mischeNachIntern(puffer, numFrames, pegel, mischen);
+    }
+
+    private void mischeNachIntern(java.nio.FloatBuffer puffer, int numFrames, float pegel, boolean mischen) {
+        if (!laeuft.get() || numFrames <= 0) return;
+        final int bytes = numFrames * 2;          // 16 Bit je Wert im Ring
+        byte[] aus = new byte[bytes];
+        int da;
+        synchronized (ringSchloss) {
+            da = Math.min(gefuellt, bytes);
+            for (int i = 0; i < da; i++) {
+                aus[i] = ring[lesePos];
+                lesePos = (lesePos + 1) % ring.length;
+            }
+            gefuellt -= da;
+        }
+        da &= ~1;
+        if (da <= 0) { leerNach++; return; }
+        bytesGeliefertNach += da;
+        messe(aus, da);
+        final int start = puffer.position();
+        for (int i = 0; i + 1 < da; i += 2) {
+            final int j = start + i / 2;
+            if (j >= puffer.limit()) break;
+            int b = (short) ((aus[i] & 0xFF) | (aus[i + 1] << 8));
+            float wert = b * pegel;
+            if (mischen) wert += puffer.get(j);
+            if (wert > 32767f) wert = 32767f;
+            if (wert < -32768f) wert = -32768f;
+            puffer.put(j, wert);
+        }
+        puffer.position(start);
+    }
+
+    private long bytesGeliefertNach = 0;
+    private int leerNach = 0;
 
     private boolean fuelleIntern(ByteBuffer puffer, int bytes, boolean mischen, float pegel) {
         if (!laeuft.get() || bytes <= 0) return false;
