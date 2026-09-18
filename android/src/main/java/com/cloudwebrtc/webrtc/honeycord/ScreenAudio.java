@@ -49,6 +49,11 @@ public final class ScreenAudio {
      *                {@code false} richtig — dann trägt der Track nur den
      *                System-Ton, selbst wenn das Mikrofon technisch aufnimmt.
      */
+    /// Kurzform ohne Pegel — der zuletzt gesetzte gilt weiter.
+    public static synchronized void setGewuenscht(boolean an, boolean mischen) {
+        setGewuenscht(an, mischen, pegel);
+    }
+
     public static synchronized void setGewuenscht(boolean an, boolean mischen, float pegel) {
         ScreenAudio.gewuenscht = an;
         ScreenAudio.mischen = mischen;
