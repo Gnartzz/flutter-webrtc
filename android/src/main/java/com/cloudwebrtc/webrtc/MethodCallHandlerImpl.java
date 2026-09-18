@@ -331,46 +331,6 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
     final PeerConnectionFactory.Builder factoryBuilder = PeerConnectionFactory.builder()
             .setOptions(options);
 
-    // ★★★ HoneyCord (#125, A1 am 18.09.2026): Der System-Ton der
-    // Bildschirmfreigabe wird HINTER der Tonaufbereitung eingesetzt.
-    //
-    // Davor eingesetzt (der bisherige Weg ueber den Aufnahme-Puffer) zog die
-    // automatische Aussteuerung jede Daempfung wieder hoch — dreimal gemessen,
-    // dreimal „zu laut". `setCapturePostProcessing` laeuft nach Echo- und
-    // Rauschunterdrueckung UND nach der Aussteuerung
-    // (`audio_processing_impl.cc`: erst MergeFrequencyBands, dann der Haken),
-    // also bleibt der Pegel jetzt so, wie der Nutzer ihn stellt.
-    //
-    // Der Puffer ist Fliesskomma, EIN Kanal, 10 ms, Wertebereich wie 16 Bit —
-    // und er zeigt DIREKT in den nativen Speicher, Schreiben wirkt also sofort.
-    try {
-      final org.webrtc.ExternalAudioProcessingFactory tonHaken =
-          new org.webrtc.ExternalAudioProcessingFactory();
-      tonHaken.setCapturePostProcessing(new org.webrtc.ExternalAudioProcessingFactory.AudioProcessing() {
-        @Override
-        public void initialize(int sampleRateHz, int numChannels) {
-          Log.i(TAG, "[schirmton] Nach-Haken bereit: " + sampleRateHz + " Hz, " + numChannels + " Kanal/Kanaele");
-          com.cloudwebrtc.webrtc.honeycord.ScreenAudio.nachHakenBereit(true);
-        }
-
-        @Override
-        public void reset(int newRate) {
-          Log.i(TAG, "[schirmton] Nach-Haken neu: " + newRate + " Hz");
-        }
-
-        @Override
-        public void process(int numBands, int numFrames, java.nio.ByteBuffer buffer) {
-          if (buffer == null) return;
-          com.cloudwebrtc.webrtc.honeycord.ScreenAudio.nachHaken(
-              buffer.order(java.nio.ByteOrder.nativeOrder()).asFloatBuffer(), numFrames);
-        }
-      });
-      factoryBuilder.setAudioProcessingFactory(tonHaken);
-    } catch (Throwable t) {
-      // Fehlt die Schnittstelle im Bau, bleibt es beim alten Weg davor.
-      Log.w(TAG, "[schirmton] Nach-Haken nicht verfuegbar — Einspeisung bleibt vor der Aufbereitung", t);
-    }
-
     // Initialize EGL contexts required for HW acceleration.
     EglBase.Context eglContext = EglUtils.getRootEglBaseContext();
 
@@ -387,6 +347,44 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
     videoEncoderFactory.setForceSWCodecList(forceSWCodecList);
 
     audioProcessingController = new AudioProcessingController();
+
+    // ★★★ HoneyCord (#125, A1 am 18.09.2026): Der System-Ton der
+    // Bildschirmfreigabe kommt HINTER die Tonaufbereitung.
+    //
+    // Davor eingesetzt (ueber den Aufnahme-Puffer) zog die automatische
+    // Aussteuerung jede Daempfung wieder hoch — dreimal gemessen, dreimal
+    // „zu laut". `capturePostProcessing` laeuft nach Echo-, Rausch- und
+    // Aussteuerung (`audio_processing_impl.cc`: erst MergeFrequencyBands,
+    // dann der Haken).
+    //
+    // ★ Und zwar an DIESEM Adapter, nicht an einer eigenen Fabrik: Der Fork
+    // setzt zwei Zeilen weiter seine eigene (`audioProcessingController`) und
+    // haette eine eigene still ueberschrieben — genau das ist beim ersten
+    // Anlauf passiert (Messlauf 18.09. 10:40: der Haken meldete sich beim
+    // Start, wurde aber nie gerufen).
+    //
+    // Puffer: Fliesskomma, EIN Kanal, 10 ms, Wertebereich wie 16 Bit, und er
+    // zeigt DIREKT in den nativen Speicher — Schreiben wirkt sofort.
+    audioProcessingController.capturePostProcessing.addProcessor(
+        new com.cloudwebrtc.webrtc.audio.AudioProcessingAdapter.ExternalAudioFrameProcessing() {
+          @Override
+          public void initialize(int sampleRateHz, int numChannels) {
+            Log.i(TAG, "[schirmton] Nach-Haken bereit: " + sampleRateHz + " Hz, " + numChannels + " Kanal/Kanaele");
+            com.cloudwebrtc.webrtc.honeycord.ScreenAudio.nachHakenBereit(true);
+          }
+
+          @Override
+          public void reset(int newRate) {
+            Log.i(TAG, "[schirmton] Nach-Haken neu: " + newRate + " Hz");
+          }
+
+          @Override
+          public void process(int numBands, int numFrames, java.nio.ByteBuffer buffer) {
+            if (buffer == null) return;
+            com.cloudwebrtc.webrtc.honeycord.ScreenAudio.nachHaken(
+                buffer.order(java.nio.ByteOrder.nativeOrder()).asFloatBuffer(), numFrames);
+          }
+        });
 
     factoryBuilder.setAudioProcessingFactory(audioProcessingController.externalAudioProcessingFactory);
 
