@@ -366,6 +366,6 @@ public final class PlaybackCapture {
         // Was nicht gefüllt wurde, bleibt Mikrofon — bei einer Lücke ist das
         // ehrlicher als Stille.
         puffer.position(start);
-        return true
+        return true;
     }
 }
