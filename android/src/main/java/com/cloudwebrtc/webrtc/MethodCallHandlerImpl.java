@@ -907,6 +907,24 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
         result.success(antwort);
         break;
       }
+      // ★ HoneyCord (#125, 18.09.2026): Das Mikrofon im AUDIOMODUL stumm
+      // schalten, ohne die Spur anzufassen. Waehrend einer Handy-Freigabe ist
+      // die Mikrofonspur der TRAEGER des Systemtons — abschalten wuerde den
+      // Ton mit toeten (gemessen). Mit `setMicrophoneMute` liefert das Modul
+      // Stille, der Traeger laeuft weiter, und die Stimme verlaesst das Geraet
+      // nicht einmal in Richtung WebRTC.
+      case "honeycordMikroStumm": {
+        final Boolean stumm = call.argument("stumm");
+        boolean an = stumm != null && stumm;
+        if (audioDeviceModule != null) {
+          audioDeviceModule.setMicrophoneMute(an);
+        }
+        Log.i(TAG, "[schirmton] Mikrofon im Audiomodul " + (an ? "stumm" : "offen"));
+        Map<String, Object> antwort = new HashMap<>();
+        antwort.put("stumm", an);
+        result.success(antwort);
+        break;
+      }
       case "honeycordScreenAudioState": {
         Map<String, Object> antwort = new HashMap<>();
         antwort.put("wanted", com.cloudwebrtc.webrtc.honeycord.ScreenAudio.istGewuenscht());

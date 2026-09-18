@@ -263,6 +263,19 @@ class Helper {
     }
   }
 
+  /// HoneyCord (#125, 18.09.2026): Das Mikrofon im AUDIOMODUL stumm schalten,
+  /// ohne die Spur zu beruehren.
+  ///
+  /// Waehrend einer Handy-Freigabe traegt die Mikrofonspur den System-Ton;
+  /// wird sie abgeschaltet, stirbt der Aufnehmer mit (gemessen). Hiermit
+  /// liefert das Modul Stille — der Traeger laeuft weiter, die Stimme geht
+  /// nicht einmal in Richtung WebRTC.
+  static Future<bool> honeycordMikroStumm(bool stumm) async {
+    if (!WebRTC.platformIsAndroid) return false;
+    final r = await WebRTC.invokeMethod('honeycordMikroStumm', {'stumm': stumm});
+    return r is Map && r['stumm'] == true;
+  }
+
   /// HoneyCord: Laeuft der Ton der Bildschirmfreigabe gerade?
   static Future<Map<String, bool>> screenAudioState() async {
     if (!WebRTC.platformIsAndroid) return {'wanted': false, 'running': false};
