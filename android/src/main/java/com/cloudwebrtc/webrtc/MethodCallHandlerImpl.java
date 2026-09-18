@@ -916,12 +916,26 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
       case "honeycordMikroStumm": {
         final Boolean stumm = call.argument("stumm");
         boolean an = stumm != null && stumm;
-        if (audioDeviceModule != null) {
-          audioDeviceModule.setMicrophoneMute(an);
+        // ★★ 18.09.2026: Mit 2.6.212 stuerzte die App beim Start der Freigabe
+        // ab, und dies war die einzige Stelle, die dabei erstmals WAEHREND
+        // laufender Aufnahme ins Modul greift. Der Absturz hinterliess keine
+        // Spur, weil die Zeile danach nie geschrieben wurde. Jetzt: Zeile
+        // DAVOR, `Throwable` gefangen, und der Aufrufer bekommt das Ergebnis —
+        // ein misslungenes Stummschalten darf die Freigabe nicht mitreissen.
+        Log.i(TAG, "[schirmton] Mikrofon im Audiomodul wird " + (an ? "stumm" : "geoeffnet")
+            + " (Modul " + (audioDeviceModule != null ? "da" : "fehlt") + ")");
+        boolean gelungen = false;
+        try {
+          if (audioDeviceModule != null) {
+            audioDeviceModule.setMicrophoneMute(an);
+            gelungen = true;
+          }
+        } catch (Throwable t) {
+          Log.e(TAG, "[schirmton] Stummschalten fehlgeschlagen", t);
         }
-        Log.i(TAG, "[schirmton] Mikrofon im Audiomodul " + (an ? "stumm" : "offen"));
+        Log.i(TAG, "[schirmton] Mikrofon im Audiomodul " + (gelungen ? (an ? "stumm" : "offen") : "unveraendert"));
         Map<String, Object> antwort = new HashMap<>();
-        antwort.put("stumm", an);
+        antwort.put("stumm", gelungen && an);
         result.success(antwort);
         break;
       }
