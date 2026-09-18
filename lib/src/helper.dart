@@ -210,10 +210,14 @@ class Helper {
   /// Gibt zurueck, ob die Aufnahme tatsaechlich laeuft. `false` heisst: noch
   /// keine Freigabe aktiv, Android aelter als 10, oder das Geraet gibt den Ton
   /// nicht heraus.
-  static Future<bool> setScreenAudio(bool enabled, {bool mix = false}) async {
+  /// [gain] daempft den System-Ton, bevor WebRTC ihn sieht. 1,0 = unveraendert,
+  /// 0,32 ≈ −10 dB (Vorgabe). GEMESSEN 18.09.2026 (#125): ohne Daempfung kam er
+  /// mit −13 dBFS RMS und Spitzen bis 0 dBFS an und uebertoente jede Stimme.
+  static Future<bool> setScreenAudio(bool enabled,
+      {bool mix = false, double gain = 0.32}) async {
     if (!WebRTC.platformIsAndroid) return false;
-    final r = await WebRTC.invokeMethod(
-        'honeycordScreenAudio', {'enabled': enabled, 'mix': mix});
+    final r = await WebRTC.invokeMethod('honeycordScreenAudio',
+        {'enabled': enabled, 'mix': mix, 'gain': gain});
     return (r is Map && r['running'] == true);
   }
 

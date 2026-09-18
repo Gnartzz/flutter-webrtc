@@ -29,6 +29,13 @@ public final class ScreenAudio {
     private static volatile boolean gewuenscht = false;
     /** Soll zum Mikrofon gemischt werden (statt es zu ersetzen)? */
     private static volatile boolean mischen = false;
+    /**
+     * Dämpfung des System-Tons, 1,0 = unverändert.
+     *
+     * ★ Vorgabe 0,32 ≈ −10 dB (Tracker #125, gemessen 18.09.2026: der Ton kam
+     * mit −13 dBFS RMS und Spitzen bis 0 dBFS an, also 8–12 dB über Sprache).
+     */
+    private static volatile float pegel = 0.32f;
     private static volatile MediaProjection projection = null;
     /** Damit der Startversuch nicht bei jedem 10-ms-Puffer wiederholt wird. */
     private static volatile boolean startFehlgeschlagen = false;
@@ -42,9 +49,10 @@ public final class ScreenAudio {
      *                {@code false} richtig — dann trägt der Track nur den
      *                System-Ton, selbst wenn das Mikrofon technisch aufnimmt.
      */
-    public static synchronized void setGewuenscht(boolean an, boolean mischen) {
+    public static synchronized void setGewuenscht(boolean an, boolean mischen, float pegel) {
         ScreenAudio.gewuenscht = an;
         ScreenAudio.mischen = mischen;
+        if (pegel > 0 && pegel <= 4) ScreenAudio.pegel = pegel;
         ScreenAudio.startFehlgeschlagen = false;
         Log.i(TAG, "System-Ton " + (an ? "gewuenscht" : "aus")
                 + (an ? (mischen ? " (mischen)" : " (statt Mikrofon)") : ""));
@@ -104,6 +112,6 @@ public final class ScreenAudio {
                 }
             }
         }
-        PlaybackCapture.fuelle(puffer, bytes, mischen);
+        PlaybackCapture.fuelle(puffer, bytes, mischen, pegel);
     }
 }

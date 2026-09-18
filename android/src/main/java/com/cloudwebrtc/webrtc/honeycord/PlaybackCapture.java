@@ -121,6 +121,8 @@ public final class PlaybackCapture {
         quadSys += q; werteSys += n; spitzeSys = Math.max(spitzeSys, spitze);
     }
 
+    private float letzterPegel = 1;
+
     private void berichteWennFaellig(boolean mischen) {
         long jetzt = System.nanoTime();
         if (berichtStart == 0) { berichtStart = jetzt; return; }
@@ -131,10 +133,10 @@ public final class PlaybackCapture {
         synchronized (ringSchloss) { fuellung = gefuellt; }
         int bytesJeMs = Math.max(1, rate * kanaele * 2 / 1000);
         Log.i(TAG, String.format(java.util.Locale.ROOT,
-                "[schirmton-pegel] modus=%s rate=%d kanaele=%d | mik rms=%.1f spitze=%.1f dBFS"
+                "[schirmton-pegel] modus=%s pegel=%.2f rate=%d kanaele=%d | mik rms=%.1f spitze=%.1f dBFS"
                         + " | system rms=%.1f spitze=%.1f dBFS | geliefert=%d%% teilweise=%d leer=%d"
                         + " aufrufe=%d ring=%dms",
-                mischen ? "mischen" : "ersetzen", rate, kanaele,
+                mischen ? "mischen" : "ersetzen", letzterPegel, rate, kanaele,
                 dbfs(rmsMik), dbfs(spitzeMik), dbfs(rmsSys), dbfs(spitzeSys),
                 bytesGewollt > 0 ? (int) (100 * bytesGeliefert / bytesGewollt) : 0,
                 teilweise, leer, aufrufe, fuellung / bytesJeMs));
@@ -192,9 +194,9 @@ public final class PlaybackCapture {
      * @param mischen {@code true} mischt zum vorhandenen Mikrofonsignal,
      *                {@code false} ersetzt es
      */
-    public static boolean fuelle(ByteBuffer puffer, int bytes, boolean mischen) {
+    public static boolean fuelle(ByteBuffer puffer, int bytes, boolean mischen, float pegel) {
         PlaybackCapture p = aktiv;
-        return p != null && p.fuelleIntern(puffer, bytes, mischen);
+        return p != null && p.fuelleIntern(puffer, bytes, mischen, pegel);
     }
 
     /** Was die Aufnahme gerade liefert — für den Fall, dass WebRTC umschaltet. */
@@ -307,11 +309,19 @@ public final class PlaybackCapture {
         }
     }
 
-    private boolean fuelleIntern(ByteBuffer puffer, int bytes, boolean mischen) {
+    /// Ein Sample begrenzen — weich, damit ein Anschlag nicht knackt.
+    private static int deckel(int v) {
+        if (v > 32767) return 32767;
+        if (v < -32768) return -32768;
+        return v;
+    }
+
+    private boolean fuelleIntern(ByteBuffer puffer, int bytes, boolean mischen, float pegel) {
         if (!laeuft.get() || bytes <= 0) return false;
         // Messung: was das Mikrofon geliefert hat, BEVOR wir den Puffer anfassen.
         aufrufe++;
         bytesGewollt += bytes;
+        letzterPegel = pegel;
         messe(puffer, puffer.position(), bytes, true);
         berichteWennFaellig(mischen);
         byte[] aus = new byte[bytes];
@@ -331,29 +341,31 @@ public final class PlaybackCapture {
         da &= ~1;
         if (da <= 0) { leer++; return false; }
         bytesGeliefert += da;
-        messe(aus, da);
+        messe(aus, da);   // ROHpegel, vor der Dämpfung — so bleibt die Messung vergleichbar
 
         final int start = puffer.position();
-        if (!mischen) {
-            // Ersetzen. Was nicht gefüllt wird, bleibt Mikrofon — bei einer
-            // Lücke ist das ehrlicher als Stille.
-            puffer.put(aus, 0, da);
-            puffer.position(start);
-            return true;
-        }
-        // Mischen mit Sättigung. Zwei laute Quellen ohne Deckel klingen wie
-        // Übersteuerung, weil sie genau das sind.
+        // ★★ GEMESSEN 18.09.2026 (Tracker #125, Tims Messlauf auf dem Odin 3):
+        // Der System-Ton kam mit **−13 dBFS RMS** und Spitzen bis **0 dBFS**
+        // im Haken an — Sprache liegt üblicherweise bei −20 bis −25 dBFS.
+        // Er war also 8 bis 12 dB zu laut und schlug obendrein an die Grenze.
+        // Die Medienlautstärke des Handys änderte daran nur rund 6 dB.
+        // Deshalb wird er hier gedämpft, bevor WebRTC ihn zu sehen bekommt.
         for (int i = 0; i + 1 < da; i += 2) {
             final int p = start + i;
-            int a = (short) ((puffer.get(p) & 0xFF) | (puffer.get(p + 1) << 8));
             int b = (short) ((aus[i] & 0xFF) | (aus[i + 1] << 8));
-            int m = a + b;
-            if (m > 32767) m = 32767;
-            if (m < -32768) m = -32768;
-            puffer.put(p, (byte) (m & 0xFF));
-            puffer.put(p + 1, (byte) ((m >> 8) & 0xFF));
+            int wert = Math.round(b * pegel);
+            if (mischen) {
+                // Mischen mit Sättigung: Stimme UND System-Ton gehen raus.
+                int a = (short) ((puffer.get(p) & 0xFF) | (puffer.get(p + 1) << 8));
+                wert += a;
+            }
+            wert = deckel(wert);
+            puffer.put(p, (byte) (wert & 0xFF));
+            puffer.put(p + 1, (byte) ((wert >> 8) & 0xFF));
         }
+        // Was nicht gefüllt wurde, bleibt Mikrofon — bei einer Lücke ist das
+        // ehrlicher als Stille.
         puffer.position(start);
-        return true;
+        return true
     }
 }

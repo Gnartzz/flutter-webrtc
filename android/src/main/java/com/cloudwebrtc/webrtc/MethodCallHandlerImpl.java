@@ -860,8 +860,10 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
       case "honeycordScreenAudio": {
         final Boolean an = call.argument("enabled");
         final Boolean mix = call.argument("mix");
+        final Double pegel = call.argument("gain");
         com.cloudwebrtc.webrtc.honeycord.ScreenAudio.setGewuenscht(
-            an != null && an, mix != null && mix);
+            an != null && an, mix != null && mix,
+            pegel != null ? pegel.floatValue() : 0.32f);
         Map<String, Object> antwort = new HashMap<>();
         antwort.put("running", com.cloudwebrtc.webrtc.honeycord.ScreenAudio.laeuft());
         result.success(antwort);
