@@ -123,10 +123,37 @@ public final class ScreenAudio {
     public static void nachHaken(java.nio.FloatBuffer puffer, int numFrames) {
         if (!gewuenscht || puffer == null || numFrames <= 0) return;
         if (!PlaybackCapture.istAktiv()) return;
-        PlaybackCapture.mischeNach(puffer, numFrames, pegel, mischen);
+        try {
+            PlaybackCapture.mischeNach(puffer, numFrames, pegel, mischen);
+        } catch (RuntimeException e) {
+            if (!hakenFehlerGemeldet) {
+                hakenFehlerGemeldet = true;
+                Log.e(TAG, "Fehler im Nach-Haken - System-Ton faellt aus, Gespraech laeuft weiter", e);
+            }
+        }
     }
 
+    /** Einmal gemeldet: ein Fehler im Haken (danach still). */
+    private static volatile boolean hakenFehlerGemeldet = false;
+
+    /**
+     * ★★ 09.10.2026: Der Haken läuft auf dem Aufnahme-Faden von WebRTC. Eine
+     * Ausnahme hier beendet die GANZE App (so geschehen: Absturz bei jedem
+     * Start der Freigabe mit stummem Mikrofon). Ein Fehler darf höchstens den
+     * System-Ton kosten, nie das Gespräch.
+     */
     public static void pufferHaken(ByteBuffer puffer, int kanaele, int rate, int bytes) {
+        try {
+            pufferHakenIntern(puffer, kanaele, rate, bytes);
+        } catch (RuntimeException e) {
+            if (!hakenFehlerGemeldet) {
+                hakenFehlerGemeldet = true;
+                Log.e(TAG, "Fehler im Aufnahme-Haken - System-Ton faellt aus, Gespraech laeuft weiter", e);
+            }
+        }
+    }
+
+    private static void pufferHakenIntern(ByteBuffer puffer, int kanaele, int rate, int bytes) {
         if (!gewuenscht || puffer == null || bytes <= 0) return;
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return;
 

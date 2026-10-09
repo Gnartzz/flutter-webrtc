@@ -333,7 +333,8 @@ public final class PlaybackCapture {
         aufrufe++;
         bytesGewollt += bytes;
         letzterPegel = pegel;
-        messe(puffer, puffer.position(), bytes, true);
+        // ★ 09.10.2026: ab 0 und höchstens bis `limit` — s. fuelleIntern.
+        messe(puffer, 0, Math.min(bytes, puffer.limit()), true);
         berichteWennFaellig(mischen);
     }
 
@@ -384,11 +385,21 @@ public final class PlaybackCapture {
 
     private boolean fuelleIntern(ByteBuffer puffer, int bytes, boolean mischen, float pegel) {
         if (!laeuft.get() || bytes <= 0) return false;
+        // ★★ 09.10.2026 (Tims Absturz beim Start der Freigabe, Odin 3, adb
+        //   logcat -b crash: IndexOutOfBoundsException index=960 limit=960 in
+        //   messe): Ist das Mikrofon im Audiomodul STUMM (Freigabe „statt
+        //   Mikrofon"), füllt WebRTC den Puffer mit `put(emptyBytes)`
+        //   (WebRtcAudioRecord.java Z. 200-202) — das schiebt die POSITION ans
+        //   Ende. Wir lasen und schrieben ab `position()` und liefen sofort über
+        //   `limit`. Die Daten liegen immer ab 0 (der native Teil liest die
+        //   Adresse des Puffers); die Position bleibt, wie sie kam.
+        bytes = Math.min(bytes, puffer.limit());
+        final int posVorher = puffer.position();
         // Messung: was das Mikrofon geliefert hat, BEVOR wir den Puffer anfassen.
         aufrufe++;
         bytesGewollt += bytes;
         letzterPegel = pegel;
-        messe(puffer, puffer.position(), bytes, true);
+        messe(puffer, 0, bytes, true);
         berichteWennFaellig(mischen);
         byte[] aus = new byte[bytes];
         int da;
@@ -409,7 +420,7 @@ public final class PlaybackCapture {
         bytesGeliefert += da;
         messe(aus, da);   // ROHpegel, vor der Dämpfung — so bleibt die Messung vergleichbar
 
-        final int start = puffer.position();
+        final int start = 0;
         // ★★ GEMESSEN 18.09.2026 (Tracker #125, Tims Messlauf auf dem Odin 3):
         // Der System-Ton kam mit **−13 dBFS RMS** und Spitzen bis **0 dBFS**
         // im Haken an — Sprache liegt üblicherweise bei −20 bis −25 dBFS.
@@ -431,7 +442,7 @@ public final class PlaybackCapture {
         }
         // Was nicht gefüllt wurde, bleibt Mikrofon — bei einer Lücke ist das
         // ehrlicher als Stille.
-        puffer.position(start);
+        puffer.position(posVorher);
         return true;
     }
 }
