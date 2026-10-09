@@ -100,6 +100,9 @@ class FlutterWebRTCBase {
   libwebrtc::scoped_refptr<libwebrtc::KeyProvider> GetKeyProviderForId(
       const std::string& keyProviderId);
 
+  // HoneyCord 09.10.2026: s. mic_agc_.
+  bool mic_agc() const { return mic_agc_; }
+
  private:
   void ParseConstraints(const EncodableMap& src,
                         scoped_refptr<RTCMediaConstraints> mediaConstraints,
@@ -114,6 +117,12 @@ class FlutterWebRTCBase {
   scoped_refptr<RTCVideoDevice> video_device_;
   scoped_refptr<RTCDesktopDevice> desktop_device_;
   scoped_refptr<RTCAudioProcessing> audio_processing_;
+  // HoneyCord 09.10.2026: Aussteuerung der zuletzt geoeffneten Mikrofonspur.
+  // Die Tonaufbereitung ist EINE fuer alle Spuren, und jede eigene Tonquelle
+  // setzt beim Senden ihre Optionen dort (ApplyOptions). Bildschirm- und
+  // Kartenton bekommen deshalb denselben Wert — sonst schaltete der Start einer
+  // Freigabe die abgeschaltete Aussteuerung des Mikrofons wieder ein.
+  bool mic_agc_ = true;
   RTCConfiguration configuration_;
 
   std::map<std::string, scoped_refptr<libwebrtc::KeyProvider>> key_providers_;

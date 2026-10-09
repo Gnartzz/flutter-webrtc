@@ -10,6 +10,15 @@
 
 namespace flutter_webrtc_plugin {
 
+// HoneyCord 09.10.2026: Eigene Tonquellen (Bildschirm-/Kartenton) uebernehmen
+// die Aussteuerung des Mikrofons — die Tonaufbereitung ist eine fuer alle
+// Spuren (s. FlutterWebRTCBase::mic_agc_). Echo/Rauschen bleiben Vorgabe.
+static RTCAudioOptions EigeneTonOptionen(FlutterWebRTCBase* base) {
+  RTCAudioOptions o;
+  o.auto_gain_control = base->mic_agc();
+  return o;
+}
+
 FlutterScreenCapture::FlutterScreenCapture(FlutterWebRTCBase* base)
     : base_(base) {}
 
@@ -197,7 +206,8 @@ void FlutterScreenCapture::CaptureAudioStart(const std::string& device_id,
                                              std::unique_ptr<MethodResultProxy> result) {
   honeycord::WasapiLogFromPlugin("captureAudioStart: geraet=%s", device_id.c_str());
   scoped_refptr<RTCAudioSource> audio_source = base_->factory_->CreateAudioSource(
-      "capture-card-audio", RTCAudioSource::SourceType::kCustom);
+      "capture-card-audio", RTCAudioSource::SourceType::kCustom,
+      EigeneTonOptionen(base_));
   if (!audio_source.get()) {
     result->Error("captureAudio", "CreateAudioSource fehlgeschlagen");
     return;
@@ -272,7 +282,8 @@ void FlutterScreenCapture::CaptureAudioStart(const std::string& device_id,
     return;
   }
   scoped_refptr<RTCAudioSource> audio_source = base_->factory_->CreateAudioSource(
-      "capture-card-audio", RTCAudioSource::SourceType::kCustom);
+      "capture-card-audio", RTCAudioSource::SourceType::kCustom,
+      EigeneTonOptionen(base_));
   if (!audio_source.get()) {
     result->Error("captureAudio", "CreateAudioSource fehlgeschlagen");
     return;
@@ -411,7 +422,8 @@ void FlutterScreenCapture::GetDisplayMedia(
     }
     scoped_refptr<RTCAudioSource> audio_source =
         base_->factory_->CreateAudioSource(
-            "screen-share-audio", RTCAudioSource::SourceType::kCustom);
+            "screen-share-audio", RTCAudioSource::SourceType::kCustom,
+      EigeneTonOptionen(base_));
     honeycord::WasapiLogFromPlugin("  CreateAudioSource(kCustom) -> %p",
                                     audio_source.get());
     if (audio_source.get()) {
@@ -458,7 +470,8 @@ void FlutterScreenCapture::GetDisplayMedia(
                                uuid.c_str());
     scoped_refptr<RTCAudioSource> audio_source =
         base_->factory_->CreateAudioSource(
-            "screen-share-audio", RTCAudioSource::SourceType::kCustom);
+            "screen-share-audio", RTCAudioSource::SourceType::kCustom,
+      EigeneTonOptionen(base_));
     if (audio_source.get()) {
       auto audio_uuid = base_->GenerateUUID();
       scoped_refptr<RTCAudioTrack> audio_track =

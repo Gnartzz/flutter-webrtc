@@ -57,6 +57,36 @@ void FlutterMediaStream::GetUserMedia(
   result->Success(EncodableValue(params));
 }
 
+// HoneyCord 09.10.2026: Ist eine Mikrofon-Option in den Constraints
+// AUSDRUECKLICH abgeschaltet? livekit_client schickt sie als
+// {'optional': [{'autoGainControl': false}, ...]}; der Vollstaendigkeit
+// halber auch flach oder unter 'mandatory', als bool oder als "false".
+static bool AudioOptionAus(const EncodableMap& m, const char* key) {
+  auto istAus = [](const EncodableValue& v) {
+    if (TypeIs<bool>(v)) return !GetValue<bool>(v);
+    if (TypeIs<std::string>(v)) return GetValue<std::string>(v) == "false";
+    return false;
+  };
+  auto direkt = m.find(EncodableValue(key));
+  if (direkt != m.end() && istAus(direkt->second)) return true;
+  auto pflicht = m.find(EncodableValue("mandatory"));
+  if (pflicht != m.end() && TypeIs<EncodableMap>(pflicht->second)) {
+    const EncodableMap& pm = GetValue<EncodableMap>(pflicht->second);
+    auto it = pm.find(EncodableValue(key));
+    if (it != pm.end() && istAus(it->second)) return true;
+  }
+  auto wahl = m.find(EncodableValue("optional"));
+  if (wahl != m.end() && TypeIs<EncodableList>(wahl->second)) {
+    for (const auto& e : GetValue<EncodableList>(wahl->second)) {
+      if (!TypeIs<EncodableMap>(e)) continue;
+      const EncodableMap& em = GetValue<EncodableMap>(e);
+      auto it = em.find(EncodableValue(key));
+      if (it != em.end() && istAus(it->second)) return true;
+    }
+  }
+  return false;
+}
+
 void addDefaultAudioConstraints(
     scoped_refptr<RTCMediaConstraints> audioConstraints) {
   audioConstraints->AddOptionalConstraint("googNoiseSuppression", "true");
@@ -98,6 +128,17 @@ void FlutterMediaStream::GetUserAudio(const EncodableMap& constraints,
   scoped_refptr<RTCMediaConstraints> audioConstraints;
   std::string sourceId;
   std::string deviceId;
+  // HoneyCord 09.10.2026: Bis heute wurden die Audio-Constraints unter
+  // Windows/Linux zwar gelesen, aber nie an die Quelle weitergegeben —
+  // `CreateAudioSource` lief immer mit den Vorgaben (Aussteuerung,
+  // Rausch- und Echounterdrueckung an). Der App-Schalter „Automatische
+  // Aussteuerung" war dort deshalb wirkungslos. Jetzt geht genau DIESER
+  // Schalter durch, wie im nativen Windows-Client (hc_media.cpp StartMic).
+  // Echo- und Rauschunterdrueckung bleiben bewusst auf der Vorgabe: unter
+  // Windows haengt an der Echounterdrueckung die eingebaute Windows-AEC, also
+  // der Aufnahmeweg selbst (vgl. #101), und die App schaltet beide nie ab.
+  RTCAudioOptions audioOptions;
+  // `audio: true` (ohne Optionen) heisst Vorgaben, also Aussteuerung an.
   auto it = constraints.find(EncodableValue("audio"));
   if (it != constraints.end()) {
     EncodableValue audio = it->second;
@@ -105,6 +146,7 @@ void FlutterMediaStream::GetUserAudio(const EncodableMap& constraints,
       audioConstraints = RTCMediaConstraints::Create();
       addDefaultAudioConstraints(audioConstraints);
       enable_audio = GetValue<bool>(audio);
+      if (enable_audio) base_->mic_agc_ = true;
       sourceId = "";
       deviceId = "";
     }
@@ -114,6 +156,10 @@ void FlutterMediaStream::GetUserAudio(const EncodableMap& constraints,
       deviceId = getDeviceIdConstraint(localMap);
       audioConstraints = base_->ParseMediaConstraints(localMap);
       enable_audio = true;
+      audioOptions.auto_gain_control =
+          !(AudioOptionAus(localMap, "autoGainControl") ||
+            AudioOptionAus(localMap, "googAutoGainControl"));
+      base_->mic_agc_ = audioOptions.auto_gain_control;
     }
   }
 
@@ -150,8 +196,8 @@ void FlutterMediaStream::GetUserAudio(const EncodableMap& constraints,
       }
     }
 
-    scoped_refptr<RTCAudioSource> source =
-        base_->factory_->CreateAudioSource("audio_input");
+    scoped_refptr<RTCAudioSource> source = base_->factory_->CreateAudioSource(
+        "audio_input", RTCAudioSource::SourceType::kMicrophone, audioOptions);
     std::string uuid = base_->GenerateUUID();
     scoped_refptr<RTCAudioTrack> track =
         base_->factory_->CreateAudioTrack(source, uuid.c_str());
@@ -169,7 +215,8 @@ void FlutterMediaStream::GetUserAudio(const EncodableMap& constraints,
     EncodableMap settings;
     settings[EncodableValue("deviceId")] = EncodableValue(sourceId);
     settings[EncodableValue("kind")] = EncodableValue("audioinput");
-    settings[EncodableValue("autoGainControl")] = EncodableValue(true);
+    settings[EncodableValue("autoGainControl")] =
+        EncodableValue(audioOptions.auto_gain_control);
     settings[EncodableValue("echoCancellation")] = EncodableValue(true);
     settings[EncodableValue("noiseSuppression")] = EncodableValue(true);
     settings[EncodableValue("channelCount")] = EncodableValue(1);
