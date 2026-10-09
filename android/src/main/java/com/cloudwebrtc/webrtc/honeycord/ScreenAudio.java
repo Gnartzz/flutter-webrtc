@@ -68,7 +68,10 @@ public final class ScreenAudio {
         ScreenAudio.startFehlgeschlagen = false;
         Log.i(TAG, "System-Ton " + (an ? "gewuenscht" : "aus")
                 + (an ? (mischen ? " (mischen)" : " (statt Mikrofon)") : ""));
-        if (!an) PlaybackCapture.stop();
+        if (!an) {
+            PlaybackCapture.stop();
+            hakenGesperrt = false;   // die nächste Freigabe beginnt frisch
+        }
     }
 
     public static boolean istGewuenscht() { return gewuenscht; }
@@ -121,20 +124,22 @@ public final class ScreenAudio {
      * 16-Bit (±32768), Länge `numFrames`.
      */
     public static void nachHaken(java.nio.FloatBuffer puffer, int numFrames) {
-        if (!gewuenscht || puffer == null || numFrames <= 0) return;
+        if (hakenGesperrt || !gewuenscht || puffer == null || numFrames <= 0) return;
         if (!PlaybackCapture.istAktiv()) return;
         try {
             PlaybackCapture.mischeNach(puffer, numFrames, pegel, mischen);
         } catch (RuntimeException e) {
-            if (!hakenFehlerGemeldet) {
-                hakenFehlerGemeldet = true;
-                Log.e(TAG, "Fehler im Nach-Haken - System-Ton faellt aus, Gespraech laeuft weiter", e);
-            }
+            hakenGesperrt = true;
+            Log.e(TAG, "[schirmton] AUSGEFALLEN: Fehler im Nach-Haken - System-Ton aus, Gespraech laeuft weiter", e);
         }
     }
 
-    /** Einmal gemeldet: ein Fehler im Haken (danach still). */
-    private static volatile boolean hakenFehlerGemeldet = false;
+    /**
+     * Nach dem ersten Fehler im Haken gesperrt (Prüfbefund M2): sonst würfe er
+     * alle 10 ms erneut — rund 100 Ausnahmen je Sekunde mit Stack. Zurück-
+     * gesetzt, wenn die Freigabe endet (`setGewuenscht(false, …)`).
+     */
+    private static volatile boolean hakenGesperrt = false;
 
     /**
      * ★★ 09.10.2026: Der Haken läuft auf dem Aufnahme-Faden von WebRTC. Eine
@@ -143,13 +148,12 @@ public final class ScreenAudio {
      * System-Ton kosten, nie das Gespräch.
      */
     public static void pufferHaken(ByteBuffer puffer, int kanaele, int rate, int bytes) {
+        if (hakenGesperrt) return;
         try {
             pufferHakenIntern(puffer, kanaele, rate, bytes);
         } catch (RuntimeException e) {
-            if (!hakenFehlerGemeldet) {
-                hakenFehlerGemeldet = true;
-                Log.e(TAG, "Fehler im Aufnahme-Haken - System-Ton faellt aus, Gespraech laeuft weiter", e);
-            }
+            hakenGesperrt = true;
+            Log.e(TAG, "[schirmton] AUSGEFALLEN: Fehler im Aufnahme-Haken - System-Ton aus, Gespraech laeuft weiter", e);
         }
     }
 
