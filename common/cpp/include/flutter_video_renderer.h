@@ -45,6 +45,25 @@ class FlutterVideoRenderer
 
   std::string media_stream_id;
 
+  // honeycord: Anzeige-Drossel. Windows-GpuSurface: die eigene Bildschirm-
+  // Selbstansicht (s. unten). PixelBuffer (Windows UND Linux, 10.10.2026): die
+  // eigene Kamera-Selbstansicht — hoechstens 1000/throttle_ms_ Textur-Updates je
+  // Sekunde, Bilder dazwischen werden NUR fuer die Anzeige verworfen (Spur und
+  // Encoder bekommen weiter jedes Bild). Jedes MarkTextureFrameAvailable plant
+  // in der Engine ein neues Fenster-Bild (ScheduleFrame) — die Drossel spart
+  // also nicht nur die Umrechnung, sondern ganze Fenster-Composites.
+  void set_throttle(bool v) { is_throttle_ = v; }
+  // Drossel-Intervall in ms (0 = ungedrosselt). GpuSurface: User-Schalter
+  // „Vorschau-Flüssigkeit": 40 = Sparsam (~20 fps), 25 = Normal (~30 fps),
+  // 0 = Flüssig. PixelBuffer: die App setzt 67 (~15 fps).
+  void set_throttle_ms(int ms) { throttle_ms_ = ms; }
+  // honeycord (10.10.2026): PixelBuffer nur in Kachelgroesse umrechnen. Flutter
+  // uebergibt CopyPixelBuffer die Groesse der Textur-Ebene in LOGISCHEN Pixeln
+  // (paint_bounds der TextureLayer, vor der Geraete-Skalierung) — die App
+  // reicht deshalb ihr devicePixelRatio herein. 0 = aus (volle Bildgroesse wie
+  // bisher, Vorgabe fuer alle Renderer, die es nicht ausdruecklich setzen).
+  void set_pixel_buffer_scale(double s) { pb_scale_ = s; }
+
 #ifdef _WINDOWS
   // GPU-Zero-Copy-Vorschau: Callback fuer Flutters GpuSurfaceTexture. Native
   // (GPU) Frames -> DXGI-Shared-Handle des Capturers direkt an ANGLE (kein
@@ -53,11 +72,6 @@ class FlutterVideoRenderer
   const FlutterDesktopGpuSurfaceDescriptor* ObtainGpuSurface(
       size_t width, size_t height) const;
   void set_gpu_surface(bool v) { is_gpu_surface_ = v; }
-  void set_throttle(bool v) { is_throttle_ = v; }
-  // Drossel-Intervall der Self-View in ms (0 = ungedrosselt). User-Schalter
-  // „Vorschau-Flüssigkeit": 40 = Sparsam (~20 fps), 25 = Normal (~30 fps),
-  // 0 = Flüssig (volle fps, mehr GPU-/Compositor-Last).
-  void set_throttle_ms(int ms) { throttle_ms_ = ms; }
 #endif
 
  private:
@@ -75,8 +89,19 @@ class FlutterVideoRenderer
   std::unique_ptr<flutter::TextureVariant> texture_;
   std::shared_ptr<FlutterDesktopPixelBuffer> pixel_buffer_;
   mutable std::shared_ptr<uint8_t> rgb_buffer_;
+  // Groesse von rgb_buffer_ in Bytes: wiederverwenden, solange das Bild
+  // hineinpasst (keine Allokation je Bild, auch nicht beim Kleinerwerden).
+  mutable size_t rgb_capacity_ = 0;
   mutable std::mutex mutex_;
   RTCVideoFrame::VideoRotation rotation_ = RTCVideoFrame::kVideoRotation_0;
+  // Drossel (s. set_throttle/set_throttle_ms) — gilt fuer GpuSurface (nur
+  // Windows) und seit 10.10.2026 auch fuer PixelBuffer.
+  bool is_throttle_ = false;
+  int throttle_ms_ = 40;
+  // PixelBuffer-Drossel: Zeitpunkt (us, steady_clock), ab dem das naechste
+  // Textur-Update faellig ist. Nur im OnFrame-Faden benutzt.
+  int64_t pb_next_due_us_ = 0;
+  double pb_scale_ = 0.0;  // s. set_pixel_buffer_scale (0 = aus)
 #ifdef _WINDOWS
   mutable FlutterDesktopGpuSurfaceDescriptor gpu_descriptor_ = {};
   // Fallback fuer nicht-native Frames (Kamera/Remote): eigene plain-SHARED
@@ -97,9 +122,7 @@ class FlutterVideoRenderer
   // ist davon unberuehrt. Greift NUR wenn is_throttle_ gesetzt ist; Remote-
   // Kacheln nutzen denselben GpuSurface-Pfad, aber OHNE Drossel (volle FPS).
   bool is_gpu_surface_ = false;
-  bool is_throttle_ = false;
   int64_t last_mark_ms_ = 0;
-  int throttle_ms_ = 40;  // Self-View-Drossel-Intervall (0 = aus), s. set_throttle_ms
   // Diagnose (2026-07-02): echte Render-fps messen. COMPOSITE = wie oft Flutter die
   // Kachel wirklich zeichnet (ObtainGpuSurface/s); ONFRAME = wie oft ein Frame an
   // den Sink geliefert wird. Selbst-Ansicht (throttled) sagt: schafft der Composite
@@ -120,6 +143,12 @@ class FlutterVideoRenderer
   // Backpressure) -> WebRTCs Render-Pacing wirft die restlichen Frames weg.
   double dbg_mark_ms_ = 0.0;
   unsigned dbg_mark_n_ = 0;
+  // PixelBuffer-Zaehler (10.10.2026): wie oft Flutter CopyPixelBuffer wirklich
+  // aufruft (= Uploads), mit Quell-/Ziel-/Ausgabegroesse — alle 5 s eine
+  // PIXELBUFFER-Zeile in render.log. Nur im Raster-Faden benutzt.
+  mutable unsigned dbg_pb_calls_ = 0;
+  mutable int64_t dbg_pb_last_ms_ = 0;
+  mutable double dbg_pb_conv_ms_ = 0.0;
 #endif
 };
 
@@ -128,7 +157,7 @@ class FlutterVideoRendererManager {
   FlutterVideoRendererManager(FlutterWebRTCBase* base);
 
   void CreateVideoRendererTexture(bool use_gpu_surface, bool throttle,
-                                  int throttle_ms,
+                                  int throttle_ms, double pixel_buffer_scale,
                                   std::unique_ptr<MethodResultProxy> result);
 
   void VideoRendererSetSrcObject(int64_t texture_id,

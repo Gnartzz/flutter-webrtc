@@ -545,6 +545,7 @@ void FlutterWebRTC::HandleMethodCall(
     bool use_gpu_surface = false;
     bool throttle = false;
     int throttle_ms = 40;  // Default Sparsam (~20 fps), s. User-Schalter
+    double pixel_buffer_scale = 0.0;  // 0 = volle Bildgroesse (wie bisher)
     if (method_call.arguments()) {
       const EncodableMap params =
           GetValue<EncodableMap>(*method_call.arguments());
@@ -566,9 +567,16 @@ void FlutterWebRTC::HandleMethodCall(
         else if (std::holds_alternative<int64_t>(it_m->second))
           throttle_ms = static_cast<int>(std::get<int64_t>(it_m->second));
       }
+      // honeycord (10.10.2026): PixelBuffer nur in Kachelgroesse umrechnen —
+      // devicePixelRatio der App (Flutter nennt die Zielgroesse logisch).
+      // Fehlt der Wert oder ist er kein double: 0 = aus.
+      auto it_s = params.find(EncodableValue("pixelBufferScale"));
+      if (it_s != params.end() && std::holds_alternative<double>(it_s->second)) {
+        pixel_buffer_scale = std::get<double>(it_s->second);
+      }
     }
     CreateVideoRendererTexture(use_gpu_surface, throttle, throttle_ms,
-                               std::move(result));
+                               pixel_buffer_scale, std::move(result));
   } else if (method_call.method_name().compare("videoRendererDispose") == 0) {
     if (!method_call.arguments()) {
       result->Error("Bad Arguments", "Null constraints arguments received");

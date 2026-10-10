@@ -25,17 +25,28 @@ class RTCVideoRenderer extends ValueNotifier<RTCVideoValue>
   /// fuer alles andere false lassen (Kamera/Remote bleiben PixelBuffer).
   bool gpuSurface = false;
 
-  /// honeycord: nur fuer die EIGENE Bildschirm-Selbstansicht auf true setzen.
-  /// Drosselt die GpuSurface-Kachel nativ auf ~25 fps (spart teure Flutter-
-  /// Composites fuer eine Vorschau, die man ohnehin sieht). Remote-Kacheln NICHT
+  /// honeycord: nur fuer die EIGENEN Selbstansichten auf true setzen.
+  /// Drosselt die Kachel nativ (spart teure Flutter-Composites fuer eine
+  /// Vorschau, die man ohnehin sieht). Gilt fuer die GpuSurface-Kachel
+  /// (Bildschirm-Selbstansicht, Windows) und seit 10.10.2026 auch fuer
+  /// PixelBuffer (eigene Kamera, Windows + Linux). Nur die ANZEIGE verwirft
+  /// Bilder — Spur und Encoder bleiben unberuehrt. Remote-Kacheln NICHT
   /// drosseln (false lassen) -> sie sollen mit voller Sender-FPS laufen.
   bool gpuSurfaceThrottle = false;
 
-  /// honeycord: Drossel-Intervall der Self-View in ms (nur mit gpuSurfaceThrottle).
-  /// User-Schalter „Vorschau-Fluessigkeit": 40 = Sparsam (~20 fps, Default),
-  /// 25 = Normal (~30 fps), 0 = Fluessig (ungedrosselt, mehr GPU-Last). VOR
-  /// initialize() setzen.
+  /// honeycord: Drossel-Intervall in ms (nur mit gpuSurfaceThrottle).
+  /// GpuSurface: User-Schalter „Vorschau-Fluessigkeit": 40 = Sparsam (~20 fps,
+  /// Default), 25 = Normal (~30 fps), 0 = Fluessig (ungedrosselt). PixelBuffer:
+  /// 67 = hoechstens ~15 Textur-Updates/s. VOR initialize() setzen.
   int gpuSurfaceThrottleMs = 40;
+
+  /// honeycord (10.10.2026): PixelBuffer nur in Kachelgroesse umrechnen
+  /// (Windows + Linux). Flutter nennt dem nativen Renderer die Groesse der
+  /// Textur in LOGISCHEN Pixeln — hier das devicePixelRatio der Ansicht
+  /// eintragen, dann rechnet der Renderer auf Geraete-Pixel der Kachel herunter
+  /// (nie hoeher als das Bild). 0 = aus: volle Bildgroesse wie bisher. VOR
+  /// initialize() setzen.
+  double pixelBufferScale = 0;
 
   @override
   Future<void> initialize() async {
@@ -48,6 +59,7 @@ class RTCVideoRenderer extends ValueNotifier<RTCVideoValue>
       'gpuSurface': gpuSurface,
       'gpuSurfaceThrottle': gpuSurfaceThrottle,
       'gpuSurfaceThrottleMs': gpuSurfaceThrottleMs,
+      'pixelBufferScale': pixelBufferScale,
     });
     _textureId = response['textureId'];
     _eventSubscription = EventChannel('FlutterWebRTC/Texture$textureId')

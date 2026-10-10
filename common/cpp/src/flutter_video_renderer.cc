@@ -1,13 +1,54 @@
 #include "flutter_video_renderer.h"
 
-#ifdef _WINDOWS
+#include <algorithm>
 #include <chrono>
+#include <cmath>
+
+#ifdef _WINDOWS
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 #endif
 
 namespace flutter_webrtc_plugin {
+
+namespace {
+inline int64_t NowUs() {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+// honeycord (10.10.2026): Ausgabegroesse des PixelBuffers. Flutter nennt die
+// Groesse der Textur-Ebene in logischen Pixeln (req_w x req_h); mal `scale`
+// (devicePixelRatio der App) ergibt das die Geraete-Pixel der Kachel. Ist das
+// DEUTLICH kleiner als das Bild (unter 3/4), wird auf diese Groesse verkleinert
+// — Seitenverhaeltnis des Bildes bleibt, das Zielrechteck wird in beiden
+// Richtungen gefuellt (wie BoxFit.cover, also nie unscharf), nie vergroessert.
+// Rueckfall auf die volle Bildgroesse bei scale <= 0 (aus), Zielgroesse 0 oder
+// unsinnigen Werten — genau das bisherige Verhalten.
+void PixelBufferZielGroesse(int fw, int fh, size_t req_w, size_t req_h,
+                            double scale, int* ow, int* oh) {
+  *ow = fw;
+  *oh = fh;
+  if (fw <= 0 || fh <= 0 || !(scale > 0.0) || req_w == 0 || req_h == 0) return;
+  // (std::min)/(std::max) in Klammern: windows.h definiert ohne NOMINMAX
+  // min/max-Makros, und das Plugin wird nicht mit NOMINMAX uebersetzt.
+  scale = (std::min)((std::max)(scale, 1.0), 4.0);
+  const double tw = static_cast<double>(req_w) * scale;
+  const double th = static_cast<double>(req_h) * scale;
+  // Untergrenze: die kurze Seite nicht unter 16 Pixel (Seitenverhaeltnis bleibt).
+  const double f = (std::max)((std::max)(tw / fw, th / fh),
+                              16.0 / (std::min)(fw, fh));
+  if (!(f < 0.75)) return;  // nicht deutlich kleiner (oder NaN) -> volle Groesse
+  // Gerade Werte (I420-Farbebenen).
+  const int w = (static_cast<int>(std::lround(fw * f)) + 1) & ~1;
+  const int h = (static_cast<int>(std::lround(fh * f)) + 1) & ~1;
+  if (w <= 0 || h <= 0 || w >= fw || h >= fh) return;
+  *ow = w;
+  *oh = h;
+}
+}  // namespace
 
 #ifdef _WINDOWS
 namespace {
@@ -50,23 +91,50 @@ void RotateLogIfNeededA(const char* path) {
 // getenv/fopen loesen unter MSVC C4996 aus (bei /WX = Fehler) -> nur hier unterdruecken.
 #pragma warning(push)
 #pragma warning(disable : 4996)
+// Pfad von render.log (leer ohne LOCALAPPDATA); rotiert einmal pro Prozess.
+const std::string& RenderLogPath() {
+  static const std::string path = [] {
+    const char* base = std::getenv("LOCALAPPDATA");
+    if (!base) return std::string();
+    std::string p = std::string(base) + "\\HoneyCord\\render.log";
+    RotateLogIfNeededA(p.c_str());
+    return p;
+  }();
+  return path;
+}
+
 void RenderLog(int64_t tex, int throttled, const char* what, double fps, int w, int h,
                int native, double fb_ms, double mark_ms) {
-  if (const char* base = std::getenv("LOCALAPPDATA")) {
-    std::string path = std::string(base) + "\\HoneyCord\\render.log";
-    static const bool rotated = [&path] {
-      RotateLogIfNeededA(path.c_str());
-      return true;
-    }();
-    (void)rotated;
-    if (FILE* f = std::fopen(path.c_str(), "a")) {
-      std::fprintf(f,
-                   "[render] tex=%lld throttled=%d %s=%.1f fps %dx%d native=%d "
-                   "fbconv=%.2f ms mark=%.1f ms\n",
-                   static_cast<long long>(tex), throttled, what, fps, w, h, native,
-                   fb_ms, mark_ms);
-      std::fclose(f);
-    }
+  const std::string& path = RenderLogPath();
+  if (path.empty()) return;
+  if (FILE* f = std::fopen(path.c_str(), "a")) {
+    std::fprintf(f,
+                 "[render] tex=%lld throttled=%d %s=%.1f fps %dx%d native=%d "
+                 "fbconv=%.2f ms mark=%.1f ms\n",
+                 static_cast<long long>(tex), throttled, what, fps, w, h, native,
+                 fb_ms, mark_ms);
+    std::fclose(f);
+  }
+}
+
+// PixelBuffer-Zeile (10.10.2026): uploads = CopyPixelBuffer-Aufrufe/s im
+// Fenster, quelle = Bild, ziel = von Flutter erbetene Groesse (logisch),
+// aus = tatsaechlich umgerechnet, drossel = Intervall in ms (0 = aus).
+void RenderLogPixelBuffer(int64_t tex, int drossel_ms, double uploads, int qw,
+                          int qh, size_t zw, size_t zh, int aw, int ah,
+                          double skala, double conv_ms, double fenster_s) {
+  const std::string& path = RenderLogPath();
+  if (path.empty()) return;
+  if (FILE* f = std::fopen(path.c_str(), "a")) {
+    std::fprintf(f,
+                 "[render] tex=%lld PIXELBUFFER uploads=%.1f/s quelle=%dx%d "
+                 "ziel=%llux%llu aus=%dx%d skala=%.2f drossel=%d ms "
+                 "conv=%.2f ms fenster=%.1f s\n",
+                 static_cast<long long>(tex), uploads, qw, qh,
+                 static_cast<unsigned long long>(zw),
+                 static_cast<unsigned long long>(zh), aw, ah, skala, drossel_ms,
+                 conv_ms, fenster_s);
+    std::fclose(f);
   }
 }
 #pragma warning(pop)
@@ -100,27 +168,54 @@ void FlutterVideoRenderer::initialize(
 const FlutterDesktopPixelBuffer* FlutterVideoRenderer::CopyPixelBuffer(
     size_t width,
     size_t height) const {
-  mutex_.lock();
-  if (pixel_buffer_.get() && frame_.get()) {
-    if (pixel_buffer_->width != frame_->width() ||
-        pixel_buffer_->height != frame_->height()) {
-      size_t buffer_size =
-          (size_t(frame_->width()) * size_t(frame_->height())) * (32 >> 3);
-      rgb_buffer_.reset(new uint8_t[buffer_size]);
-      pixel_buffer_->width = frame_->width();
-      pixel_buffer_->height = frame_->height();
-    }
-
-    frame_->ConvertToARGB(RTCVideoFrame::Type::kABGR, rgb_buffer_.get(), 0,
-                          static_cast<int>(pixel_buffer_->width),
-                          static_cast<int>(pixel_buffer_->height));
-
-    pixel_buffer_->buffer = rgb_buffer_.get();
-    mutex_.unlock();
-    return pixel_buffer_.get();
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!pixel_buffer_.get() || !frame_.get()) return nullptr;
+  const int fw = frame_->width();
+  const int fh = frame_->height();
+  if (fw <= 0 || fh <= 0) return nullptr;
+  // honeycord (10.10.2026): nur in Kachelgroesse umrechnen, wenn die App es fuer
+  // diesen Renderer eingeschaltet hat (pb_scale_ > 0) — sonst volle Groesse.
+  // ConvertToARGB skaliert selbst (I420 ScaleFrom, Box-Filter), wenn die
+  // Zielgroesse vom Bild abweicht.
+  int ow = fw;
+  int oh = fh;
+  PixelBufferZielGroesse(fw, fh, width, height, pb_scale_, &ow, &oh);
+  const size_t needed = static_cast<size_t>(ow) * static_cast<size_t>(oh) * 4;
+  if (!rgb_buffer_ || needed > rgb_capacity_) {
+    // new[] braucht delete[] — der Vorgabe-Loescher von shared_ptr<uint8_t>
+    // ruft delete (bisher so geschrieben, undefiniert).
+    rgb_buffer_.reset(new uint8_t[needed], std::default_delete<uint8_t[]>());
+    rgb_capacity_ = needed;
   }
-  mutex_.unlock();
-  return nullptr;
+  pixel_buffer_->width = static_cast<size_t>(ow);
+  pixel_buffer_->height = static_cast<size_t>(oh);
+#ifdef _WINDOWS
+  auto _t_conv = std::chrono::steady_clock::now();
+#endif
+  frame_->ConvertToARGB(RTCVideoFrame::Type::kABGR, rgb_buffer_.get(), 0, ow,
+                        oh);
+  pixel_buffer_->buffer = rgb_buffer_.get();
+#ifdef _WINDOWS
+  {
+    dbg_pb_conv_ms_ += std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - _t_conv)
+                           .count();
+    dbg_pb_calls_++;
+    const int64_t now = NowMs();
+    if (dbg_pb_last_ms_ == 0) dbg_pb_last_ms_ = now;
+    if (now - dbg_pb_last_ms_ >= 5000) {
+      const double fenster_ms = static_cast<double>(now - dbg_pb_last_ms_);
+      RenderLogPixelBuffer(texture_id_, is_throttle_ ? throttle_ms_ : 0,
+                           dbg_pb_calls_ * 1000.0 / fenster_ms, fw, fh, width,
+                           height, ow, oh, pb_scale_,
+                           dbg_pb_conv_ms_ / dbg_pb_calls_, fenster_ms / 1000.0);
+      dbg_pb_calls_ = 0;
+      dbg_pb_conv_ms_ = 0.0;
+      dbg_pb_last_ms_ = now;
+    }
+  }
+#endif
+  return pixel_buffer_.get();
 }
 
 #ifdef _WINDOWS
@@ -236,9 +331,6 @@ void FlutterVideoRenderer::OnFrame(scoped_refptr<RTCVideoFrame> frame) {
     params[EncodableValue("event")] = "didFirstFrameRendered";
     params[EncodableValue("id")] = EncodableValue(texture_id_);
     event_channel_->Success(EncodableValue(params));
-    pixel_buffer_.reset(new FlutterDesktopPixelBuffer());
-    pixel_buffer_->width = 0;
-    pixel_buffer_->height = 0;
     first_frame_rendered = true;
   }
   if (rotation_ != frame->rotation()) {
@@ -262,8 +354,36 @@ void FlutterVideoRenderer::OnFrame(scoped_refptr<RTCVideoFrame> frame) {
     last_frame_size_ = {(size_t)frame->width(), (size_t)frame->height()};
   }
   mutex_.lock();
+  // honeycord (10.10.2026): den PixelBuffer nur EINMAL und unter der Sperre
+  // anlegen. Frueher wurde er bei jedem „ersten Bild" (also auch nach jedem
+  // neuen srcObject) ohne Sperre ersetzt, waehrend der Raster-Faden ihn in
+  // CopyPixelBuffer lesen konnte. Breite/Hoehe setzt CopyPixelBuffer je Aufruf.
+  if (!pixel_buffer_) {
+    pixel_buffer_.reset(new FlutterDesktopPixelBuffer());
+    pixel_buffer_->width = 0;
+    pixel_buffer_->height = 0;
+  }
   frame_ = frame;
   mutex_.unlock();
+#ifdef _WINDOWS
+  const bool pixel_buffer_pfad = !is_gpu_surface_;
+#else
+  const bool pixel_buffer_pfad = true;
+#endif
+  // honeycord (10.10.2026): PixelBuffer-Drossel (eigene Kamera-Selbstansicht).
+  // Hoechstens ein Textur-Update je throttle_ms_; frame_ ist schon aktuell, das
+  // naechste Update zeigt also das neueste Bild. Fester Takt mit Schlupf von
+  // einem Viertel-Intervall, damit eine 30-fps-Kamera bei 67 ms verlaesslich
+  // jedes zweite Bild zeigt (15 fps) statt durch Zeitzittern auf 10 fps zu
+  // fallen; nach einer Pause kein Nachholen. Spur/Encoder unberuehrt.
+  if (pixel_buffer_pfad && is_throttle_ && throttle_ms_ > 0) {
+    const int64_t now = NowUs();
+    const int64_t intervall = static_cast<int64_t>(throttle_ms_) * 1000;
+    if (now < pb_next_due_us_ - intervall / 4) return;
+    pb_next_due_us_ = (now - pb_next_due_us_ > intervall)
+                          ? now + intervall
+                          : pb_next_due_us_ + intervall;
+  }
 #ifdef _WINDOWS
   // Self-View-Drossel: jeder MarkTextureFrameAvailable triggert ein Flutter-
   // Fenster-Composite (ANGLE, teuer bei grossen Fenstern). NUR fuer die eigene
@@ -322,8 +442,14 @@ FlutterVideoRendererManager::FlutterVideoRendererManager(
 
 void FlutterVideoRendererManager::CreateVideoRendererTexture(
     bool use_gpu_surface, bool throttle, int throttle_ms,
-    std::unique_ptr<MethodResultProxy> result) {
+    double pixel_buffer_scale, std::unique_ptr<MethodResultProxy> result) {
   auto texture = new RefCountedObject<FlutterVideoRenderer>();
+  // Drossel + Kachelgroesse gelten ab 10.10.2026 auch fuer PixelBuffer (Windows
+  // und Linux) — nur wenn die App sie fuer diesen Renderer ausdruecklich setzt
+  // (eigene Kamera-Selbstansicht). Alle anderen Renderer: Vorgaben = wie bisher.
+  texture->set_throttle(throttle);
+  texture->set_throttle_ms(throttle_ms);
+  texture->set_pixel_buffer_scale(pixel_buffer_scale);
   // Default: PixelBuffer (Kamera/Remote) -- bewaehrt, fasst nichts an. NUR wenn
   // die App explizit gpuSurface=true setzt (chirurgisch: lokale Bildschirm-
   // Selbst-Kachel auf Windows) wird eine GpuSurfaceTexture (Zero-Copy via
@@ -332,9 +458,7 @@ void FlutterVideoRendererManager::CreateVideoRendererTexture(
   std::unique_ptr<flutter::TextureVariant> textureVariant;
 #ifdef _WINDOWS
   if (use_gpu_surface) {
-    texture->set_gpu_surface(true);
-    texture->set_throttle(throttle);  // nur Self-View drosselt (OnFrame)
-    texture->set_throttle_ms(throttle_ms);  // Intervall (0=aus, s. User-Schalter)
+    texture->set_gpu_surface(true);  // Drossel s. oben: nur Self-View (OnFrame)
     textureVariant = std::make_unique<flutter::TextureVariant>(
         flutter::GpuSurfaceTexture(
             kFlutterDesktopGpuSurfaceTypeDxgiSharedHandle,
