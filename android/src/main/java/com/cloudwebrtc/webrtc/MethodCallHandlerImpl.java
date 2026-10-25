@@ -170,6 +170,9 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
   }
 
   void dispose() {
+    // ★ HoneyCord A2: Probe-Faden und eigene Quelle zuerst, bevor die Spuren
+    // unten pauschal freigegeben werden.
+    honeycordA2ProbeBeenden("plugin-dispose");
     for (final MediaStream mediaStream : localStreams.values()) {
       streamDispose(mediaStream);
       mediaStream.dispose();
@@ -939,6 +942,24 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
         result.success(antwort);
         break;
       }
+      // ★ HoneyCord A2, Phase 2 (nur Alpha, Diagnose): Testton als eigene Spur.
+      // `an=true` erzeugt Quelle + Spur + Stream und speist einen Sinus; die
+      // Antwort traegt streamId/trackId wie getUserMedia, damit Dart die Spur
+      // ueber LiveKit veroeffentlichen kann. `an=false` raeumt alles ab.
+      // Fehlt die eigene Tonquelle (offizielle AAR), kommt ok=false + grund.
+      case "honeycordA2Probe": {
+        final Boolean an = call.argument("an");
+        if (an != null && an) {
+          result.success(honeycordA2ProbeStarten());
+        } else {
+          honeycordA2ProbeBeenden("aus");
+          Map<String, Object> antwort = new HashMap<>();
+          antwort.put("ok", true);
+          antwort.put("running", false);
+          result.success(antwort);
+        }
+        break;
+      }
       case "honeycordScreenAudioState": {
         Map<String, Object> antwort = new HashMap<>();
         antwort.put("wanted", com.cloudwebrtc.webrtc.honeycord.ScreenAudio.istGewuenscht());
@@ -1597,6 +1618,138 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
     observer.setPeerConnection(peerConnection);
     mPeerConnectionObservers.put(peerConnectionId, observer);
     return peerConnectionId;
+  }
+
+  // ★ HoneyCord A2, Phase 2: Zustand der Testton-Probe (hoechstens eine).
+  private com.cloudwebrtc.webrtc.honeycord.EigeneTonquelle a2Quelle;
+  private com.cloudwebrtc.webrtc.honeycord.A2Probe a2Probe;
+  private AudioTrack a2Spur;
+  private MediaStream a2Stream;
+  private String a2StreamId;
+  private String a2TrackId;
+
+  private Map<String, Object> honeycordA2ProbeAntwort() {
+    Map<String, Object> antwort = new HashMap<>();
+    antwort.put("ok", true);
+    antwort.put("running", true);
+    antwort.put("streamId", a2StreamId);
+    antwort.put("trackId", a2TrackId);
+    Map<String, Object> spur = new HashMap<>();
+    spur.put("enabled", true);
+    spur.put("id", a2TrackId);
+    spur.put("kind", "audio");
+    spur.put("label", a2TrackId);
+    spur.put("readyState", "live");
+    spur.put("remote", false);
+    List<Object> audio = new ArrayList<>();
+    audio.add(spur);
+    antwort.put("audioTracks", audio);
+    antwort.put("videoTracks", new ArrayList<>());
+    return antwort;
+  }
+
+  private Map<String, Object> honeycordA2ProbeStarten() {
+    if (a2Probe != null) {
+      Log.i(TAG, "[a2] probe laeuft schon trackId=" + a2TrackId);
+      return honeycordA2ProbeAntwort();
+    }
+    Map<String, Object> fehler = new HashMap<>();
+    fehler.put("ok", false);
+    fehler.put("running", false);
+    // N-4: die Quelle erst nach PeerConnectionFactory.initialize — mFactory
+    // entsteht genau dort.
+    if (mFactory == null) {
+      fehler.put("grund", "fabrik-fehlt");
+      Log.w(TAG, "[a2] probe nicht moeglich: Fabrik fehlt (initialize noch nicht gelaufen)");
+      return fehler;
+    }
+    if (!com.cloudwebrtc.webrtc.honeycord.EigeneTonquelle.verfuegbar()) {
+      fehler.put("grund", "quelle-fehlt:" + com.cloudwebrtc.webrtc.honeycord.EigeneTonquelle.grund());
+      return fehler;
+    }
+    com.cloudwebrtc.webrtc.honeycord.EigeneTonquelle quelle =
+        com.cloudwebrtc.webrtc.honeycord.EigeneTonquelle.erzeugen();
+    if (quelle == null) {
+      fehler.put("grund", "quelle-erzeugen");
+      return fehler;
+    }
+    AudioTrack spur = null;
+    MediaStream stream = null;
+    try {
+      String trackId = "hc-a2-probe-" + getNextTrackUUID();
+      String streamId = getNextStreamUUID();
+      spur = mFactory.createAudioTrack(trackId, quelle.quelle());
+      stream = mFactory.createLocalMediaStream(streamId);
+      stream.addTrack(spur);
+      // Wie jede lokale Spur registrieren, damit die ueblichen Wege (addTransceiver,
+      // mediaStreamTrackSetEnable, trackDispose) sie finden. Bewusst LocalTrack,
+      // nicht LocalAudioTrack: die bekaeme sonst Mikrofon-Puffer fuer Sinks.
+      localStreams.put(streamId, stream);
+      synchronized (localTracks) {
+        localTracks.put(trackId, new LocalTrack(spur));
+      }
+      a2Quelle = quelle;
+      a2Spur = spur;
+      a2Stream = stream;
+      a2StreamId = streamId;
+      a2TrackId = trackId;
+      a2Probe = new com.cloudwebrtc.webrtc.honeycord.A2Probe(quelle);
+      a2Probe.starten();
+      Log.i(TAG, "[a2] spur erzeugt trackId=" + trackId + " streamId=" + streamId);
+      Log.i(TAG, "[a2] probe an (sinus 440 Hz, 48 kHz, stereo, -20 dBFS)");
+      return honeycordA2ProbeAntwort();
+    } catch (Throwable t) {
+      Log.e(TAG, "[a2] probe starten fehlgeschlagen", t);
+      honeycordA2ProbeBeenden("fehler");
+      // Teile, die noch nicht in den Feldern standen, selbst freigeben.
+      if (a2Spur == null && spur != null) {
+        try { spur.dispose(); } catch (Throwable ignoriert) { }
+      }
+      if (a2Stream == null && stream != null) {
+        try { stream.dispose(); } catch (Throwable ignoriert) { }
+      }
+      if (a2Quelle == null) quelle.dispose();
+      fehler.put("grund", "ausnahme:" + t.getClass().getSimpleName());
+      return fehler;
+    }
+  }
+
+  /**
+   * Faden stoppen, dann Spur, Stream und Quelle freigeben. Wirft nie.
+   *
+   * <p>Haelt LiveKit die Spur noch an einem Sender, ist das unkritisch: der
+   * native Sender hat eine eigene Referenz, und die gestoppte Quelle liefert
+   * nichts mehr. Dart meldet die Spur trotzdem VORHER ab.
+   */
+  private void honeycordA2ProbeBeenden(String grund) {
+    com.cloudwebrtc.webrtc.honeycord.A2Probe probe = a2Probe;
+    if (probe == null && a2Quelle == null) return;
+    a2Probe = null;
+    if (probe != null) probe.beenden();
+    if (a2TrackId != null) {
+      synchronized (localTracks) {
+        localTracks.remove(a2TrackId);
+      }
+    }
+    if (a2StreamId != null) localStreams.remove(a2StreamId);
+    if (a2Stream != null && a2Spur != null) {
+      try {
+        if (a2Stream.audioTracks.contains(a2Spur)) a2Stream.removeTrack(a2Spur);
+      } catch (Throwable ignoriert) { }
+    }
+    if (a2Spur != null) {
+      try { a2Spur.dispose(); } catch (Throwable ignoriert) { }
+    }
+    if (a2Stream != null) {
+      try { a2Stream.dispose(); } catch (Throwable ignoriert) { }
+    }
+    if (a2Quelle != null) a2Quelle.dispose();
+    Log.i(TAG, "[a2] probe aus grund=" + grund + " trackId=" + a2TrackId);
+    a2Quelle = null;
+    a2Spur = null;
+    a2Stream = null;
+    a2StreamId = null;
+    a2TrackId = null;
   }
 
   @Override

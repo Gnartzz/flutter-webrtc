@@ -276,6 +276,27 @@ class Helper {
     return r is Map && r['stumm'] == true;
   }
 
+  /// HoneyCord A2, Phase 2 (nur Android-Alpha, Diagnose): Testton als EIGENE
+  /// Spur aus der eigenen Tonquelle der HoneyCord-libwebrtc.
+  ///
+  /// `an: true` liefert einen Stream mit einer Audiospur (Sinus 440 Hz, 48 kHz,
+  /// Stereo, −20 dBFS), den der Aufrufer als NEUEN Transceiver veroeffentlicht
+  /// (App-Regel N-1, nie `replaceTrack`). Gibt es die eigene Quelle nicht
+  /// (offizielle AAR), kommt `(null, grund)` zurueck — der Client bleibt bei A1.
+  /// `an: false` stoppt den Speise-Faden und gibt Spur und Quelle frei; vorher
+  /// die Spur abmelden.
+  static Future<(MediaStream?, String?)> honeycordA2Probe(bool an) async {
+    if (!WebRTC.platformIsAndroid) return (null, 'plattform');
+    final r = await WebRTC.invokeMethod('honeycordA2Probe', {'an': an});
+    if (!an) return (null, null);
+    if (r is! Map || r['ok'] != true || r['streamId'] is! String) {
+      return (null, (r is Map ? r['grund'] as String? : null) ?? 'antwort');
+    }
+    final stream = MediaStreamNative(r['streamId'] as String, 'local');
+    stream.setMediaTracks(r['audioTracks'], r['videoTracks']);
+    return (stream, null);
+  }
+
   /// HoneyCord: Laeuft der Ton der Bildschirmfreigabe gerade?
   static Future<Map<String, bool>> screenAudioState() async {
     if (!WebRTC.platformIsAndroid) return {'wanted': false, 'running': false};
