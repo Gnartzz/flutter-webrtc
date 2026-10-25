@@ -1675,12 +1675,21 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
     }
     AudioTrack spur = null;
     MediaStream stream = null;
+    boolean uebernommen = false;   // ab hier gehoeren alle Teile den a2-Feldern
     try {
       String trackId = "hc-a2-probe-" + getNextTrackUUID();
       String streamId = getNextStreamUUID();
       spur = mFactory.createAudioTrack(trackId, quelle.quelle());
       stream = mFactory.createLocalMediaStream(streamId);
       stream.addTrack(spur);
+      // Erst die Felder, dann registrieren: ab hier raeumt EIN Weg
+      // (honeycordA2ProbeBeenden) alles ab, auch eine halbe Registrierung.
+      a2Quelle = quelle;
+      a2Spur = spur;
+      a2Stream = stream;
+      a2StreamId = streamId;
+      a2TrackId = trackId;
+      uebernommen = true;
       // Wie jede lokale Spur registrieren, damit die ueblichen Wege (addTransceiver,
       // mediaStreamTrackSetEnable, trackDispose) sie finden. Bewusst LocalTrack,
       // nicht LocalAudioTrack: die bekaeme sonst Mikrofon-Puffer fuer Sinks.
@@ -1688,11 +1697,6 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
       synchronized (localTracks) {
         localTracks.put(trackId, new LocalTrack(spur));
       }
-      a2Quelle = quelle;
-      a2Spur = spur;
-      a2Stream = stream;
-      a2StreamId = streamId;
-      a2TrackId = trackId;
       a2Probe = new com.cloudwebrtc.webrtc.honeycord.A2Probe(quelle);
       a2Probe.starten();
       Log.i(TAG, "[a2] spur erzeugt trackId=" + trackId + " streamId=" + streamId);
@@ -1700,15 +1704,24 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
       return honeycordA2ProbeAntwort();
     } catch (Throwable t) {
       Log.e(TAG, "[a2] probe starten fehlgeschlagen", t);
-      honeycordA2ProbeBeenden("fehler");
-      // Teile, die noch nicht in den Feldern standen, selbst freigeben.
-      if (a2Spur == null && spur != null) {
-        try { spur.dispose(); } catch (Throwable ignoriert) { }
+      if (uebernommen) {
+        // Felder tragen alles (auch die Registrierung) — EIN Abbauweg.
+        honeycordA2ProbeBeenden("fehler");
+      } else {
+        // Noch nichts registriert: nur die lokal erzeugten Teile freigeben.
+        if (stream != null) {
+          try {
+            if (spur != null && stream.audioTracks.contains(spur)) stream.removeTrack(spur);
+          } catch (Throwable ignoriert) { }
+        }
+        if (spur != null) {
+          try { spur.dispose(); } catch (Throwable ignoriert) { }
+        }
+        if (stream != null) {
+          try { stream.dispose(); } catch (Throwable ignoriert) { }
+        }
+        quelle.dispose();
       }
-      if (a2Stream == null && stream != null) {
-        try { stream.dispose(); } catch (Throwable ignoriert) { }
-      }
-      if (a2Quelle == null) quelle.dispose();
       fehler.put("grund", "ausnahme:" + t.getClass().getSimpleName());
       return fehler;
     }
