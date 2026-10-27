@@ -3,6 +3,7 @@
 #include "base/scoped_ref_ptr.h"
 #include "flutter_data_channel.h"
 #include "flutter_frame_capturer.h"
+#include "honeycord_inert_observers.h"
 #include "rtc_dtmf_sender.h"
 #include "rtc_rtp_parameters.h"
 
@@ -1198,13 +1199,15 @@ FlutterPeerConnectionObserver::~FlutterPeerConnectionObserver() {
 }
 
 void FlutterPeerConnectionObserver::Detach() {
-  // RegisterRTCPeerConnectionObserver setzt `observer_` unter der Sperre
-  // `callback_crt_sec_` (libwebrtc rtc_peerconnection_impl.cc). Jede
-  // PeerConnection hat genau einen Beobachter, also trifft das nur uns.
+  // Jede PeerConnection hat genau einen Beobachter, also trifft das nur uns.
   // `peerconnection_` haelt eine eigene Referenz -> das Objekt lebt hier noch,
   // auch wenn es schon geschlossen ist (normaler Weg RTCPeerConnectionClose).
+  // Nicht nullptr, sondern ein wirkungsloser Dauer-Beobachter: die Rueckrufe
+  // in RTCPeerConnectionImpl lesen `observer_` ohne Sperre (Pruefen und
+  // Aufrufen getrennt), s. honeycord_inert_observers.h.
   if (peerconnection_) {
-    peerconnection_->RegisterRTCPeerConnectionObserver(nullptr);
+    peerconnection_->RegisterRTCPeerConnectionObserver(
+        inert::InertPeerConnection());
   }
 }
 

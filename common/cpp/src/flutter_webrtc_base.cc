@@ -6,8 +6,12 @@
 #include "helper.h"
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <ctime>
+#include <thread>
+
+#include "honeycord_inert_observers.h"
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -16,7 +20,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <windows.h>  // GetCurrentProcessId, GetEnvironmentVariableA
+#include <windows.h>  // GetCurrentProcessId, GetEnvironmentVariableA, TerminateProcess
 #endif
 
 namespace flutter_webrtc_plugin {
@@ -114,60 +118,93 @@ void FlutterWebRTCBase::TeardownForExit() {
   // dessen Destruktor marshalt synchron auf den Signalisierungs-Thread
   // (PROXY_PRIMARY_THREAD_DESTRUCTOR). Der Signalisierungs-Thread wartet nie
   // auf den Plattform-Thread (Ereignisse gehen per PostMessage), also
-  // dieselbe Verklemmungsfreiheit wie beim normalen Auflegen.
+  // dieselbe Verklemmungsfreiheit wie beim normalen Auflegen. Fuer den Fall,
+  // dass es trotzdem haengt: Waechter unten.
   const auto t0 = std::chrono::steady_clock::now();
   size_t kanaele = 0;
   {
     std::lock_guard<std::mutex> guard(mutex_);
     kanaele = data_channel_observers_.size();
   }
-  ExitLog("start", peerconnections_.size(), peerconnection_observers_.size(),
-          kanaele, 0);
+  const size_t pcs = peerconnections_.size();
+  const size_t beobachter = peerconnection_observers_.size();
+  ExitLog("start", pcs, beobachter, kanaele, 0);
 
-  // (1) Alle Beobachter abmelden, solange sie noch leben. Ab hier ruft
-  //     libwebrtc nichts Neues mehr in Plugin-Objekte (alle Aufrufstellen in
-  //     RTCPeerConnectionImpl / RTCDataChannelImpl pruefen `observer_` auf
-  //     nullptr). Auch die Ereigniskanaele bekommen nichts mehr.
-  for (auto& kv : peerconnection_observers_) {
-    if (kv.second) kv.second->Detach();
-  }
-  for (auto& kv : peerconnections_) {
-    // Doppelt haelt besser: falls ein Beobachter fehlt, der PC aber noch da ist.
-    if (kv.second) kv.second->RegisterRTCPeerConnectionObserver(nullptr);
-  }
-  {
-    std::lock_guard<std::mutex> guard(mutex_);
-    for (auto& kv : data_channel_observers_) {
-      if (kv.second && kv.second->data_channel()) {
-        kv.second->data_channel()->UnregisterObserver();
+#if defined(_WIN32)
+  // Gutachten N5: Haengt der Abbau, bliebe ein unsichtbarer Prozess, der
+  // weiter Ton sendet. Nach 5 s: Zeile "haengt" und Prozess beenden. Nur
+  // scharf, wenn es PeerConnections gibt — nur dann kann Close() blockieren,
+  // und ein zweites Fenster mit eigener Engine (ohne Gespraech) kann so nie
+  // die ganze App beenden.
+  struct Waechter {
+    std::mutex m;
+    std::condition_variable cv;
+    bool fertig = false;
+    std::thread t;
+  } waechter;
+  if (pcs > 0) {
+    // Kann der Thread nicht starten (std::system_error), laeuft der Abbau
+    // eben ohne Waechter — eine Ausnahme aus dem Destruktor waere terminate().
+    try {
+    waechter.t = std::thread([&waechter, pcs, beobachter, kanaele, t0] {
+      std::unique_lock<std::mutex> lk(waechter.m);
+      if (waechter.cv.wait_for(lk, std::chrono::seconds(5),
+                               [&waechter] { return waechter.fertig; })) {
+        return;
       }
+      const long long ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now() - t0)
+              .count();
+      ExitLog("haengt", pcs, beobachter, kanaele, ms);
+      TerminateProcess(GetCurrentProcess(), 0);
+    });
+    } catch (...) {
+      ExitLog("ohne-waechter", pcs, beobachter, kanaele, 0);
     }
   }
+#endif
 
-  // (2) Schliessen, solange Fabrik, Threads und SSL leben. Close() ist mit
-  //     `observer_ == nullptr` sicher: die Schleife ueber die fremden Stroeme
-  //     ruft nur `if (observer_) observer_->OnRemoveStream(...)`. Ein zweites
-  //     Close() (aus ~RTCPeerConnectionImpl) ist ein No-Op, weil
-  //     `rtc_peerconnection_` dann schon nullptr ist. Delete() nimmt die
-  //     Referenz der Fabrik-Liste weg, damit der PC hier — und nicht erst
-  //     nach Terminate() mit der Fabrik — verschwindet.
+  // (1) Schliessen, SOLANGE die Beobachter noch angemeldet sind und leben —
+  //     wie beim normalen Auflegen (RTCPeerConnectionClose). Gutachten N1:
+  //     die Rueckrufe in RTCPeerConnectionImpl lesen `observer_` ohne Sperre;
+  //     waehrend Close() muss der Zeiger deshalb stabil auf ein lebendes
+  //     Objekt zeigen. OnRemoveStream & Co. reihen nur Ereignisse ein; der
+  //     TaskRunner lebt noch (Member-Reihenfolge im Plugin). Fabrik, Threads
+  //     und SSL leben ebenfalls noch (vor Terminate()). Ein zweites Close()
+  //     aus ~RTCPeerConnectionImpl ist ein No-Op (`rtc_peerconnection_` ist
+  //     dann nullptr). Delete() nimmt die Referenz der Fabrik-Liste weg,
+  //     damit der PC hier verschwindet und nicht erst nach Terminate().
   for (auto& kv : peerconnections_) {
     if (!kv.second) continue;
     kv.second->Close();
     if (factory_) factory_->Delete(kv.second);
   }
 
-  // (3) Erst jetzt die Container leeren. Ein Rueckruf, der vor (1) schon auf
-  //     dem Signalisierungs-Thread lief, ist durch das synchrone Marshalling
-  //     in Close() abgeschlossen, bevor die Beobachter hier fallen.
-  const size_t pcs = peerconnections_.size();
-  const size_t beobachter = peerconnection_observers_.size();
+  // (2) Jetzt abmelden — auf wirkungslose Dauer-Beobachter statt nullptr
+  //     (honeycord_inert_observers.h), damit auch ein verspaeteter Rueckruf
+  //     ein gueltiges Ziel hat.
+  for (auto& kv : peerconnection_observers_) {
+    if (kv.second) kv.second->Detach();
+  }
+  for (auto& kv : peerconnections_) {
+    // Doppelt haelt besser: falls ein Beobachter fehlt, der PC aber noch da ist.
+    if (kv.second)
+      kv.second->RegisterRTCPeerConnectionObserver(inert::InertPeerConnection());
+  }
+  {
+    std::lock_guard<std::mutex> guard(mutex_);
+    for (auto& kv : data_channel_observers_) {
+      if (kv.second) kv.second->Detach();
+    }
+  }
+
+  // (3) Erst jetzt die Container leeren.
   peerconnections_.clear();
   {
     // Ausserhalb der Sperre zerstoeren: der Abbau eines RTCDataChannelImpl
     // marshalt auf den Signalisierungs-Thread, und der nimmt in
-    // OnDataChannel dieselbe Sperre (dorthin kommt nach (1) zwar nichts mehr,
-    // aber eine Sperre ueber einem blockierenden Aufruf ist unnoetig).
+    // OnDataChannel dieselbe Sperre.
     std::map<std::string, std::shared_ptr<FlutterRTCDataChannelObserver>> weg;
     {
       std::lock_guard<std::mutex> guard(mutex_);
@@ -175,6 +212,17 @@ void FlutterWebRTCBase::TeardownForExit() {
     }
   }
   peerconnection_observers_.clear();
+
+#if defined(_WIN32)
+  if (waechter.t.joinable()) {
+    {
+      std::lock_guard<std::mutex> lk(waechter.m);
+      waechter.fertig = true;
+    }
+    waechter.cv.notify_one();
+    waechter.t.join();
+  }
+#endif
 
   const long long ms =
       std::chrono::duration_cast<std::chrono::milliseconds>(

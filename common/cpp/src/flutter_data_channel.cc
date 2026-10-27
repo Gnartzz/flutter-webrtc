@@ -2,6 +2,8 @@
 
 #include <vector>
 
+#include "honeycord_inert_observers.h"
+
 namespace flutter_webrtc_plugin {
 
 FlutterRTCDataChannelObserver::FlutterRTCDataChannelObserver(
@@ -18,11 +20,16 @@ FlutterRTCDataChannelObserver::FlutterRTCDataChannelObserver(
 // zeigt `observer_` in RTCDataChannelImpl beim Plugin-Abbau auf geloeschten
 // Speicher, und OnStateChange(kClosed)/OnMessage vom Signalisierungs-Thread
 // liefe hinein (derselbe Fehler wie beim PeerConnection-Beobachter).
-// Mehrfaches Abmelden ist harmlos (setzt nur nullptr; DataChannelClose hat
-// ueber Close() schon abgemeldet).
+// Abgemeldet wird auf einen wirkungslosen Dauer-Beobachter statt auf nullptr:
+// RTCDataChannelImpl::OnMessage prueft und ruft ohne Sperre
+// (s. honeycord_inert_observers.h). Mehrfaches Abmelden ist harmlos.
 FlutterRTCDataChannelObserver::~FlutterRTCDataChannelObserver() {
+  Detach();
+}
+
+void FlutterRTCDataChannelObserver::Detach() {
   if (data_channel_) {
-    data_channel_->UnregisterObserver();
+    data_channel_->RegisterObserver(inert::InertDataChannel());
   }
 }
 
