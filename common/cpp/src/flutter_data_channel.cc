@@ -14,7 +14,17 @@ FlutterRTCDataChannelObserver::FlutterRTCDataChannelObserver(
   data_channel_->RegisterObserver(this);
 }
 
-FlutterRTCDataChannelObserver::~FlutterRTCDataChannelObserver() {}
+// HoneyCord 27.10.2026: abmelden, bevor das Objekt verschwindet. Ohne das
+// zeigt `observer_` in RTCDataChannelImpl beim Plugin-Abbau auf geloeschten
+// Speicher, und OnStateChange(kClosed)/OnMessage vom Signalisierungs-Thread
+// liefe hinein (derselbe Fehler wie beim PeerConnection-Beobachter).
+// Mehrfaches Abmelden ist harmlos (setzt nur nullptr; DataChannelClose hat
+// ueber Close() schon abgemeldet).
+FlutterRTCDataChannelObserver::~FlutterRTCDataChannelObserver() {
+  if (data_channel_) {
+    data_channel_->UnregisterObserver();
+  }
+}
 
 void FlutterDataChannel::CreateDataChannel(
     const std::string& peerConnectionId,

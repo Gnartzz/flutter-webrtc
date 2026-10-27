@@ -33,7 +33,15 @@ FlutterWebRTC::FlutterWebRTC(FlutterWebRTCPlugin* plugin)
 #endif
 }
 
-FlutterWebRTC::~FlutterWebRTC() {}
+FlutterWebRTC::~FlutterWebRTC() {
+  // HoneyCord 27.10.2026: PeerConnections ZUERST abbauen — hier leben noch
+  // alle Teilobjekte (Renderer, Bildschirmfreigabe, DataChannels). Die
+  // Basisklasse FlutterWebRTCBase wird als letzte zerstoert; erst in ihrem
+  // Destruktor waere es fuer die Renderer schon zu spaet (die fallen mit
+  // FlutterVideoRendererManager vorher, waehrend fremde Spuren noch Bilder
+  // liefern koennten). S. FlutterWebRTCBase::TeardownForExit().
+  TeardownForExit();
+}
 
 void FlutterWebRTC::HandleMethodCall(
     const MethodCallProxy& method_call,

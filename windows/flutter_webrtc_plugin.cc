@@ -32,7 +32,11 @@ class FlutterWebRTCPluginImpl : public FlutterWebRTCPlugin {
     registrar->AddPlugin(std::move(plugin));
   }
 
-  virtual ~FlutterWebRTCPluginImpl() {}
+  virtual ~FlutterWebRTCPluginImpl() {
+    // HoneyCord 27.10.2026: die geteilte Instanz zeigt sonst nach dem Abbau
+    // auf freigegebenen Speicher.
+    if (g_shared_instance == webrtc_.get()) g_shared_instance = nullptr;
+  }
 
   BinaryMessenger* messenger() { return messenger_; }
 
@@ -62,11 +66,16 @@ class FlutterWebRTCPluginImpl : public FlutterWebRTCPlugin {
   }
 
  private:
+  // HoneyCord 27.10.2026: Reihenfolge = Abbau rueckwaerts. `task_runner_`
+  // steht VOR `webrtc_`, damit er den Plugin-Kern ueberlebt: Renderer und
+  // Ereigniskanaele, die waehrend ~FlutterWebRTC noch ein Ereignis einreihen,
+  // trafen vorher einen schon zerstoerten TaskRunner. Initialisiert wird
+  // `webrtc_` ohnehin erst im Konstruktorrumpf.
   std::unique_ptr<MethodChannel> channel_;
-  std::unique_ptr<FlutterWebRTC> webrtc_;
   BinaryMessenger* messenger_;
   TextureRegistrar* textures_;
   std::unique_ptr<TaskRunner> task_runner_;
+  std::unique_ptr<FlutterWebRTC> webrtc_;
 };
 
 }  // namespace flutter_webrtc_plugin
