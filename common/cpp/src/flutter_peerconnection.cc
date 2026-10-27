@@ -1193,6 +1193,21 @@ FlutterPeerConnectionObserver::FlutterPeerConnectionObserver(
   peerconnection->RegisterRTCPeerConnectionObserver(this);
 }
 
+FlutterPeerConnectionObserver::~FlutterPeerConnectionObserver() {
+  Detach();
+}
+
+void FlutterPeerConnectionObserver::Detach() {
+  // RegisterRTCPeerConnectionObserver setzt `observer_` unter der Sperre
+  // `callback_crt_sec_` (libwebrtc rtc_peerconnection_impl.cc). Jede
+  // PeerConnection hat genau einen Beobachter, also trifft das nur uns.
+  // `peerconnection_` haelt eine eigene Referenz -> das Objekt lebt hier noch,
+  // auch wenn es schon geschlossen ist (normaler Weg RTCPeerConnectionClose).
+  if (peerconnection_) {
+    peerconnection_->RegisterRTCPeerConnectionObserver(nullptr);
+  }
+}
+
 
 void FlutterPeerConnectionObserver::OnSignalingState(RTCSignalingState state) {
   EncodableMap params;

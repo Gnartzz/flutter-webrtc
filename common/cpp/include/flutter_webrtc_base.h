@@ -49,6 +49,15 @@ class FlutterWebRTCBase {
                     TaskRunner* task_runner);
   ~FlutterWebRTCBase();
 
+  // HoneyCord 27.10.2026 (okunoku, SIGABRT beim Schliessen des Fensters
+  // mitten im Gespraech): baut alle PeerConnections geordnet ab, BEVOR
+  // irgendein Beobachter geloescht wird. Reihenfolge: (1) alle Beobachter
+  // (PeerConnection + DataChannel) abmelden, (2) jede PeerConnection
+  // schliessen und aus der Fabrik-Liste nehmen, (3) erst dann die Container
+  // leeren. Mehrfach aufrufbar (zweiter Aufruf = No-Op). Laeuft auf dem
+  // Plattform-Thread, wie jeder Methodenaufruf des Plugins.
+  void TeardownForExit();
+
   virtual scoped_refptr<RTCAudioProcessing> audio_processing() {
     return audio_processing_;
   }
@@ -123,6 +132,8 @@ class FlutterWebRTCBase {
   // Kartenton bekommen deshalb denselben Wert — sonst schaltete der Start einer
   // Freigabe die abgeschaltete Aussteuerung des Mikrofons wieder ein.
   bool mic_agc_ = true;
+  // HoneyCord 27.10.2026: s. TeardownForExit().
+  bool torn_down_ = false;
   RTCConfiguration configuration_;
 
   std::map<std::string, scoped_refptr<libwebrtc::KeyProvider>> key_providers_;

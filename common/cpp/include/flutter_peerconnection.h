@@ -15,6 +15,16 @@ class FlutterPeerConnectionObserver : public RTCPeerConnectionObserver {
                                 const std::string& channel_name,
                                 std::string& peerConnectionId);
 
+  // HoneyCord 27.10.2026 (Absturz beim Schliessen mitten im Gespraech):
+  // meldet sich bei der PeerConnection ab. Vorher blieb `observer_` in
+  // RTCPeerConnectionImpl auf das geloeschte Objekt zeigen, und deren
+  // Close() rief beim Plugin-Abbau OnRemoveStream darauf auf (_purecall ->
+  // abort). S. FlutterWebRTCBase::TeardownForExit().
+  virtual ~FlutterPeerConnectionObserver();
+
+  // Abmelden ohne zu loeschen; mehrfach aufrufbar.
+  void Detach();
+
   virtual void OnSignalingState(RTCSignalingState state) override;
   virtual void OnPeerConnectionState(RTCPeerConnectionState state) override;
   virtual void OnIceGatheringState(RTCIceGatheringState state) override;
