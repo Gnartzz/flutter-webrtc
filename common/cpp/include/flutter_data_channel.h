@@ -20,6 +20,9 @@ class FlutterRTCDataChannelObserver : public RTCDataChannelObserver {
 
   scoped_refptr<RTCDataChannel> data_channel() { return data_channel_; }
 
+  // HoneyCord 27.10.2026: abmelden ohne zu loeschen; mehrfach aufrufbar.
+  void Detach();
+
  private:
   std::unique_ptr<EventChannelProxy> event_channel_;
   scoped_refptr<RTCDataChannel> data_channel_;

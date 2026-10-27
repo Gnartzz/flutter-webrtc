@@ -1,5 +1,7 @@
 #include "flutter_screen_capture.h"
 
+#include "honeycord_inert_observers.h"
+
 #if defined(_WIN32)
 #include <windows.h>
 #include <cstdlib>
@@ -533,7 +535,15 @@ void FlutterScreenCapture::GetDisplayMedia(
     return;
   }
 
-  desktop_capturer->RegisterDesktopCapturerObserver(this);
+  // HoneyCord 27.10.2026 (Gutachten N2 zum Exit-Absturz): NICHT `this`.
+  // Der Capturer lebt ueber die lokale Spur (ScreenCapturerTrackSource haelt
+  // ihn) bis nach LibWebRTC::Terminate(); FlutterScreenCapture faellt vorher.
+  // ~ScreenCapturerTrackSource ruft capturer_->Stop() -> observer_->OnStop
+  // (und der Aufnahme-Thread OnPaused/OnStart/OnError) -> auf einem
+  // geloeschten Objekt = _purecall. Unsere OnStart/OnPaused/OnStop/OnError
+  // sind ohnehin leer; der Dauer-Beobachter tut dasselbe und stirbt nie.
+  desktop_capturer->RegisterDesktopCapturerObserver(
+      inert::InertDesktopCapturer());
 
   const char* video_source_label = "screen_capture_input";
 
