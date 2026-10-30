@@ -7,6 +7,7 @@
 #include "rtc_video_frame.h"
 #include "rtc_video_renderer.h"
 
+#include <atomic>
 #include <mutex>
 #ifdef _WINDOWS
 #include <d3d11.h>
@@ -64,6 +65,21 @@ class FlutterVideoRenderer
   // bisher, Vorgabe fuer alle Renderer, die es nicht ausdruecklich setzen).
   void set_pixel_buffer_scale(double s) { pb_scale_ = s; }
 
+  // honeycord (30.10.2026): Empfangsdrossel fuer FREMDE Kacheln. Hoechstens
+  // `fps` Textur-Meldungen (MarkTextureFrameAvailable) je Sekunde, 0 = aus
+  // (Vorgabe fuer jeden Renderer). Unter Windows zeichnet die Engine bei JEDER
+  // Meldung das ganze Fenster neu (Impeller, kein Raster-Cache, belegt am
+  // 10.10.2026) — ein 60-fps-Strom in einer kleinen Kachel kostet also 60
+  // Vollraster/s. Die App setzt den Wert zur Laufzeit nach der Kachelgroesse
+  // (klein -> 30, gross/fokussiert -> 0). Verworfen wird NUR die Meldung an
+  // Flutter, NACH dem Decoder: Spur, Decoder und Statistik laufen unveraendert,
+  // es gibt kein Keyframe-Problem. Vom Plattform-Faden gesetzt, im
+  // OnFrame-Faden gelesen -> atomar.
+  void set_max_fps(int fps) {
+    max_fps_.store(fps > 0 ? fps : 0, std::memory_order_relaxed);
+  }
+  int max_fps() const { return max_fps_.load(std::memory_order_relaxed); }
+
 #ifdef _WINDOWS
   // GPU-Zero-Copy-Vorschau: Callback fuer Flutters GpuSurfaceTexture. Native
   // (GPU) Frames -> DXGI-Shared-Handle des Capturers direkt an ANGLE (kein
@@ -102,6 +118,15 @@ class FlutterVideoRenderer
   // Textur-Update faellig ist. Nur im OnFrame-Faden benutzt.
   int64_t pb_next_due_us_ = 0;
   double pb_scale_ = 0.0;  // s. set_pixel_buffer_scale (0 = aus)
+  // Empfangsdrossel (s. set_max_fps): Hoechstrate, Takt und Zaehler. Takt und
+  // Zaehler nur im OnFrame-Faden benutzt (wie pb_next_due_us_).
+  std::atomic<int> max_fps_{0};
+  int64_t mf_next_due_us_ = 0;
+  unsigned mf_gemeldet_ = 0;
+  unsigned mf_verworfen_ = 0;
+#ifdef _WINDOWS
+  int64_t mf_log_last_ms_ = 0;  // render.log gibt es nur unter Windows
+#endif
 #ifdef _WINDOWS
   mutable FlutterDesktopGpuSurfaceDescriptor gpu_descriptor_ = {};
   // Fallback fuer nicht-native Frames (Kamera/Remote): eigene plain-SHARED
@@ -167,6 +192,10 @@ class FlutterVideoRendererManager {
 
   void VideoRendererDispose(int64_t texture_id,
                             std::unique_ptr<MethodResultProxy> result);
+
+  // Empfangsdrossel zur Laufzeit setzen (0 = aus), s. set_max_fps.
+  void VideoRendererSetMaxFps(int64_t texture_id, int fps,
+                              std::unique_ptr<MethodResultProxy> result);
 
  private:
   FlutterWebRTCBase* base_;

@@ -609,6 +609,20 @@ void FlutterWebRTC::HandleMethodCall(
 
     VideoRendererSetSrcObject(texture_id, stream_id, owner_tag, track_id);
     result->Success();
+  } else if (method_call.method_name().compare("videoRendererSetMaxFps") == 0) {
+    // honeycord (30.10.2026): Empfangsdrossel je Renderer zur Laufzeit —
+    // hoechstens `fps` Textur-Meldungen je Sekunde, 0 = aus. Fehlt `fps`
+    // oder ist er unsinnig (findLongInt liefert -1) -> aus.
+    if (!method_call.arguments()) {
+      result->Error("Bad Arguments", "Null constraints arguments received");
+      return;
+    }
+    const EncodableMap params =
+        GetValue<EncodableMap>(*method_call.arguments());
+    int64_t texture_id = findLongInt(params, "textureId");
+    int64_t fps = findLongInt(params, "fps");
+    if (fps < 0 || fps > 1000) fps = 0;
+    VideoRendererSetMaxFps(texture_id, static_cast<int>(fps), std::move(result));
   } else if (method_call.method_name().compare(
                  "mediaStreamTrackSwitchCamera") == 0) {
     if (!method_call.arguments()) {

@@ -48,6 +48,24 @@ void PixelBufferZielGroesse(int fw, int fh, size_t req_w, size_t req_h,
   *ow = w;
   *oh = h;
 }
+
+// Fester Takt ohne Drift (30.10.2026, aus der PixelBuffer-Drossel vom 10.10.
+// herausgezogen): `*next_due_us` ist der Zeitpunkt, ab dem die naechste Meldung
+// faellig ist. Faellig mit einem Schlupf von einem Viertel-Intervall — eine
+// 60-fps-Quelle bei 33 ms Intervall liefert so verlaesslich jedes zweite Bild
+// (30 fps) statt durch Zeitzittern auf 20 zu fallen. Der naechste Termin wird
+// vom vorigen aus weitergezaehlt (kein Drift); liegt die letzte Meldung mehr
+// als ein Intervall zurueck (Pause, Rate gewechselt), setzt der Takt neu auf —
+// kein Nachholen. Rueckgabe: Bild melden (true) oder verwerfen (false).
+bool TaktDurchlassen(int64_t now_us, int64_t intervall_us,
+                     int64_t* next_due_us) {
+  if (intervall_us <= 0) return true;
+  if (now_us < *next_due_us - intervall_us / 4) return false;
+  *next_due_us = (now_us - *next_due_us > intervall_us)
+                     ? now_us + intervall_us
+                     : *next_due_us + intervall_us;
+  return true;
+}
 }  // namespace
 
 #ifdef _WINDOWS
@@ -134,6 +152,34 @@ void RenderLogPixelBuffer(int64_t tex, int drossel_ms, double uploads, int qw,
                  static_cast<unsigned long long>(zw),
                  static_cast<unsigned long long>(zh), aw, ah, skala, drossel_ms,
                  conv_ms, fenster_s);
+    std::fclose(f);
+  }
+}
+
+// Empfangsdrossel-Zeile (30.10.2026), alle 5 s je gedrosseltem Renderer:
+// gemeldet = an Flutter gemeldete Bilder, verworfen = nur fuer die Anzeige
+// uebersprungene (Decoder lief fuer sie trotzdem).
+void RenderLogDrossel(int64_t tex, int max_fps, unsigned gemeldet,
+                      unsigned verworfen, double fenster_s) {
+  const std::string& path = RenderLogPath();
+  if (path.empty()) return;
+  if (FILE* f = std::fopen(path.c_str(), "a")) {
+    std::fprintf(f,
+                 "[drossel] tex=%lld max=%d gemeldet=%u verworfen=%u "
+                 "fenster=%.1f s\n",
+                 static_cast<long long>(tex), max_fps, gemeldet, verworfen,
+                 fenster_s);
+    std::fclose(f);
+  }
+}
+
+// Einmal je Setzen: so steht im Protokoll, WANN die App welchen Wert waehlte.
+void RenderLogDrosselGesetzt(int64_t tex, int max_fps) {
+  const std::string& path = RenderLogPath();
+  if (path.empty()) return;
+  if (FILE* f = std::fopen(path.c_str(), "a")) {
+    std::fprintf(f, "[drossel] tex=%lld max=%d gesetzt\n",
+                 static_cast<long long>(tex), max_fps);
     std::fclose(f);
   }
 }
@@ -365,6 +411,36 @@ void FlutterVideoRenderer::OnFrame(scoped_refptr<RTCVideoFrame> frame) {
   }
   frame_ = frame;
   mutex_.unlock();
+  // honeycord (30.10.2026): Empfangsdrossel (fremde Kacheln, s. set_max_fps).
+  // Gilt fuer BEIDE Wege: PixelBuffer (ohne Meldung ruft Flutter CopyPixelBuffer
+  // nicht — die Umrechnung entfaellt mit) und GpuSurface (ohne Meldung kein
+  // ObtainGpuSurface). frame_ ist schon das neueste Bild, die naechste Meldung
+  // zeigt es; das verworfene Bild haelt nur noch `frame` und wird mit dem
+  // `return` freigegeben — beim Zero-Copy-Weg also auch sein GPU-Handle, nichts
+  // bleibt haengen. Der Decoder hat das Bild bereits fertig, hier wird nur die
+  // Anzeige uebersprungen.
+  const int max_fps = max_fps_.load(std::memory_order_relaxed);
+  if (max_fps > 0) {
+    const int64_t now = NowUs();
+    const bool melden = TaktDurchlassen(now, 1000000 / max_fps, &mf_next_due_us_);
+    if (melden) {
+      mf_gemeldet_++;
+    } else {
+      mf_verworfen_++;
+    }
+#ifdef _WINDOWS
+    const int64_t now_ms = now / 1000;
+    if (mf_log_last_ms_ == 0) mf_log_last_ms_ = now_ms;
+    if (now_ms - mf_log_last_ms_ >= 5000) {
+      RenderLogDrossel(texture_id_, max_fps, mf_gemeldet_, mf_verworfen_,
+                       static_cast<double>(now_ms - mf_log_last_ms_) / 1000.0);
+      mf_gemeldet_ = 0;
+      mf_verworfen_ = 0;
+      mf_log_last_ms_ = now_ms;
+    }
+#endif
+    if (!melden) return;
+  }
 #ifdef _WINDOWS
   const bool pixel_buffer_pfad = !is_gpu_surface_;
 #else
@@ -373,16 +449,14 @@ void FlutterVideoRenderer::OnFrame(scoped_refptr<RTCVideoFrame> frame) {
   // honeycord (10.10.2026): PixelBuffer-Drossel (eigene Kamera-Selbstansicht).
   // Hoechstens ein Textur-Update je throttle_ms_; frame_ ist schon aktuell, das
   // naechste Update zeigt also das neueste Bild. Fester Takt mit Schlupf von
-  // einem Viertel-Intervall, damit eine 30-fps-Kamera bei 67 ms verlaesslich
-  // jedes zweite Bild zeigt (15 fps) statt durch Zeitzittern auf 10 fps zu
-  // fallen; nach einer Pause kein Nachholen. Spur/Encoder unberuehrt.
+  // einem Viertel-Intervall (TaktDurchlassen), damit eine 30-fps-Kamera bei
+  // 67 ms verlaesslich jedes zweite Bild zeigt (15 fps) statt durch Zeitzittern
+  // auf 10 fps zu fallen; nach einer Pause kein Nachholen. Spur/Encoder
+  // unberuehrt.
   if (pixel_buffer_pfad && is_throttle_ && throttle_ms_ > 0) {
-    const int64_t now = NowUs();
-    const int64_t intervall = static_cast<int64_t>(throttle_ms_) * 1000;
-    if (now < pb_next_due_us_ - intervall / 4) return;
-    pb_next_due_us_ = (now - pb_next_due_us_ > intervall)
-                          ? now + intervall
-                          : pb_next_due_us_ + intervall;
+    if (!TaktDurchlassen(NowUs(), static_cast<int64_t>(throttle_ms_) * 1000,
+                         &pb_next_due_us_))
+      return;
   }
 #ifdef _WINDOWS
   // Self-View-Drossel: jeder MarkTextureFrameAvailable triggert ein Flutter-
@@ -543,6 +617,24 @@ void FlutterVideoRendererManager::VideoRendererDispose(
   }
   result->Error("VideoRendererDisposeFailed",
                 "VideoRendererDispose() texture not found!");
+}
+
+void FlutterVideoRendererManager::VideoRendererSetMaxFps(
+    int64_t texture_id,
+    int fps,
+    std::unique_ptr<MethodResultProxy> result) {
+  auto it = renderers_.find(texture_id);
+  if (it == renderers_.end()) {
+    // Kachel inzwischen abgebaut (Dispose kam zuerst) — kein Fehler wert, die
+    // App setzt den Wert beim naechsten Aufbau ohnehin neu.
+    result->Success();
+    return;
+  }
+  it->second->set_max_fps(fps);
+#ifdef _WINDOWS
+  RenderLogDrosselGesetzt(texture_id, it->second->max_fps());
+#endif
+  result->Success();
 }
 
 }  // namespace flutter_webrtc_plugin

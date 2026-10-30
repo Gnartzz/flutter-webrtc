@@ -128,6 +128,27 @@ class RTCVideoRenderer extends ValueNotifier<RTCVideoValue>
     }
   }
 
+  /// honeycord (30.10.2026): Empfangsdrossel zur Laufzeit — hoechstens [fps]
+  /// Textur-Meldungen je Sekunde fuer DIESE Kachel, 0 = aus (Vorgabe). Unter
+  /// Windows zeichnet jede Meldung das ganze Fenster neu; kleine fremde
+  /// Kacheln brauchen keine 60 davon. Nur die Anzeige verwirft Bilder — Spur,
+  /// Decoder und Statistik laufen unveraendert. Nach initialize() aufrufen;
+  /// vorher oder nach dispose() tut es nichts. Plattformen ohne die Methode
+  /// (macOS/iOS/Android) werden still uebergangen.
+  Future<void> setMaxFps(int fps) async {
+    if (_disposed || _textureId == null) return;
+    try {
+      await WebRTC.invokeMethod('videoRendererSetMaxFps', <String, dynamic>{
+        'textureId': _textureId,
+        'fps': fps < 0 ? 0 : fps,
+      });
+    } on MissingPluginException {
+      // Plattform kennt die Drossel nicht — kein Fehler.
+    } on PlatformException catch (e) {
+      print('RTCVideoRenderer::setMaxFps: ${e.message}');
+    }
+  }
+
   @override
   Future<void> dispose() async {
     if (_disposed) return;
