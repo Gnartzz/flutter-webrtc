@@ -74,24 +74,89 @@ NSArray<RTC_OBJC_TYPE(RTCVideoCodecInfo) *>* motifyH264ProfileLevelId(
   return newCodecs;
 }
 
+// ★ HoneyCord (30.10.2026, nur macOS): H.264 **High** (profile-level-id
+// `6400xx`) als ERSTEN Eintrag der Encoder-Liste anbieten.
+//
+// Apples Fabrik liefert nur Constrained High (`640cxx`) und Constrained
+// Baseline (`42e0xx`). livekit-server (pion) kennt fuer Veroeffentlicher nur
+// `640032` (plain High) und `42e01f`, und pion vergleicht profile_idc UND das
+// Constraint-Byte: `640c` passt nicht auf `6400`, uebrig bleibt Constrained
+// Baseline. Daraus macht `RTCVideoEncoderH264.mm` (`ExtractProfile`) ein
+// Baseline-Profil, und Apple schreibt ein SPS mit profile_idc=66 OHNE
+// constraint_set1 — die Form, die Microsofts H.264-Decoder nur in Software
+// nimmt (DXVA gibt es fuer Baseline nur mit cs1=1, sonst fuer Main/High).
+// Gemessen bei okunoku: `[hwdec-sps] profil=66 cs=0x00 level=52`, `dxva=nein`,
+// 3,2 ms je Bild. Mit `6400xx` im Angebot passt der Vergleich exakt, der
+// Encoder laeuft als High, der Windows-Empfaenger dekodiert in Hardware.
+//
+// Abgeleitet aus dem (von `motifyH264ProfileLevelId` schon auf Level >= 5.1
+// gehobenen) Constrained-High-Eintrag: Level-Byte, `level-asymmetry-allowed`
+// und `packetization-mode` werden uebernommen, nur das iop-Byte wechselt
+// `0c` -> `00`. Alle vorhandenen Eintraege bleiben in ihrer Reihenfolge.
+// livekit_client (`engine.dart`, setPreferredCodec) zieht nur `42e01f` nach
+// vorn — das gibt es hier nach der Level-Anhebung nicht —, die uebrigen
+// H.264-Eintraege behalten die Fabrik-Reihenfolge: High bleibt vorn.
+//
+// Encoder, Simulcast-Huelle UND Decoder: livekit_client liest die
+// Codec-Praeferenzen aus den EMPFAENGER-Faehigkeiten (`engine.dart`,
+// setPreferredCodec -> `getRtpReceiverCapabilities`), und `setCodecPreferences`
+// nimmt nur Eintraege, die dort stehen — ohne den Decoder-Eintrag wuerde High
+// gar nicht erst angeboten. Fuer den Empfang ist er ohnehin richtig: Apples
+// VideoToolbox dekodiert High. Nur macOS: iOS hat keinen Alpha-Kanal und ist
+// nicht der gemessene Fall; die Schranke kann spaeter fallen.
+//
+// Nebenwirkung, bewusst: unser WebRTC-Bau schaltet fuer die High-Familie
+// `kVTVideoEncoderSpecification_EnableLowLatencyRateControl` ein (nur dort
+// erlaubt) — mit der Baseline-Aushandlung war das bisher aus.
+#if TARGET_OS_OSX
+static NSArray<RTC_OBJC_TYPE(RTCVideoCodecInfo) *>* honeycordH264HighVoran(
+    NSArray<RTC_OBJC_TYPE(RTCVideoCodecInfo) *>* codecs) {
+  RTC_OBJC_TYPE(RTCVideoCodecInfo)* vorlage = nil;
+  for (RTC_OBJC_TYPE(RTCVideoCodecInfo)* info in codecs) {
+    if (![info.name isEqualToString:kRTCVideoCodecH264Name]) continue;
+    NSString* pli = [info.parameters[@"profile-level-id"] lowercaseString];
+    if (pli.length != 6) continue;
+    if ([pli hasPrefix:@"6400"]) return codecs;  // bietet der Bau schon an
+    if (vorlage == nil && [pli hasPrefix:@"640c"]) vorlage = info;
+  }
+  if (vorlage == nil) return codecs;
+  NSString* level = [[vorlage.parameters[@"profile-level-id"] lowercaseString] substringFromIndex:4];
+  NSMutableDictionary* parameter = [vorlage.parameters mutableCopy];
+  parameter[@"profile-level-id"] = [@"6400" stringByAppendingString:level];
+  NSMutableArray* neu = [NSMutableArray arrayWithObject:[[RTCVideoCodecInfo alloc]
+                                                            initWithName:kRTCVideoCodecH264Name
+                                                              parameters:parameter]];
+  [neu addObjectsFromArray:codecs];
+  return neu;
+}
+#else
+static inline NSArray<RTC_OBJC_TYPE(RTCVideoCodecInfo) *>* honeycordH264HighVoran(
+    NSArray<RTC_OBJC_TYPE(RTCVideoCodecInfo) *>* codecs) {
+  return codecs;
+}
+#endif
+
 @implementation VideoEncoderFactory
 - (NSArray<RTC_OBJC_TYPE(RTCVideoCodecInfo) *>*)supportedCodecs {
   NSArray<RTC_OBJC_TYPE(RTCVideoCodecInfo)*>* codecs = [super supportedCodecs];
-  return motifyH264ProfileLevelId(codecs);
+  return honeycordH264HighVoran(motifyH264ProfileLevelId(codecs));
 }
 @end
 
 @implementation VideoDecoderFactory
 - (NSArray<RTC_OBJC_TYPE(RTCVideoCodecInfo) *>*)supportedCodecs {
   NSArray<RTC_OBJC_TYPE(RTCVideoCodecInfo)*>* codecs = [super supportedCodecs];
-  return motifyH264ProfileLevelId(codecs);
+  // Auch hier (s. o.): livekit_client bildet die Praeferenzen aus DIESER Liste.
+  return honeycordH264HighVoran(motifyH264ProfileLevelId(codecs));
 }
 @end
 
 @implementation VideoEncoderFactorySimulcast
 - (NSArray<RTC_OBJC_TYPE(RTCVideoCodecInfo) *>*)supportedCodecs {
   NSArray<RTC_OBJC_TYPE(RTCVideoCodecInfo)*>* codecs = [super supportedCodecs];
-  return motifyH264ProfileLevelId(codecs);
+  // Die Huelle reiht primary + fallback aneinander; der primaere Encoder hat
+  // High schon vorn, dann aendert `honeycordH264HighVoran` hier nichts mehr.
+  return honeycordH264HighVoran(motifyH264ProfileLevelId(codecs));
 }
 @end
 
