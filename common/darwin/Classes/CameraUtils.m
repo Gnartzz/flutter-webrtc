@@ -1,4 +1,5 @@
 #import "CameraUtils.h"
+#import "FlutterRTCMediaStream.h"
 
 @implementation FlutterWebRTCPlugin (CameraUtils)
 
@@ -286,19 +287,25 @@
   AVCaptureDeviceFormat* selectedFormat = [self selectFormatForDevice:videoDevice
                                                           targetWidth:self._lastTargetWidth
                                                          targetHeight:self._lastTargetHeight];
-  [self.videoCapturer startCaptureWithDevice:videoDevice
-                                      format:selectedFormat
-                                         fps:[self selectFpsForFormat:selectedFormat
-                                                            targetFps:self._lastTargetFps]
-                           completionHandler:^(NSError* error) {
-                             if (error != nil) {
-                               result([FlutterError errorWithCode:@"Error while switching camera"
-                                                          message:@"Error while switching camera"
-                                                          details:error]);
-                             } else {
-                               result([NSNumber numberWithBool:self._usingFrontCamera]);
-                             }
-                           }];
+  // ★ HoneyCord 06.11.2026: dieselbe Bildraten-Festlegung wie beim Start (Vorab-Pin,
+  // Waechter, Nach-Start-Pin) — vorher setzte nur der Capturer die Obergrenze, und
+  // iOS fiel nach dem Wechsel bei wenig Licht auf 4,6 fps. Ist `_lastTargetFps` 0
+  // (Start ohne Ziel), liefert selectFpsForFormat 0 und es wird nichts gepinnt.
+  NSInteger wechselFps = [self selectFpsForFormat:selectedFormat targetFps:self._lastTargetFps];
+  [self honeycordKameraStarten:self.videoCapturer
+                        geraet:videoDevice
+                        format:selectedFormat
+                           fps:wechselFps
+                           ort:@"wechsel"
+             completionHandler:^(NSError* error) {
+               if (error != nil) {
+                 result([FlutterError errorWithCode:@"Error while switching camera"
+                                            message:@"Error while switching camera"
+                                            details:error]);
+               } else {
+                 result([NSNumber numberWithBool:self._usingFrontCamera]);
+               }
+             }];
 }
 
 

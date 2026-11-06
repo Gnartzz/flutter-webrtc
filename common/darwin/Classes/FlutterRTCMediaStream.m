@@ -200,6 +200,120 @@ static double HoneycordPinnen(AVCaptureDevice* d, AVCaptureDeviceFormat* format,
 
 @implementation FlutterWebRTCPlugin (RTCMediaStream)
 
+// Der Waechter haengt je Aufnehmer am Capturer (assoziiertes Objekt): beim
+// Kamerawechsel wird derselbe Capturer mit einem NEUEN Geraet gestartet — ein
+// noch laufender Waechter des alten Geraets muss vorher beendet werden, sonst
+// beobachtet er das falsche Geraet.
+static const void* kHoneycordWaechterKey = &kHoneycordWaechterKey;
+
+// HoneyCord: Kamera-fps NACH startCaptureWithDevice pinnen (im completionHandler).
+// Warum nicht davor (webrtc-sdk RTCCameraVideoCapturer::updateDeviceCaptureFormat):
+//  (a) startCapture setzt activeFormat NEU -> das RESETTET jede vorher gesetzte
+//      FrameDuration auf den Format-Default; ein Setzen DAVOR ist wirkungslos
+//      (darum brachte der activeFormat-vor-Duration-Versuch ea4f5dd nichts).
+//  (b) fuer AVCaptureDALDevice (viele USB/UVC-Cams, u.a. Logitech Brio)
+//      UEBERSPRINGT der Capturer das fps-Setzen KOMPLETT -> Cam bleibt auf 30,
+//      waehrend Nicht-DAL-Cams (Home-Cam) korrekt auf 60 gehen.
+// Hier ist activeFormat bereits == format und wird nicht mehr ueberschrieben,
+// also 1/fps gueltig und dauerhaft. Geraeteklasse wird geloggt (Beweis DAL?).
+//
+// ★ 06.11.2026 (Maddins iPhone 15 Pro, iOS 27, GEMESSEN): nach dem Kamerawechsel
+// Front→Rueck sendete die Kamera nur noch 4,6 Bilder/s (vorher 60, 0 % Verlust).
+// Der Wechsel in CameraUtils.m war Originalcode ohne Pin: WebRTCs Capturer setzt
+// nur die Mindestdauer (Obergrenze), die Untergrenze blieb auf der Formatvorgabe,
+// und iOS senkt bei wenig Licht die Bildrate (lange Belichtung). Deshalb liegt
+// der ganze Pin-Pfad jetzt HIER und wird von beiden Pfaden benutzt.
+- (void)honeycordKameraStarten:(RTCCameraVideoCapturer*)capturer
+                        geraet:(AVCaptureDevice*)videoDevice
+                        format:(AVCaptureDeviceFormat*)selectedFormat
+                           fps:(NSInteger)selectedFps
+                           ort:(NSString*)ort
+             completionHandler:(void (^)(NSError* error))handler {
+  // Protokoll-Praefix: "" beim Start (Zeilen wie bisher), "wechsel " beim Kamerawechsel.
+  NSString* praefix = ort.length > 0 ? [ort stringByAppendingString:@" "] : @"";
+  NSString* woVorab = [praefix stringByAppendingString:@"vorab"];
+  NSString* woNach  = [praefix stringByAppendingString:@"nach Start"];
+
+  // Alten Waechter dieses Aufnehmers beenden (normalerweise schon im vorigen
+  // completionHandler geschehen; beim Wechsel haengt er sonst am ALTEN Geraet).
+  HoneycordFormatWaechter* alterWaechter = objc_getAssociatedObject(capturer, kHoneycordWaechterKey);
+  if (alterWaechter != nil) {
+    [alterWaechter beenden];
+    objc_setAssociatedObject(capturer, kHoneycordWaechterKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+  }
+
+  AVCaptureDevice* fpsDevice = videoDevice;
+  NSInteger pinFps = selectedFps;
+  // ★ VORAB: Format und Bildrate setzen, BEVOR der Capturer die Session startet.
+  // Der Capturer setzt `activeFormat = format` (dasselbe Objekt) — ob das die
+  // Dauer zuruecksetzt, zeigt die Kontrollzeile im completionHandler. Ziel:
+  // EIN UVC-Start mit der Zielrate, wie OBS (s. HoneycordBereichFuer).
+  if (pinFps > 0 && [videoDevice lockForConfiguration:NULL]) {
+    @try {
+      videoDevice.activeFormat = selectedFormat;
+    } @catch (NSException* eF) {
+      NSLog(@"[hc-fps] %@: activeFormat abgelehnt: %@", woVorab, eF.reason);
+    }
+    double vorab = HoneycordPinnen(videoDevice, selectedFormat, pinFps, woVorab);
+    NSLog(@"[hc-fps] %@ aktiv %.3f fps", woVorab, vorab);
+    [videoDevice unlockForConfiguration];
+  }
+  HoneycordFormatWaechter* waechter = (pinFps > 0)
+      ? [[HoneycordFormatWaechter alloc] initMitGeraet:videoDevice session:capturer.captureSession zielFps:pinFps] : nil;
+  if (waechter != nil) {
+    objc_setAssociatedObject(capturer, kHoneycordWaechterKey, waechter, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+  }
+  [capturer startCaptureWithDevice:videoDevice
+                            format:selectedFormat
+                               fps:selectedFps
+                 completionHandler:^(NSError* error) {
+                   // Der Start ist durch (Session laeuft) — Beobachter abmelden.
+                   [waechter beenden];
+                   if (waechter != nil && objc_getAssociatedObject(capturer, kHoneycordWaechterKey) == waechter) {
+                     objc_setAssociatedObject(capturer, kHoneycordWaechterKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                   }
+                   if (error) {
+                     NSLog(@"Start capture error: %@", [error localizedDescription]);
+                     if (handler) handler(error);
+                     return;
+                   }
+                   // Ohne Ziel (keine frameRate in den Constraints liefert selectFpsForFormat 0)
+                   // bleibt die Format-Vorgabe — sonst pinnte die Bereichssuche auf die
+                   // LANGSAMSTE Stufe einer UVC-Karte (Pruefbefund 2).
+                   if (pinFps <= 0) {
+                     NSLog(@"[hc-fps] %@kein Ziel (pinFps %ld), Format-Vorgabe bleibt", praefix, (long)pinFps);
+                     if (handler) handler(nil);
+                     return;
+                   }
+                   if (![fpsDevice lockForConfiguration:NULL]) {
+                     if (handler) handler(nil);
+                     return;
+                   }
+                   NSString* cls = NSStringFromClass([fpsDevice class]);
+                   // Stimmt die Rate schon (Vorab-Pin hat den Start ueberlebt)?
+                   // Dann NICHTS anfassen — jedes Setzen startet den UVC-Strom
+                   // neu, und genau der Neustart hielt die Karte neben laufendem
+                   // Ton an. Sonst wie bisher pinnen.
+                   AVFrameRateRange* zielBereich = HoneycordBereichFuer(fpsDevice.activeFormat, pinFps);
+                   const double zielFps = zielBereich ? zielBereich.maxFrameRate : (double)pinFps;
+                   const double aktiv = HoneycordAktiveFps(fpsDevice);
+                   if (aktiv > 0 && fabs(aktiv - zielFps) < 0.05) {
+                     NSLog(@"[hc-fps] %@: schon %.3f fps (Ziel %.3f) — kein Neustart (device %@)", woNach, aktiv, zielFps, cls);
+                   } else {
+                     const double jetzt = HoneycordPinnen(fpsDevice, fpsDevice.activeFormat, pinFps, woNach);
+                     NSLog(@"[hc-fps] %@: war %.3f, jetzt %.3f fps (Ziel %.3f, device %@)", woNach, aktiv, jetzt, zielFps, cls);
+                   }
+                   {
+                     CMTime mn = fpsDevice.activeVideoMinFrameDuration, mx = fpsDevice.activeVideoMaxFrameDuration;
+                     NSLog(@"[hc-fps] %@aktiv jetzt %.3f..%.3f fps (device %@)", praefix,
+                           mx.value > 0 ? (double)mx.timescale / (double)mx.value : 0.0,
+                           mn.value > 0 ? (double)mn.timescale / (double)mn.value : 0.0, cls);
+                   }
+                   [fpsDevice unlockForConfiguration];
+                   if (handler) handler(nil);
+                 }];
+}
+
 /**
  * {@link https://www.w3.org/TR/mediacapture-streams/#navigatorusermediaerrorcallback}
  */
@@ -702,73 +816,16 @@ typedef void (^NavigatorUserMediaSuccessCallback)(RTCMediaStream* mediaStream);
     
     NSLog(@"target format %ldx%ld, targetFps: %ld, selected format: %ldx%ld, selected fps %ld", targetWidth, targetHeight, targetFps, selectedWidth, selectedHeight, selectedFps);
 
-    // HoneyCord: Kamera-fps NACH startCaptureWithDevice pinnen (im completionHandler).
-    // Warum nicht davor (webrtc-sdk RTCCameraVideoCapturer::updateDeviceCaptureFormat):
-    //  (a) startCapture setzt activeFormat NEU -> das RESETTET jede vorher gesetzte
-    //      FrameDuration auf den Format-Default; ein Setzen DAVOR ist wirkungslos
-    //      (darum brachte der activeFormat-vor-Duration-Versuch ea4f5dd nichts).
-    //  (b) fuer AVCaptureDALDevice (viele USB/UVC-Cams, u.a. Logitech Brio)
-    //      UEBERSPRINGT der Capturer das fps-Setzen KOMPLETT -> Cam bleibt auf 30,
-    //      waehrend Nicht-DAL-Cams (Home-Cam) korrekt auf 60 gehen.
-    // Hier ist activeFormat bereits == selectedFormat und wird nicht mehr ueberschrieben,
-    // also 1/fps gueltig und dauerhaft. Geraeteklasse wird geloggt (Beweis DAL?).
-    AVCaptureDevice* fpsDevice = videoDevice;
-    NSInteger pinFps = selectedFps;
-    // ★ VORAB: Format und Bildrate setzen, BEVOR der Capturer die Session startet.
-    // Der Capturer setzt `activeFormat = format` (dasselbe Objekt) — ob das die
-    // Dauer zuruecksetzt, zeigt die Kontrollzeile im completionHandler. Ziel:
-    // EIN UVC-Start mit der Zielrate, wie OBS (s. HoneycordBereichFuer).
-    if (pinFps > 0 && [videoDevice lockForConfiguration:NULL]) {
-      @try {
-        videoDevice.activeFormat = selectedFormat;
-      } @catch (NSException* eF) {
-        NSLog(@"[hc-fps] vorab: activeFormat abgelehnt: %@", eF.reason);
-      }
-      double vorab = HoneycordPinnen(videoDevice, selectedFormat, pinFps, @"vorab");
-      NSLog(@"[hc-fps] vorab aktiv %.3f fps", vorab);
-      [videoDevice unlockForConfiguration];
-    }
     // Die Video-Track-Id entsteht schon hier (sie geht in den Stop-Handler ein).
     NSString* trackUUID = [[NSUUID UUID] UUIDString];
-    HoneycordFormatWaechter* waechter = (pinFps > 0)
-        ? [[HoneycordFormatWaechter alloc] initMitGeraet:videoDevice session:self.videoCapturer.captureSession zielFps:pinFps] : nil;
-    [self.videoCapturer startCaptureWithDevice:videoDevice
-                                        format:selectedFormat
-                                           fps:selectedFps
-                             completionHandler:^(NSError* error) {
-                               // Der Start ist durch (Session laeuft) — Beobachter abmelden.
-                               [waechter beenden];
-                               if (error) {
-                                 NSLog(@"Start capture error: %@", [error localizedDescription]);
-                                 return;
-                               }
-                               // Ohne Ziel (keine frameRate in den Constraints liefert selectFpsForFormat 0)
-                               // bleibt die Format-Vorgabe — sonst pinnte die Bereichssuche auf die
-                               // LANGSAMSTE Stufe einer UVC-Karte (Pruefbefund 2).
-                               if (pinFps <= 0) { NSLog(@"[hc-fps] kein Ziel (pinFps %ld), Format-Vorgabe bleibt", (long)pinFps); return; }
-                               if (![fpsDevice lockForConfiguration:NULL]) return;
-                               NSString* cls = NSStringFromClass([fpsDevice class]);
-                               // Stimmt die Rate schon (Vorab-Pin hat den Start ueberlebt)?
-                               // Dann NICHTS anfassen — jedes Setzen startet den UVC-Strom
-                               // neu, und genau der Neustart hielt die Karte neben laufendem
-                               // Ton an. Sonst wie bisher pinnen.
-                               AVFrameRateRange* zielBereich = HoneycordBereichFuer(fpsDevice.activeFormat, pinFps);
-                               const double zielFps = zielBereich ? zielBereich.maxFrameRate : (double)pinFps;
-                               const double aktiv = HoneycordAktiveFps(fpsDevice);
-                               if (aktiv > 0 && fabs(aktiv - zielFps) < 0.05) {
-                                 NSLog(@"[hc-fps] nach Start: schon %.3f fps (Ziel %.3f) — kein Neustart (device %@)", aktiv, zielFps, cls);
-                               } else {
-                                 const double jetzt = HoneycordPinnen(fpsDevice, fpsDevice.activeFormat, pinFps, @"nach Start");
-                                 NSLog(@"[hc-fps] nach Start: war %.3f, jetzt %.3f fps (Ziel %.3f, device %@)", aktiv, jetzt, zielFps, cls);
-                               }
-                               {
-                                 CMTime mn = fpsDevice.activeVideoMinFrameDuration, mx = fpsDevice.activeVideoMaxFrameDuration;
-                                 NSLog(@"[hc-fps] aktiv jetzt %.3f..%.3f fps (device %@)",
-                                       mx.value > 0 ? (double)mx.timescale / (double)mx.value : 0.0,
-                                       mn.value > 0 ? (double)mn.timescale / (double)mn.value : 0.0, cls);
-                               }
-                               [fpsDevice unlockForConfiguration];
-                             }];
+    // HoneyCord: Bildrate vorab pinnen, Waechter setzen, starten, nach dem Start
+    // nachpinnen — gemeinsamer Pfad mit dem Kamerawechsel (s. honeycordKameraStarten).
+    [self honeycordKameraStarten:self.videoCapturer
+                          geraet:videoDevice
+                          format:selectedFormat
+                             fps:selectedFps
+                             ort:@""
+               completionHandler:nil];
 
     RTCVideoTrack* videoTrack = [self.peerConnectionFactory videoTrackWithSource:videoSource
                                                                         trackId:trackUUID];
