@@ -21,6 +21,11 @@
 #define NOMINMAX
 #endif
 #include <windows.h>  // GetCurrentProcessId, GetEnvironmentVariableA, TerminateProcess
+#elif defined(__linux__)
+#include <sys/stat.h>
+#include <unistd.h>   // getpid, _exit
+#include <cstdlib>    // getenv
+#include <string>
 #endif
 
 namespace flutter_webrtc_plugin {
@@ -30,8 +35,8 @@ namespace {
 // HoneyCord 27.10.2026: eine Zeile nach %LOCALAPPDATA%\HoneyCord\exit.log je
 // Abbau-Schritt, damit ein Folgefall belegbar ist ("start" ohne "ende" =
 // Abbau haengt oder stuerzt). Jede Zeile oeffnet und schliesst die Datei
-// selbst — kein offener Griff, der den Prozess ueberleben muesste. Nur
-// Windows; anderswo No-Op. Scheitert still.
+// selbst — kein offener Griff, der den Prozess ueberleben muesste. Windows
+// und (seit 08.11.2026) Linux; anderswo No-Op. Scheitert still.
 void ExitLog(const char* phase,
              size_t pcs,
              size_t beobachter,
@@ -62,6 +67,37 @@ void ExitLog(const char* phase,
                "[exit] %s pid=%lu %s pcs=%llu beobachter=%llu kanaele=%llu "
                "ms=%lld\n",
                ts, static_cast<unsigned long>(GetCurrentProcessId()), phase,
+               static_cast<unsigned long long>(pcs),
+               static_cast<unsigned long long>(beobachter),
+               static_cast<unsigned long long>(kanaele), ms);
+  std::fclose(f);
+#elif defined(__linux__)
+  // honeycord (08.11.2026, Funktionsvergleich O36): derselbe Bericht unter
+  // Linux, im Protokollordner des Clients (`lib/services/log_ort.dart`:
+  // $XDG_STATE_HOME/honeycord, sonst ~/.local/state/honeycord).
+  std::string dir;
+  const char* xdg = std::getenv("XDG_STATE_HOME");
+  if (xdg != nullptr && *xdg != '\0') {
+    dir = std::string(xdg) + "/honeycord";
+  } else {
+    const char* home = std::getenv("HOME");
+    if (home == nullptr || *home == '\0') return;
+    dir = std::string(home) + "/.local/state/honeycord";
+  }
+  const std::string path = dir + "/exit.log";
+  struct stat st = {};
+  const char* mode = (stat(path.c_str(), &st) == 0 && st.st_size > 256 * 1024) ? "w" : "a";
+  FILE* f = std::fopen(path.c_str(), mode);
+  if (f == nullptr) return;
+  std::time_t now = std::time(nullptr);
+  std::tm tm_local = {};
+  localtime_r(&now, &tm_local);
+  char ts[32] = {};
+  std::strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_local);
+  std::fprintf(f,
+               "[exit] %s pid=%ld %s pcs=%llu beobachter=%llu kanaele=%llu "
+               "ms=%lld\n",
+               ts, static_cast<long>(getpid()), phase,
                static_cast<unsigned long long>(pcs),
                static_cast<unsigned long long>(beobachter),
                static_cast<unsigned long long>(kanaele), ms);
@@ -130,7 +166,7 @@ void FlutterWebRTCBase::TeardownForExit() {
   const size_t beobachter = peerconnection_observers_.size();
   ExitLog("start", pcs, beobachter, kanaele, 0);
 
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
   // Gutachten N5: Haengt der Abbau, bliebe ein unsichtbarer Prozess, der
   // weiter Ton sendet. Nach 5 s: Zeile "haengt" und Prozess beenden. Nur
   // scharf, wenn es PeerConnections gibt — nur dann kann Close() blockieren,
@@ -157,7 +193,13 @@ void FlutterWebRTCBase::TeardownForExit() {
               std::chrono::steady_clock::now() - t0)
               .count();
       ExitLog("haengt", pcs, beobachter, kanaele, ms);
+#if defined(_WIN32)
       TerminateProcess(GetCurrentProcess(), 0);
+#else
+      // honeycord (08.11.2026): Linux wie Windows — sofort weg, ohne
+      // atexit-Handler, die selbst am haengenden Abbau warten koennten.
+      _exit(0);
+#endif
     });
     } catch (...) {
       ExitLog("ohne-waechter", pcs, beobachter, kanaele, 0);
@@ -213,7 +255,7 @@ void FlutterWebRTCBase::TeardownForExit() {
   }
   peerconnection_observers_.clear();
 
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
   if (waechter.t.joinable()) {
     {
       std::lock_guard<std::mutex> lk(waechter.m);
