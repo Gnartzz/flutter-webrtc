@@ -5,15 +5,18 @@
 // glTexImage2D in Flutters Pixelpuffer-Textur), dieser 1,4 ms — davon die
 // Anzeige 0,14 statt 2,07 ms. Farben gleich (mittlere Abweichung < 2).
 //
-// Aufbau: Unter Wayland ist Flutters GL-Kontext ein EGL-Kontext. Daneben legt
-// dieser Teil einen EIGENEN Kontext an, der seine Texturen mit Flutters teilt.
+// Aufbau: Unter Wayland ist Flutters GL-Kontext ein EGL-Kontext (OpenGL ES).
+// Je Engine legt dieser Teil daneben einen EIGENEN Kontext an, der seine Texturen mit Flutters teilt.
 // Gezeichnet wird nur dort — Flutters GL-Zustand (Skia) bleibt unberührt.
 // Danach ein EGL-Fence, auf den Flutters Kontext auf der Grafikkarte wartet.
 //
-// Rückfälle (je Bild): kein GPU-Bild (Software, gedreht, ältere libwebrtc) →
-// das bisherige RGBA aus `CopyPixelBuffer`, hier hochgeladen. Scheitert das
-// Einrichten → Pixelweg im Flutter-Kontext, genau wie Flutters eigene
-// Pixelpuffer-Textur. Unter X11 (GLX) wird dieser Typ gar nicht erst benutzt.
+// Pixelbilder (Software, gedreht, ältere libwebrtc, GPU-Weg aus) lädt diese
+// Textur wie Flutters eigene Pixelpuffer-Textur in Flutters Kontext hoch —
+// den eigenen Kontext betritt nur ein echtes GPU-Bild. Scheitert das
+// Einrichten, ein Kontextwechsel oder 30-mal das Zeichnen, ist der GPU-Weg
+// für den Prozess aus (und die Bibliothek erfährt es). Gezeichnet wird auf
+// Kachelgröße (Flutter nennt sie in populate). Unter X11 (GLX) wird dieser
+// Typ gar nicht erst benutzt.
 // Abschalten: HONEYCORD_EMPFANG_GPU=0.
 #include "hc_gl_textur.h"
 
@@ -66,26 +69,42 @@ struct Egl {
 };
 
 constexpr int kEglDraw = 0x3059, kEglRead = 0x305A, kEglConfigId = 0x3028, kEglNone = 0x3038,
-              kEglExtensions = 0x3055, kEglMajor = 0x3098, kEglMinor = 0x30FB,
-              kEglProfileMask = 0x30FD;
+              kEglExtensions = 0x3055, kEglMajor = 0x3098;
 constexpr unsigned kEglSyncFence = 0x30F9;
-constexpr unsigned kGlVersion = 0x1F02, kGlProfileMask = 0x9126;
+constexpr unsigned kGlVersion = 0x1F02;
 
-// Alles hier läuft auf Flutters Raster-Faden (populate). Abgemeldete Texturen
-// kommen vom Plattform-Faden — sie werden vorgemerkt und hier gelöscht.
+// So oft hintereinander darf das Zeichnen eines GPU-Bilds scheitern, bevor
+// der GPU-Weg für diesen Prozess aus ist (sonst je Bild: GPU-Kopie, Export,
+// Fehlschlag UND Zurücklesen — teurer als der alte Weg).
+constexpr int kFehlerBremse = 30;
+
+using Melden = void (*)(int);
+Melden Bibliothek() {
+  static const Melden m =
+      reinterpret_cast<Melden>(dlsym(RTLD_DEFAULT, "honeycord_empfang_gpu_bereit"));
+  return m;
+}
+
+// Je Flutter-GL-Kontext (= je Engine) einer: Texturnamen gelten nur in der
+// Teilungsgruppe dieses Kontexts. Alles hier läuft auf dem Raster-Faden der
+// Engine (populate); abgemeldete Texturen kommen vom Plattform-Faden — sie
+// werden vorgemerkt und beim nächsten populate in Flutters Kontext gelöscht.
 struct Gpu {
-  enum class Zustand { kNeu, kBereit, kNotweg } zustand = Zustand::kNeu;
+  void* flutter = nullptr;  // Flutters Kontext, zu dem dieser gehört
+  bool gpu_an = false;      // eigener Kontext + Zeichner bereit
   Egl egl;
   void* anzeige = nullptr;
   void* eigener = nullptr;
   hcgpu::Zeichner z;
   bool fence = false;
-  // Notweg (im Flutter-Kontext): nur Hochladen.
+  int fehler_in_folge = 0;
+  // Pixelweg (in Flutters Kontext, wie Flutters eigene Pixelpuffer-Textur).
   void (*glGenTextures)(int, unsigned*) = nullptr;
   void (*glBindTexture)(unsigned, unsigned) = nullptr;
   void (*glTexImage2D)(unsigned, int, int, int, int, int, unsigned, unsigned, const void*) = nullptr;
   void (*glTexParameteri)(unsigned, unsigned, int) = nullptr;
   void (*glDeleteTextures)(int, const unsigned*) = nullptr;
+  void (*glPixelStorei)(unsigned, int) = nullptr;
   void (*glFinish)() = nullptr;
 
   std::mutex weg_m;
@@ -93,10 +112,11 @@ struct Gpu {
 
   void* f_draw = nullptr;
   void* f_read = nullptr;
-  void* f_ctx = nullptr;
 
-  void Einrichten() {
-    zustand = Zustand::kNotweg;
+  bool PixelwegBereit() const { return glGenTextures && glBindTexture && glTexImage2D && glTexParameteri && glDeleteTextures && glPixelStorei; }
+
+  void Einrichten(void* flutter_ctx) {
+    flutter = flutter_ctx;
     if (!egl.Laden()) return;
     auto gp = reinterpret_cast<hcgpu::GetProc>(egl.GetProcAddress);
     glGenTextures = reinterpret_cast<decltype(glGenTextures)>(gp("glGenTextures"));
@@ -104,34 +124,25 @@ struct Gpu {
     glTexImage2D = reinterpret_cast<decltype(glTexImage2D)>(gp("glTexImage2D"));
     glTexParameteri = reinterpret_cast<decltype(glTexParameteri)>(gp("glTexParameteri"));
     glDeleteTextures = reinterpret_cast<decltype(glDeleteTextures)>(gp("glDeleteTextures"));
+    glPixelStorei = reinterpret_cast<decltype(glPixelStorei)>(gp("glPixelStorei"));
     glFinish = reinterpret_cast<decltype(glFinish)>(gp("glFinish"));
     anzeige = egl.GetCurrentDisplay();
-    void* flutter = egl.GetCurrentContext();
     if (!anzeige || !flutter) {
       g_message("HoneyCord: Empfang ohne Umweg — kein EGL-Kontext, Pixelweg");
       return;
     }
-    // Welcher GL-Dialekt? Das bestimmt Kontext-Attribute und Shader.
+    // Flutter legt unter Wayland OpenGL-ES-Kontexte an (fl_opengl_manager).
+    // Desktop-GL (ältere Engines) bleibt beim Pixelweg: dafür müsste die
+    // EGL-API des Fadens umgestellt werden, und das gehört Flutter.
     auto glGetString = reinterpret_cast<const char* (*)(unsigned)>(gp("glGetString"));
-    auto glGetIntegerv = reinterpret_cast<void (*)(unsigned, int*)>(gp("glGetIntegerv"));
     const char* v = glGetString ? glGetString(kGlVersion) : nullptr;
-    if (!v) return;
-    hcgpu::Dialekt d = hcgpu::Dialekt::kES;
-    std::vector<int> attr;
-    if (std::strncmp(v, "OpenGL ES", 9) == 0) {
-      int major = 2;
-      std::sscanf(v + 9, " %d", &major);
-      attr = {kEglMajor, major >= 3 ? 3 : 2, kEglNone};
-    } else {
-      int major = 2, minor = 1, maske = 0;
-      std::sscanf(v, "%d.%d", &major, &minor);
-      if (major >= 3 && glGetIntegerv) glGetIntegerv(kGlProfileMask, &maske);
-      const bool core = (maske & 1) != 0;
-      d = core ? hcgpu::Dialekt::kCore : hcgpu::Dialekt::kLegacy;
-      attr = {kEglMajor, major, kEglMinor, minor};
-      if (major >= 3) { attr.push_back(kEglProfileMask); attr.push_back(core ? 1 : 2); }
-      attr.push_back(kEglNone);
+    if (!v || std::strncmp(v, "OpenGL ES", 9) != 0) {
+      g_message("HoneyCord: Empfang ohne Umweg — kein OpenGL-ES-Kontext (%s), Pixelweg", v ? v : "?");
+      return;
     }
+    int major = 2;
+    std::sscanf(v + 9, " %d", &major);
+    const int attr[] = {kEglMajor, major >= 3 ? 3 : 2, kEglNone};
     int id = 0;
     void* konfig = nullptr;
     if (egl.QueryContext(anzeige, flutter, kEglConfigId, &id) && id > 0) {
@@ -140,7 +151,7 @@ struct Gpu {
       egl.ChooseConfig(anzeige, such, &konfig, 1, &n);
       if (n < 1) konfig = nullptr;
     }
-    eigener = egl.CreateContext(anzeige, konfig, flutter, attr.data());
+    eigener = egl.CreateContext(anzeige, konfig, flutter, attr);
     if (!eigener) {
       g_message("HoneyCord: Empfang ohne Umweg — eigener GL-Kontext nicht anzulegen (%s), Pixelweg", v);
       return;
@@ -148,50 +159,106 @@ struct Gpu {
     const char* ext = egl.QueryString(anzeige, kEglExtensions);
     fence = ext && std::strstr(ext, "EGL_KHR_fence_sync") && std::strstr(ext, "EGL_KHR_wait_sync") &&
             egl.CreateSyncKHR && egl.WaitSyncKHR && egl.DestroySyncKHR;
-    Betreten();
-    const bool zok = z.Einrichten(gp, anzeige, d);
-    Verlassen();
-    if (!zok) {
+    if (!Betreten()) return;
+    const bool zok = z.Einrichten(gp, anzeige, hcgpu::Dialekt::kES);
+    if (!Verlassen() || !zok) {
       g_message("HoneyCord: Empfang ohne Umweg — GL-Baustein scheitert (%s), Pixelweg", v);
       return;
     }
-    zustand = Zustand::kBereit;
-    g_message("HoneyCord: Empfang ohne Umweg bereit (%s, %s)", v,
-              d == hcgpu::Dialekt::kES ? "ES" : d == hcgpu::Dialekt::kCore ? "Core" : "Legacy");
+    gpu_an = true;
+    g_message("HoneyCord: Empfang ohne Umweg bereit (%s, Fence %s)", v, fence ? "ja" : "nein");
     // Erst jetzt der Bibliothek sagen, dass GPU-Bilder hier ankommen dürfen.
-    using Melden = void (*)(int);
-    if (auto m = reinterpret_cast<Melden>(dlsym(RTLD_DEFAULT, "honeycord_empfang_gpu_bereit"))) m(1);
+    if (Bibliothek()) Bibliothek()(1);
   }
 
-  void Betreten() {
+  // Den GPU-Weg dauerhaft beenden — und der Bibliothek sagen, dass sie
+  // keine GPU-Bilder mehr ausgeben soll (-1 = gesperrt, nicht nur aus).
+  void Aufgeben(const char* grund) {
+    if (!gpu_an) return;
+    gpu_an = false;
+    g_message("HoneyCord: Empfang ohne Umweg aus — %s, ab jetzt Pixelweg", grund);
+    if (Bibliothek()) Bibliothek()(-1);
+  }
+
+  // Wechsel in den eigenen Kontext. false = Wechsel scheiterte; dann ist
+  // (nach Möglichkeit) wieder Flutters Kontext aktiv, und nichts wurde
+  // gezeichnet — in Flutters Kontext zu zeichnen hieße Skias GL-Zustand
+  // (Framebuffer, Programm, Viewport) zu zerstören.
+  bool Betreten() {
     f_draw = egl.GetCurrentSurface(kEglDraw);
     f_read = egl.GetCurrentSurface(kEglRead);
-    f_ctx = egl.GetCurrentContext();
-    egl.MakeCurrent(anzeige, nullptr, nullptr, eigener);
-    std::vector<unsigned> weg;
-    {
-      std::lock_guard<std::mutex> l(weg_m);
-      weg.swap(zu_loeschen);
+    if (!egl.MakeCurrent(anzeige, nullptr, nullptr, eigener)) {
+      egl.MakeCurrent(anzeige, f_draw, f_read, flutter);
+      return false;
     }
-    for (unsigned t : weg) z.TexturWeg(&t);
+    return true;
   }
 
-  void Verlassen() {
+  bool Verlassen() {
     void* sync = nullptr;
     if (fence) sync = egl.CreateSyncKHR(anzeige, kEglSyncFence, nullptr);
-    else if (glFinish) glFinish();
-    egl.MakeCurrent(anzeige, f_draw, f_read, f_ctx);
+    if (!sync && glFinish) glFinish();
+    if (!egl.MakeCurrent(anzeige, f_draw, f_read, flutter)) {
+      if (sync) egl.DestroySyncKHR(anzeige, sync);
+      return false;
+    }
     if (sync) {
       // Flutters Kontext wartet auf der GRAFIKKARTE, der Faden läuft weiter.
       egl.WaitSyncKHR(anzeige, sync, 0);
       egl.DestroySyncKHR(anzeige, sync);
     }
+    return true;
+  }
+
+  // In Flutters Kontext (Texturnamen sind geteilt).
+  void Aufraeumen() {
+    std::vector<unsigned> weg;
+    {
+      std::lock_guard<std::mutex> l(weg_m);
+      weg.swap(zu_loeschen);
+    }
+    if (!weg.empty() && glDeleteTextures) glDeleteTextures(static_cast<int>(weg.size()), weg.data());
+  }
+
+  void Hochladen(const FlutterDesktopPixelBuffer* p, unsigned* tex, int* b, int* h) {
+    if (!*tex) {
+      glGenTextures(1, tex);
+      glBindTexture(hcgpu::kTexture2D, *tex);
+      glTexParameteri(hcgpu::kTexture2D, hcgpu::kMinFilter, hcgpu::kLinear);
+      glTexParameteri(hcgpu::kTexture2D, hcgpu::kMagFilter, hcgpu::kLinear);
+      glTexParameteri(hcgpu::kTexture2D, hcgpu::kWrapS, hcgpu::kClampToEdge);
+      glTexParameteri(hcgpu::kTexture2D, hcgpu::kWrapT, hcgpu::kClampToEdge);
+    }
+    glBindTexture(hcgpu::kTexture2D, *tex);
+    glPixelStorei(hcgpu::kUnpackAlignment, 4);
+    glTexImage2D(hcgpu::kTexture2D, 0, hcgpu::kRGBA, static_cast<int>(p->width),
+                 static_cast<int>(p->height), 0, hcgpu::kRGBA, hcgpu::kUByte, p->buffer);
+    *b = static_cast<int>(p->width);
+    *h = static_cast<int>(p->height);
   }
 };
 
-Gpu& gpu() {
-  static Gpu* g = new Gpu();  // lebt bis zum Prozessende (Raster-Faden)
-  return *g;
+// Je Flutter-Kontext ein Gpu; lebt bis zum Prozessende (die Texturen der
+// Engine können ihn noch referenzieren, wenn sie abgebaut wird).
+Gpu* GpuFuer(void* flutter_ctx) {
+  static std::mutex m;
+  static std::vector<Gpu*>* alle = new std::vector<Gpu*>();
+  std::lock_guard<std::mutex> l(m);
+  for (Gpu* g : *alle)
+    if (g->flutter == flutter_ctx) return g;
+  Gpu* g = new Gpu();
+  g->Einrichten(flutter_ctx);
+  alle->push_back(g);
+  return g;
+}
+
+void* FlutterKontext() {
+  static void* (*aktuell)() = [] {
+    void* h = dlopen("libEGL.so.1", RTLD_NOW | RTLD_NOLOAD);
+    if (!h) h = dlopen("libEGL.so.1", RTLD_NOW);
+    return h ? reinterpret_cast<void* (*)()>(dlsym(h, "eglGetCurrentContext")) : nullptr;
+  }();
+  return aktuell ? aktuell() : nullptr;
 }
 
 }  // namespace
@@ -199,6 +266,7 @@ Gpu& gpu() {
 struct HcGlTextur {
   FlTextureGL parent_instance;
   flutter::TextureVariant* variante = nullptr;
+  Gpu* gpu = nullptr;  // der Kontext-Gruppe, in der tex lebt
   unsigned tex = 0;
   int breite = 0, hoehe = 0;
 };
@@ -214,52 +282,51 @@ G_DEFINE_TYPE(HcGlTextur, hc_gl_textur, fl_texture_gl_get_type())
 static gboolean hc_gl_textur_populate(FlTextureGL* texture, uint32_t* target, uint32_t* name,
                                       uint32_t* width, uint32_t* height, GError** error) {
   HcGlTextur* self = HC_GL_TEXTUR(texture);
-  Gpu& g = gpu();
-  if (g.zustand == Gpu::Zustand::kNeu) g.Einrichten();
+  if (!self->gpu) self->gpu = GpuFuer(FlutterKontext());
+  Gpu& g = *self->gpu;
   auto& pb = std::get<flutter::PixelBufferTexture>(*self->variante);
+  // Kachelgröße (Pixel), wie sie Flutter fordert — dorthin wird verkleinert.
+  const int max_b = static_cast<int>(*width), max_h = static_cast<int>(*height);
+  g.Aufraeumen();
 
-  if (g.zustand == Gpu::Zustand::kBereit) {
-    g.Betreten();
-    bool ok = false;
+  bool fertig = false;
+  if (g.gpu_an) {
     hcgpu::Bild b;
-    if (pb.GpuBild(&b)) ok = g.z.Zeichnen(b, &self->tex, &self->breite, &self->hoehe);
-    if (!ok) {
-      const FlutterDesktopPixelBuffer* p = pb.CopyPixelBuffer(*width, *height);
-      if (p && p->buffer)
-        ok = g.z.Hochladen(p->buffer, static_cast<int>(p->width), static_cast<int>(p->height),
-                           &self->tex, &self->breite, &self->hoehe);
+    if (pb.GpuBild(&b)) {
+      // Nur für GPU-Bilder in den eigenen Kontext.
+      if (!g.Betreten()) {
+        hcgpu::FdsSchliessen(b);
+        g.Aufgeben("GL-Kontextwechsel scheitert");
+      } else {
+        fertig = g.z.Zeichnen(b, &self->tex, &self->breite, &self->hoehe, max_b, max_h);
+        const char* grund = g.z.letzter_fehler();
+        if (!g.Verlassen()) {
+          fertig = false;
+          g.Aufgeben("GL-Kontextwechsel zurück scheitert");
+        } else if (fertig) {
+          g.fehler_in_folge = 0;
+        } else if (++g.fehler_in_folge == 1) {
+          g_message("HoneyCord: Empfang ohne Umweg — Bild nicht zu zeichnen (%s), dieses Bild über den Pixelweg", grund);
+        } else if (g.fehler_in_folge >= kFehlerBremse) {
+          g.Aufgeben("Zeichnen scheitert wiederholt");
+        }
+      }
     }
-    if (!self->tex) {
+  }
+  if (!fertig && g.PixelwegBereit()) {
+    // Pixelweg in Flutters Kontext — wie Flutters eigene Pixelpuffer-Textur.
+    const FlutterDesktopPixelBuffer* p = pb.CopyPixelBuffer(*width, *height);
+    if (p && p->buffer && p->width > 0 && p->height > 0) {
+      g.Hochladen(p, &self->tex, &self->breite, &self->hoehe);
+    } else if (!self->tex) {
       // Noch kein Bild: durchsichtig statt eines Fehlers je Bild.
       static const uint8_t leer[4] = {0, 0, 0, 0};
-      g.z.Hochladen(leer, 1, 1, &self->tex, &self->breite, &self->hoehe);
-    }
-    g.Verlassen();
-  } else if (g.glGenTextures && g.glTexImage2D) {
-    // Notweg: wie Flutters eigene Pixelpuffer-Textur, im Flutter-Kontext.
-    static const uint8_t leer[4] = {0, 0, 0, 0};
-    static const FlutterDesktopPixelBuffer kLeer = {leer, 1, 1, nullptr, nullptr};
-    const FlutterDesktopPixelBuffer* p = pb.CopyPixelBuffer(*width, *height);
-    if ((!p || !p->buffer) && !self->tex) p = &kLeer;
-    if (p && p->buffer) {
-      if (!self->tex) {
-        g.glGenTextures(1, &self->tex);
-        g.glBindTexture(hcgpu::kTexture2D, self->tex);
-        g.glTexParameteri(hcgpu::kTexture2D, hcgpu::kMinFilter, hcgpu::kLinear);
-        g.glTexParameteri(hcgpu::kTexture2D, hcgpu::kMagFilter, hcgpu::kLinear);
-        g.glTexParameteri(hcgpu::kTexture2D, hcgpu::kWrapS, hcgpu::kClampToEdge);
-        g.glTexParameteri(hcgpu::kTexture2D, hcgpu::kWrapT, hcgpu::kClampToEdge);
-      }
-      g.glBindTexture(hcgpu::kTexture2D, self->tex);
-      g.glTexImage2D(hcgpu::kTexture2D, 0, hcgpu::kRGBA, static_cast<int>(p->width),
-                     static_cast<int>(p->height), 0, hcgpu::kRGBA, hcgpu::kUByte, p->buffer);
-      self->breite = static_cast<int>(p->width);
-      self->hoehe = static_cast<int>(p->height);
+      static const FlutterDesktopPixelBuffer kLeer = {leer, 1, 1, nullptr, nullptr};
+      g.Hochladen(&kLeer, &self->tex, &self->breite, &self->hoehe);
     }
   }
   if (!self->tex) {
-    // Noch kein Bild — wie der Pixelpuffer ohne Puffer: nichts zeichnen.
-    g_set_error(error, g_quark_from_static_string("honeycord"), 1, "noch kein Bild");
+    g_set_error(error, g_quark_from_static_string("honeycord"), 1, "keine GL-Textur");
     return FALSE;
   }
   *target = hcgpu::kTexture2D;
@@ -271,13 +338,12 @@ static gboolean hc_gl_textur_populate(FlTextureGL* texture, uint32_t* target, ui
 
 static void hc_gl_textur_dispose(GObject* obj) {
   HcGlTextur* self = HC_GL_TEXTUR(obj);
-  if (self->tex) {
+  if (self->tex && self->gpu) {
     // Nicht hier löschen: kein GL-Kontext auf diesem Faden.
-    Gpu& g = gpu();
-    std::lock_guard<std::mutex> l(g.weg_m);
-    g.zu_loeschen.push_back(self->tex);
-    self->tex = 0;
+    std::lock_guard<std::mutex> l(self->gpu->weg_m);
+    self->gpu->zu_loeschen.push_back(self->tex);
   }
+  self->tex = 0;
   G_OBJECT_CLASS(hc_gl_textur_parent_class)->dispose(obj);
 }
 
