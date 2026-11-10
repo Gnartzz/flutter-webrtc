@@ -36,6 +36,11 @@ class FlutterVideoRenderer
 
   virtual void OnFrame(scoped_refptr<RTCVideoFrame> frame) override;
 
+#if defined(__linux__)
+  // honeycord (10.11.2026): aktuelles Bild als GPU-Bild (linux/hc_gl_textur.cc).
+  bool GpuBildHolen(void* aus);
+#endif
+
   void SetVideoTrack(scoped_refptr<RTCVideoTrack> track);
 
   int64_t texture_id() { return texture_id_; }

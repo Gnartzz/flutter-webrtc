@@ -29,6 +29,7 @@ add_library(${PLUGIN_NAME} SHARED
   "../common/cpp/src/flutter_common.cc"
   "flutter_webrtc_plugin.cc"
   "honeycord_pipewire_loopback.cc"
+  "hc_gl_textur.cc"
   "flutter/core_implementations.cc"
   "flutter/standard_codec.cc"
   "flutter/plugin_registrar.cc"
@@ -54,6 +55,8 @@ target_include_directories(${PLUGIN_NAME} INTERFACE
 )
 target_link_libraries(${PLUGIN_NAME} PRIVATE flutter)
 target_link_libraries(${PLUGIN_NAME} PRIVATE PkgConfig::GTK)
+# honeycord: dlopen/dlsym (libEGL, honeycord_gpu_bild aus libwebrtc.so)
+target_link_libraries(${PLUGIN_NAME} PRIVATE ${CMAKE_DL_LIBS})
 
 # HoneyCord: Systemton der Bildschirmfreigabe (honeycord_pipewire_loopback.cc).
 # Betrifft NUR den Linux-Bau — Windows und macOS haben eigene CMake-Dateien.

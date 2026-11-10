@@ -1,3 +1,6 @@
+#if defined(__linux__)
+#include <dlfcn.h>
+#endif
 #include "flutter_video_renderer.h"
 
 #include <algorithm>
@@ -353,6 +356,24 @@ const FlutterDesktopGpuSurfaceDescriptor* FlutterVideoRenderer::ObtainGpuSurface
 }
 #endif
 
+#if defined(__linux__)
+// honeycord (10.11.2026): das aktuelle Bild als GPU-Bild (DMA-BUF), über die
+// C-Schnittstelle von libwebrtc.so — fehlt sie (ältere Bibliothek), bleibt es
+// beim Pixelweg. Läuft auf dem Raster-Faden.
+bool FlutterVideoRenderer::GpuBildHolen(void* aus) {
+  using Fn = int (*)(void*, void*);
+  static const Fn fn = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "honeycord_gpu_bild"));
+  if (fn == nullptr) return false;
+  scoped_refptr<RTCVideoFrame> f;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    f = frame_;
+  }
+  if (!f.get()) return false;
+  return fn(static_cast<void*>(f.get()), aus) == 1;
+}
+#endif
+
 void FlutterVideoRenderer::OnFrame(scoped_refptr<RTCVideoFrame> frame) {
 #ifdef _WINDOWS
   {
@@ -549,6 +570,13 @@ void FlutterVideoRendererManager::CreateVideoRendererTexture(
                       size_t height) -> const FlutterDesktopPixelBuffer* {
               return texture->CopyPixelBuffer(width, height);
             }));
+#if defined(__linux__)
+    // honeycord (10.11.2026): Empfang ohne Umweg — die Linux-Textur fragt
+    // zuerst nach einem GPU-Bild (linux/hc_gl_textur.cc).
+    std::get<flutter::PixelBufferTexture>(*textureVariant)
+        .set_gpu_bild_callback(
+            [texture](void* aus) -> bool { return texture->GpuBildHolen(aus); });
+#endif
   }
 
   auto texture_id = base_->textures_->RegisterTexture(textureVariant.get());

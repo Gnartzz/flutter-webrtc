@@ -34,7 +34,9 @@ class TextureRegistrarImpl : public TextureRegistrar {
  private:
   // Handle for interacting with the C API.
   FlTextureRegistrar* texture_registrar_ref_;
-  std::map<int64_t, FlTextureProxy*> textures_;
+  // honeycord: FlTexture statt FlTextureProxy — unter Wayland eine GL-Textur
+  // (hc_gl_textur.cc), sonst die Pixelpuffer-Textur.
+  std::map<int64_t, FlTexture*> textures_;
 };
 
 }  // namespace flutter

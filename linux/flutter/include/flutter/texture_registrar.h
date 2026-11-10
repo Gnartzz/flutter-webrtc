@@ -44,6 +44,15 @@ class PixelBufferTexture {
   explicit PixelBufferTexture(CopyBufferCallback copy_buffer_callback)
       : copy_buffer_callback_(copy_buffer_callback) {}
 
+  // honeycord (Linux, Empfang ohne Umweg, 10.11.2026): Liefert, wenn möglich,
+  // das aktuelle Bild als GPU-Bild (`hcgpu::Bild`, DMA-BUF). Ohne diesen Weg
+  // bleibt es beim Pixelpuffer. Siehe linux/hc_gl_textur.cc.
+  typedef std::function<bool(void* hcgpu_bild)> GpuBildCallback;
+  void set_gpu_bild_callback(GpuBildCallback cb) { gpu_bild_callback_ = std::move(cb); }
+  bool GpuBild(void* hcgpu_bild) const {
+    return gpu_bild_callback_ && gpu_bild_callback_(hcgpu_bild);
+  }
+
   // Returns the callback-provided FlutterDesktopPixelBuffer that contains the
   // actual pixel data. The intended surface size is specified by |width| and
   // |height|.
@@ -54,6 +63,7 @@ class PixelBufferTexture {
 
  private:
   const CopyBufferCallback copy_buffer_callback_;
+  GpuBildCallback gpu_bild_callback_;
 };
 
 // The available texture variants.

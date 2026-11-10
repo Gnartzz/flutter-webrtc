@@ -21,6 +21,7 @@
 #include "include/flutter/engine_method_result.h"
 #include "include/flutter/texture_registrar.h"
 #include "texture_registrar_impl.h"
+#include "../hc_gl_textur.h"
 
 struct FlTextureProxy {
   FlPixelBufferTexture parent_instance;
@@ -224,11 +225,13 @@ TextureRegistrarImpl::TextureRegistrarImpl(
 TextureRegistrarImpl::~TextureRegistrarImpl() = default;
 
 int64_t TextureRegistrarImpl::RegisterTexture(TextureVariant* texture) {
-  auto texture_proxy = fl_texture_proxy_new(texture);
-  fl_texture_registrar_register_texture(texture_registrar_ref_,
-                                        FL_TEXTURE(texture_proxy));
-  int64_t texture_id = reinterpret_cast<int64_t>(texture_proxy);
-  textures_[texture_id] = texture_proxy;
+  // honeycord (10.11.2026): unter Wayland eine GL-Textur, die GPU-Bilder ohne
+  // Umweg zeigt und sonst wie der Pixelpuffer hochlädt (hc_gl_textur.cc).
+  FlTexture* t = hc_gl_textur_moeglich() ? hc_gl_textur_neu(texture)
+                                         : FL_TEXTURE(fl_texture_proxy_new(texture));
+  fl_texture_registrar_register_texture(texture_registrar_ref_, t);
+  int64_t texture_id = reinterpret_cast<int64_t>(t);
+  textures_[texture_id] = t;
   return texture_id;
 }
 
