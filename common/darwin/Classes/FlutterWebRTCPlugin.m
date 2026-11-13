@@ -446,6 +446,25 @@ static FlutterWebRTCPlugin *sharedSingleton;
     [self initialize:networkIgnoreMask bypassVoiceProcessing:enableBypassVoiceProcessing
                      severity:severity];
     result(@"");
+  } else if ([@"honeycordNetzAuslassen" isEqualToString:call.method]) {
+    // HoneyCord LAN-Vorrang (13.11.2026): Schnittstellen nach BSD-Namen
+    // ("en0") auslassen — unser WebRTC-Patch `honeycord-netz.patch`. Per
+    // Selektor, weil derselbe Code gegen Frameworks OHNE den Patch baut (iOS,
+    // aeltere Mac-Fassungen); dort meldet der Aufruf `false`, nichts aendert sich.
+    NSDictionary* argsMap = call.arguments;
+    NSArray* namen = argsMap[@"schnittstellen"];
+    if (![namen isKindOfClass:[NSArray class]]) namen = @[];
+    SEL setzen = NSSelectorFromString(@"honeycordSetIgnoredInterfaceNames:");
+    Class optionen = [RTCPeerConnectionFactoryOptions class];
+    if ([optionen respondsToSelector:setzen]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+      [optionen performSelector:setzen withObject:namen];
+#pragma clang diagnostic pop
+      result(@YES);
+    } else {
+      result(@NO);
+    }
   } else if ([@"createPeerConnection" isEqualToString:call.method]) {
     NSDictionary* argsMap = call.arguments;
     NSDictionary* configuration = argsMap[@"configuration"];
