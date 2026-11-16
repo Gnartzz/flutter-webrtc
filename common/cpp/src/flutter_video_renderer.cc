@@ -140,21 +140,27 @@ void RenderLog(int64_t tex, int throttled, const char* what, double fps, int w, 
 
 // PixelBuffer-Zeile (10.10.2026): uploads = CopyPixelBuffer-Aufrufe/s im
 // Fenster, quelle = Bild, ziel = von Flutter erbetene Groesse (logisch),
-// aus = tatsaechlich umgerechnet, drossel = Intervall in ms (0 = aus).
+// aus = tatsaechlich umgerechnet, drossel = Intervall in ms (0 = aus),
+// conv = ganze Umrechnung je Bild (wie bisher, einschliesslich i420).
+// ★ 16.11.2026: i420 = davon der Anteil des Wrappers, das Bild nach I420 zu
+// holen (EnsureI420: bei nativen/NV12-Bildern ToI420, ggf. GPU-Readback —
+// sonst ~0), weg = welcher Umrechnungsweg lief (direkt = I420-Ebenen direkt
+// verkleinert, convert = ConvertToARGB, gemischt = beides im Fenster).
 void RenderLogPixelBuffer(int64_t tex, int drossel_ms, double uploads, int qw,
                           int qh, size_t zw, size_t zh, int aw, int ah,
-                          double skala, double conv_ms, double fenster_s) {
+                          double skala, double conv_ms, double i420_ms,
+                          const char* weg, double fenster_s) {
   const std::string& path = RenderLogPath();
   if (path.empty()) return;
   if (FILE* f = std::fopen(path.c_str(), "a")) {
     std::fprintf(f,
                  "[render] tex=%lld PIXELBUFFER uploads=%.1f/s quelle=%dx%d "
                  "ziel=%llux%llu aus=%dx%d skala=%.2f drossel=%d ms "
-                 "conv=%.2f ms fenster=%.1f s\n",
+                 "conv=%.2f ms i420=%.2f ms weg=%s fenster=%.1f s\n",
                  static_cast<long long>(tex), uploads, qw, qh,
                  static_cast<unsigned long long>(zw),
                  static_cast<unsigned long long>(zh), aw, ah, skala, drossel_ms,
-                 conv_ms, fenster_s);
+                 conv_ms, i420_ms, weg, fenster_s);
     std::fclose(f);
   }
 }
@@ -225,7 +231,8 @@ const FlutterDesktopPixelBuffer* FlutterVideoRenderer::CopyPixelBuffer(
   // honeycord (10.10.2026): nur in Kachelgroesse umrechnen, wenn die App es fuer
   // diesen Renderer eingeschaltet hat (pb_scale_ > 0) — sonst volle Groesse.
   // ConvertToARGB skaliert selbst (I420 ScaleFrom, Box-Filter), wenn die
-  // Zielgroesse vom Bild abweicht.
+  // Zielgroesse vom Bild abweicht — kopiert dafuer aber zuerst das GANZE Bild
+  // (I420Buffer::Rotate, auch bei Drehung 0) in frisch angelegten Speicher.
   int ow = fw;
   int oh = fh;
   PixelBufferZielGroesse(fw, fh, width, height, pb_scale_, &ow, &oh);
@@ -241,8 +248,40 @@ const FlutterDesktopPixelBuffer* FlutterVideoRenderer::CopyPixelBuffer(
 #ifdef _WINDOWS
   auto _t_conv = std::chrono::steady_clock::now();
 #endif
-  frame_->ConvertToARGB(RTCVideoFrame::Type::kABGR, rgb_buffer_.get(), 0, ow,
-                        oh);
+  // ★ 16.11.2026 (AIX1, Flutter-AMD: 3840x1080 -> ~890 px, conv=10,7 ms):
+  // Ebenen holen. DataY() loest im Wrapper EnsureI420 aus — bei nativen
+  // (GPU-) oder NV12-Bildern einmal ToI420, danach am Bild gecacht; derselbe
+  // Schritt, den ConvertToARGB sonst intern macht, also keine Mehrarbeit.
+  // Getrennt gemessen (i420=), damit das Protokoll zeigt, ob die Zeit im
+  // Holen des Bildes oder im Umrechnen steckt.
+  // NUR Windows (Pruefbefund S1, 16.11.): Unter Linux gibt DataY() bei einem
+  // GPU-Bild ohne Nullpruefung weiter (ToI420 liefert nach GPU-Reset nullptr)
+  // und holt das VOLLE Bild zurueck, waehrend ConvertToARGB dort erst auf der
+  // Grafikkarte verkleinert — Linux bleibt deshalb beim bisherigen Weg.
+  bool direkt = false;
+#ifdef _WINDOWS
+  const uint8_t* ebene_y = frame_->DataY();
+  dbg_pb_i420_ms_ += std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - _t_conv)
+                         .count();
+  // Direkter Weg (honeycord_i420_abtaster.h): bei deutlichem Verkleinern
+  // (beide Achsen mehr als halb — dort nimmt libyuv denselben Box-Filter) und
+  // ohne Drehung aus den I420-Ebenen in EINEM Durchgang nach RGBA, ohne die
+  // Vollbild-Kopie und ohne Allokation je Bild. Sonst, oder wenn eine Ebene
+  // fehlt bzw. ein Zeilenabstand nicht passt: ConvertToARGB wie bisher.
+  if (pb_scale_ > 0.0 && ebene_y &&
+      honeycord::I420DirektGeeignet(fw, fh, ow, oh) &&
+      frame_->rotation() == RTCVideoFrame::kVideoRotation_0) {
+    direkt = honeycord::I420NachRgbaVerkleinern(
+        ebene_y, frame_->StrideY(), frame_->DataU(), frame_->StrideU(),
+        frame_->DataV(), frame_->StrideV(), fw, fh, rgb_buffer_.get(), ow, oh,
+        &abtaster_);
+  }
+#endif
+  if (!direkt) {
+    frame_->ConvertToARGB(RTCVideoFrame::Type::kABGR, rgb_buffer_.get(), 0, ow,
+                          oh);
+  }
   pixel_buffer_->buffer = rgb_buffer_.get();
 #ifdef _WINDOWS
   {
@@ -250,16 +289,24 @@ const FlutterDesktopPixelBuffer* FlutterVideoRenderer::CopyPixelBuffer(
                            std::chrono::steady_clock::now() - _t_conv)
                            .count();
     dbg_pb_calls_++;
+    if (direkt) dbg_pb_direkt_++;
     const int64_t now = NowMs();
     if (dbg_pb_last_ms_ == 0) dbg_pb_last_ms_ = now;
     if (now - dbg_pb_last_ms_ >= 5000) {
       const double fenster_ms = static_cast<double>(now - dbg_pb_last_ms_);
+      const char* weg = dbg_pb_direkt_ == 0                ? "convert"
+                        : dbg_pb_direkt_ == dbg_pb_calls_ ? "direkt"
+                                                          : "gemischt";
       RenderLogPixelBuffer(texture_id_, is_throttle_ ? throttle_ms_ : 0,
                            dbg_pb_calls_ * 1000.0 / fenster_ms, fw, fh, width,
                            height, ow, oh, pb_scale_,
-                           dbg_pb_conv_ms_ / dbg_pb_calls_, fenster_ms / 1000.0);
+                           dbg_pb_conv_ms_ / dbg_pb_calls_,
+                           dbg_pb_i420_ms_ / dbg_pb_calls_, weg,
+                           fenster_ms / 1000.0);
       dbg_pb_calls_ = 0;
+      dbg_pb_direkt_ = 0;
       dbg_pb_conv_ms_ = 0.0;
+      dbg_pb_i420_ms_ = 0.0;
       dbg_pb_last_ms_ = now;
     }
   }

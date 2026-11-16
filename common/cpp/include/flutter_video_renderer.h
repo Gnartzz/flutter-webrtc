@@ -7,6 +7,8 @@
 #include "rtc_video_frame.h"
 #include "rtc_video_renderer.h"
 
+#include "honeycord_i420_abtaster.h"
+
 #include <atomic>
 #include <mutex>
 #ifdef _WINDOWS
@@ -76,10 +78,11 @@ class FlutterVideoRenderer
   // Meldung das ganze Fenster neu (Impeller, kein Raster-Cache, belegt am
   // 10.10.2026) — ein 60-fps-Strom in einer kleinen Kachel kostet also 60
   // Vollraster/s. Die App setzt den Wert zur Laufzeit nach der Kachelgroesse
-  // (klein -> 30, gross/fokussiert -> 0). Verworfen wird NUR die Meldung an
-  // Flutter, NACH dem Decoder: Spur, Decoder und Statistik laufen unveraendert,
-  // es gibt kein Keyframe-Problem. Vom Plattform-Faden gesetzt, im
-  // OnFrame-Faden gelesen -> atomar.
+  // (klein -> 30, gross/fokussiert -> 0; ★ 16.11.2026: jede Kachel 15 ausser
+  // der einen grossen, s. app/lib/services/empfangs_drossel.dart). Verworfen
+  // wird NUR die Meldung an Flutter, NACH dem Decoder: Spur, Decoder und
+  // Statistik laufen unveraendert, es gibt kein Keyframe-Problem. Vom
+  // Plattform-Faden gesetzt, im OnFrame-Faden gelesen -> atomar.
   void set_max_fps(int fps) {
     max_fps_.store(fps > 0 ? fps : 0, std::memory_order_relaxed);
   }
@@ -123,6 +126,10 @@ class FlutterVideoRenderer
   // Textur-Update faellig ist. Nur im OnFrame-Faden benutzt.
   int64_t pb_next_due_us_ = 0;
   double pb_scale_ = 0.0;  // s. set_pixel_buffer_scale (0 = aus)
+  // ★ 16.11.2026: Arbeitsspeicher des direkten Verkleinerns (Spannen,
+  // Kehrwerte, Zeilensummen) — ueber Bilder wiederverwendet, nur in
+  // CopyPixelBuffer unter mutex_ benutzt.
+  mutable honeycord::I420Abtaster abtaster_;
   // Empfangsdrossel (s. set_max_fps): Hoechstrate, Takt und Zaehler. Takt und
   // Zaehler nur im OnFrame-Faden benutzt (wie pb_next_due_us_).
   std::atomic<int> max_fps_{0};
@@ -179,6 +186,10 @@ class FlutterVideoRenderer
   mutable unsigned dbg_pb_calls_ = 0;
   mutable int64_t dbg_pb_last_ms_ = 0;
   mutable double dbg_pb_conv_ms_ = 0.0;
+  // ★ 16.11.2026: Anteil EnsureI420 an conv (i420=) und Zahl der Bilder, die
+  // den direkten Weg nahmen (weg=).
+  mutable double dbg_pb_i420_ms_ = 0.0;
+  mutable unsigned dbg_pb_direkt_ = 0;
 #endif
 };
 
