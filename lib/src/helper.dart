@@ -7,6 +7,7 @@ import 'package:logger/logger.dart';
 import '../flutter_webrtc.dart';
 import 'native_logs_listener.dart';
 import 'native/media_stream_impl.dart';
+import 'native/rtc_rtp_receiver_impl.dart';
 
 class Helper {
   /// Set Logger object for webrtc;
@@ -274,6 +275,29 @@ class Helper {
     if (!WebRTC.platformIsAndroid) return false;
     final r = await WebRTC.invokeMethod('honeycordMikroStumm', {'stumm': stumm});
     return r is Map && r['stumm'] == true;
+  }
+
+  /// HoneyCord Videopuffer (21.11.2026, wie Mac nativ und v3): Mindest-
+  /// verzoegerung des Jitterpuffers eines fremden Empfaengers in Sekunden
+  /// (`RtpReceiverInterface::SetJitterBufferMinimumDelay`). 0 = WebRTC-Vorgabe
+  /// (keine Untergrenze, eigene Jitter-Schaetzung bleibt).
+  /// Ergebnis: `true` gesetzt, `false` Empfaenger nicht gefunden (noch nicht
+  /// eingehaengt — spaeter erneut versuchen), `null` die Plattform kann es
+  /// nicht (Android/iOS, macOS-Framework ohne `honeycord-jitterpuffer.patch`).
+  static Future<bool?> honeycordJitterPuffer(
+      RTCRtpReceiver receiver, double sekunden) async {
+    if (WebRTC.platformIsAndroid || WebRTC.platformIsIOS || WebRTC.platformIsWeb) {
+      return null;
+    }
+    if (receiver is! RTCRtpReceiverNative) return null;
+    final r = await WebRTC.invokeMethod('honeycordJitterPuffer', {
+      'peerConnectionId': receiver.peerConnectionId,
+      'receiverId': receiver.receiverId,
+      'sekunden': sekunden,
+    });
+    if (r is! Map) return null;
+    if (r['kann'] != true) return null;
+    return r['gesetzt'] == true;
   }
 
   /// HoneyCord: Laeuft der Ton der Bildschirmfreigabe gerade?

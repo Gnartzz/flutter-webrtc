@@ -17,6 +17,7 @@
 #import "AudioManager.h"
 
 #import <AVFoundation/AVFoundation.h>
+#import <objc/message.h>
 #import <WebRTC/RTCFieldTrials.h>
 #import <WebRTC/WebRTC.h>
 
@@ -465,6 +466,37 @@ static FlutterWebRTCPlugin *sharedSingleton;
     } else {
       result(@NO);
     }
+  } else if ([@"honeycordJitterPuffer" isEqualToString:call.method]) {
+    // HoneyCord Videopuffer (21.11.2026, wie Mac nativ und v3): Mindest-
+    // verzoegerung des Jitterpuffers eines fremden Empfaengers, ueber unseren
+    // WebRTC-Patch `honeycord-jitterpuffer.patch`
+    // (-[RTCRtpReceiver setJitterBufferMinimumDelay:]). Per Selektor, weil
+    // derselbe Code gegen Frameworks OHNE den Patch baut (iOS, aeltere
+    // Mac-Fassungen); dort {kann: NO}, nichts aendert sich.
+    NSDictionary* argsMap = call.arguments;
+    SEL setzen = NSSelectorFromString(@"setJitterBufferMinimumDelay:");
+    if (![RTCRtpReceiver instancesRespondToSelector:setzen]) {
+      result(@{@"kann" : @NO, @"gesetzt" : @NO});
+      return;
+    }
+    NSString* peerConnectionId = argsMap[@"peerConnectionId"];
+    NSString* receiverId = argsMap[@"receiverId"];
+    NSNumber* zahl = argsMap[@"sekunden"];
+    double sekunden = [zahl isKindOfClass:[NSNumber class]] ? zahl.doubleValue : 0.0;
+    if (!(sekunden >= 0.0)) sekunden = 0.0;  // auch NaN
+    if (sekunden > 10.0) sekunden = 10.0;
+    RTCPeerConnection* peerConnection =
+        [peerConnectionId isKindOfClass:[NSString class]] ? self.peerConnections[peerConnectionId] : nil;
+    RTCRtpReceiver* receiver =
+        (peerConnection && [receiverId isKindOfClass:[NSString class]])
+            ? [self getRtpReceiverById:peerConnection Id:receiverId]
+            : nil;
+    if (receiver == nil) {
+      result(@{@"kann" : @YES, @"gesetzt" : @NO});
+      return;
+    }
+    ((void (*)(id, SEL, double))objc_msgSend)(receiver, setzen, sekunden);
+    result(@{@"kann" : @YES, @"gesetzt" : @YES});
   } else if ([@"createPeerConnection" isEqualToString:call.method]) {
     NSDictionary* argsMap = call.arguments;
     NSDictionary* configuration = argsMap[@"configuration"];

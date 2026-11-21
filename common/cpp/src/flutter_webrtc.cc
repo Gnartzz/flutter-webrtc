@@ -191,6 +191,40 @@ void FlutterWebRTC::HandleMethodCall(
         GetValue<EncodableMap>(*method_call.arguments());
     const std::string streamId = findString(params, "streamId");
     MediaStreamGetTracks(streamId, std::move(result));
+  } else if (method_call.method_name().compare("honeycordJitterPuffer") == 0) {
+    // HoneyCord Videopuffer (21.11.2026, wie Mac nativ und v3): Mindest-
+    // verzoegerung des Jitterpuffers eines fremden Empfaengers. Der Wrapper
+    // reicht an RtpReceiverInterface::SetJitterBufferMinimumDelay durch (der
+    // Proxy springt synchron auf den Worker-Faden — selten, nur bei Wechsel).
+    // Antwort {kann: true, gesetzt: bool}; gesetzt=false = Empfaenger (noch)
+    // nicht gefunden, der Aufrufer versucht es im naechsten Takt.
+    if (!method_call.arguments()) {
+      result->Error("Bad Arguments", "Null arguments received");
+      return;
+    }
+    const EncodableMap params =
+        GetValue<EncodableMap>(*method_call.arguments());
+    const std::string peerConnectionId = findString(params, "peerConnectionId");
+    const std::string receiverId = findString(params, "receiverId");
+    double sekunden = findDouble(params, "sekunden");
+    if (!(sekunden >= 0.0)) sekunden = 0.0;  // auch NaN
+    if (sekunden > 10.0) sekunden = 10.0;
+    bool gesetzt = false;
+    RTCPeerConnection* pc = PeerConnectionForId(peerConnectionId);
+    if (pc != nullptr && !receiverId.empty()) {
+      auto receivers = pc->receivers();
+      for (scoped_refptr<RTCRtpReceiver> receiver : receivers.std_vector()) {
+        if (receiver && receiver->id().std_string() == receiverId) {
+          receiver->SetJitterBufferMinimumDelay(sekunden);
+          gesetzt = true;
+          break;
+        }
+      }
+    }
+    EncodableMap antwort;
+    antwort[EncodableValue("kann")] = EncodableValue(true);
+    antwort[EncodableValue("gesetzt")] = EncodableValue(gesetzt);
+    result->Success(EncodableValue(antwort));
   } else if (method_call.method_name().compare("createOffer") == 0) {
     if (!method_call.arguments()) {
       result->Error("Bad Arguments", "Null constraints arguments received");
