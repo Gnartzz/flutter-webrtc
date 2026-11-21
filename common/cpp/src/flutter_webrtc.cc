@@ -3,6 +3,12 @@
 
 #include "flutter_webrtc/flutter_web_r_t_c_plugin.h"
 
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <mutex>
+#include <thread>
+
 #if defined(_WIN32)
 #include <windows.h>  // id34: SetEnvironmentVariableA (Framerate-Halten-Schalter)
 #include "../../../windows/honeycord_mem_telemetry.h"
@@ -12,6 +18,53 @@
 namespace flutter_webrtc_plugin {
 
 static EventChannelProxy* eventChannelProxy = nullptr;
+
+// ── HoneyCord Videopuffer: eigener serieller Faden (Pruefbefund N2, 21.11.2026)
+// `pc->receivers()` springt synchron auf den Signalfaden, das Setzen auf den
+// Worker-Faden. Auf dem Plattformfaden haette ein belegter Worker die
+// Oberflaeche angehalten — Mac nativ legt den Aufruf deshalb auf eine eigene
+// Schlange, hier dasselbe. EIN Faden, Auftraege der Reihe nach (sonst koennte
+// ein aelterer Wert einen neueren ueberholen). Bewusst nie abgebaut: kein
+// statischer Destruktor beim Beenden (Lehre aus den Beenden-Abstuerzen), der
+// Faden schlaeft dann einfach in der Bedingung.
+struct HoneycordPufferSchlange {
+  std::mutex mtx;
+  std::condition_variable cv;
+  std::deque<std::function<void()>> auftraege;
+  bool laeuft = false;
+  TaskRunner* runner = nullptr;   // Antworten zurueck auf den Plattformfaden; nullptr = Plugin weg
+};
+static HoneycordPufferSchlange* HoneycordPuffer() {
+  static HoneycordPufferSchlange* s = new HoneycordPufferSchlange();
+  return s;
+}
+static void HoneycordPufferAuftrag(std::function<void()> auftrag) {
+  HoneycordPufferSchlange* s = HoneycordPuffer();
+  std::lock_guard<std::mutex> lk(s->mtx);
+  s->auftraege.push_back(std::move(auftrag));
+  if (!s->laeuft) {
+    s->laeuft = true;
+    std::thread([s] {
+      for (;;) {
+        std::function<void()> a;
+        {
+          std::unique_lock<std::mutex> lk2(s->mtx);
+          s->cv.wait(lk2, [s] { return !s->auftraege.empty(); });
+          a = std::move(s->auftraege.front());
+          s->auftraege.pop_front();
+        }
+        a();
+      }
+    }).detach();
+  }
+  s->cv.notify_one();
+}
+// Antwort auf dem Plattformfaden abliefern — nur, solange das Plugin lebt.
+static void HoneycordPufferAntwort(std::function<void()> antwort) {
+  HoneycordPufferSchlange* s = HoneycordPuffer();
+  std::lock_guard<std::mutex> lk(s->mtx);
+  if (s->runner) s->runner->EnqueueTask(std::move(antwort));
+}
 
 FlutterWebRTC::FlutterWebRTC(FlutterWebRTCPlugin* plugin)
     : FlutterWebRTCBase::FlutterWebRTCBase(plugin->messenger(),
@@ -24,6 +77,11 @@ FlutterWebRTC::FlutterWebRTC(FlutterWebRTCPlugin* plugin)
       FlutterDataChannel::FlutterDataChannel(this),
       FlutterFrameCryptor::FlutterFrameCryptor(this),
       FlutterDataPacketCryptor::FlutterDataPacketCryptor(this) {
+  {
+    HoneycordPufferSchlange* s = HoneycordPuffer();
+    std::lock_guard<std::mutex> lk(s->mtx);
+    s->runner = plugin->task_runner();
+  }
 #if defined(_WIN32)
   // OOM-Diagnose (Abendtest 2026-07-03): RAM/VRAM/Handle-Kurve nach mem.log.
   honeycord::StartMemTelemetryOnce();
@@ -34,6 +92,13 @@ FlutterWebRTC::FlutterWebRTC(FlutterWebRTCPlugin* plugin)
 }
 
 FlutterWebRTC::~FlutterWebRTC() {
+  // Videopuffer-Faden: keine Antworten mehr an den gleich verschwindenden
+  // Task-Runner (N2, 21.11.2026).
+  {
+    HoneycordPufferSchlange* s = HoneycordPuffer();
+    std::lock_guard<std::mutex> lk(s->mtx);
+    s->runner = nullptr;
+  }
   // HoneyCord 27.10.2026: PeerConnections ZUERST abbauen — hier leben noch
   // alle Teilobjekte (Renderer, Bildschirmfreigabe, DataChannels). Die
   // Basisklasse FlutterWebRTCBase wird als letzte zerstoert; erst in ihrem
@@ -209,22 +274,30 @@ void FlutterWebRTC::HandleMethodCall(
     double sekunden = findDouble(params, "sekunden");
     if (!(sekunden >= 0.0)) sekunden = 0.0;  // auch NaN
     if (sekunden > 10.0) sekunden = 10.0;
-    bool gesetzt = false;
-    RTCPeerConnection* pc = PeerConnectionForId(peerConnectionId);
-    if (pc != nullptr && !receiverId.empty()) {
-      auto receivers = pc->receivers();
-      for (scoped_refptr<RTCRtpReceiver> receiver : receivers.std_vector()) {
-        if (receiver && receiver->id().std_string() == receiverId) {
-          receiver->SetJitterBufferMinimumDelay(sekunden);
-          gesetzt = true;
-          break;
+    // Verbindung per Referenz festhalten — sie darf waehrend des Auftrags
+    // geschlossen, aber nicht freigegeben werden. Gearbeitet wird auf dem
+    // eigenen Faden (N2), geantwortet auf dem Plattformfaden.
+    scoped_refptr<RTCPeerConnection> pc(PeerConnectionForId(peerConnectionId));
+    std::shared_ptr<MethodResultProxy> ergebnis(result.release());
+    HoneycordPufferAuftrag([pc, receiverId, sekunden, ergebnis]() {
+      bool gesetzt = false;
+      if (pc && !receiverId.empty()) {
+        auto receivers = pc->receivers();
+        for (scoped_refptr<RTCRtpReceiver> receiver : receivers.std_vector()) {
+          if (receiver && receiver->id().std_string() == receiverId) {
+            receiver->SetJitterBufferMinimumDelay(sekunden);
+            gesetzt = true;
+            break;
+          }
         }
       }
-    }
-    EncodableMap antwort;
-    antwort[EncodableValue("kann")] = EncodableValue(true);
-    antwort[EncodableValue("gesetzt")] = EncodableValue(gesetzt);
-    result->Success(EncodableValue(antwort));
+      HoneycordPufferAntwort([ergebnis, gesetzt]() {
+        EncodableMap antwort;
+        antwort[EncodableValue("kann")] = EncodableValue(true);
+        antwort[EncodableValue("gesetzt")] = EncodableValue(gesetzt);
+        ergebnis->Success(EncodableValue(antwort));
+      });
+    });
   } else if (method_call.method_name().compare("createOffer") == 0) {
     if (!method_call.arguments()) {
       result->Error("Bad Arguments", "Null constraints arguments received");

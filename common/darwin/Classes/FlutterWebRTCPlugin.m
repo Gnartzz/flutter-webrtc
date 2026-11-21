@@ -487,16 +487,29 @@ static FlutterWebRTCPlugin *sharedSingleton;
     if (sekunden > 10.0) sekunden = 10.0;
     RTCPeerConnection* peerConnection =
         [peerConnectionId isKindOfClass:[NSString class]] ? self.peerConnections[peerConnectionId] : nil;
-    RTCRtpReceiver* receiver =
-        (peerConnection && [receiverId isKindOfClass:[NSString class]])
-            ? [self getRtpReceiverById:peerConnection Id:receiverId]
-            : nil;
-    if (receiver == nil) {
+    if (peerConnection == nil || ![receiverId isKindOfClass:[NSString class]]) {
       result(@{@"kann" : @YES, @"gesetzt" : @NO});
       return;
     }
-    ((void (*)(id, SEL, double))objc_msgSend)(receiver, setzen, sekunden);
-    result(@{@"kann" : @YES, @"gesetzt" : @YES});
+    // Pruefbefund N2 (21.11.2026): `receivers` springt synchron auf den
+    // Signalfaden, das Setzen auf den Worker-Faden — nicht auf dem Hauptfaden
+    // (wie Mac nativ: eigene serielle Schlange, Reihenfolge bleibt). Die
+    // Antwort geht auf dem Hauptfaden zurueck.
+    static dispatch_queue_t schlange;
+    static dispatch_once_t einmal;
+    dispatch_once(&einmal, ^{
+      schlange = dispatch_queue_create("de.honeycord.videopuffer", DISPATCH_QUEUE_SERIAL);
+    });
+    dispatch_async(schlange, ^{
+      RTCRtpReceiver* receiver = [self getRtpReceiverById:peerConnection Id:receiverId];
+      if (receiver != nil) {
+        ((void (*)(id, SEL, double))objc_msgSend)(receiver, setzen, sekunden);
+      }
+      BOOL gesetzt = receiver != nil;
+      dispatch_async(dispatch_get_main_queue(), ^{
+        result(@{@"kann" : @YES, @"gesetzt" : @(gesetzt)});
+      });
+    });
   } else if ([@"createPeerConnection" isEqualToString:call.method]) {
     NSDictionary* argsMap = call.arguments;
     NSDictionary* configuration = argsMap[@"configuration"];
